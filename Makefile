@@ -60,6 +60,23 @@ test: ## Run unit tests (with -race when gcc is available)
 test-integration: ## Run integration tests against throwaway containers (needs Docker)
 	CGO_ENABLED=$(if $(RACE),1,0) go test $(RACE) -tags=integration -count=1 ./test/integration/...
 
+# The API that the load test targets: the port of HTTP_ADDR on this host.
+LOAD_BASE_URL ?= http://localhost:$(lastword $(subst :, ,$(HTTP_ADDR)))
+# k6 from PATH, or else its container image (host networking reaches the API on localhost).
+K6_IMAGE ?= grafana/k6:2.3.0
+K6       ?= $(if $(shell command -v k6 2>/dev/null),k6,docker run --rm -i --network host $(K6_IMAGE))
+
+.PHONY: load-test
+load-test: ## Race 500 users for one seat with k6 (the API must run with AUTH_IP_RATE_LIMIT_PER_MIN=0)
+	$(K6) run -e BASE_URL=$(LOAD_BASE_URL) -e VUS=$(or $(VUS),500) - < test/load/booking_race.js
+
+# Redocly CLI lints the API contract; it runs in the Node image unless npx is on PATH.
+REDOCLY ?= $(if $(shell command -v npx 2>/dev/null),npx --yes,docker run --rm -v "$(CURDIR):/src" -w /src node:22 npx --yes) @redocly/cli@2.54.3
+
+.PHONY: lint-api
+lint-api: ## Lint the OpenAPI contract in api/openapi.yaml
+	$(REDOCLY) lint --config api/redocly.yaml api/openapi.yaml
+
 .PHONY: cover
 cover: ## Run unit tests and print total coverage
 	CGO_ENABLED=$(if $(RACE),1,0) go test $(RACE) -count=1 -coverprofile=coverage.out ./...

@@ -159,3 +159,19 @@ func TestDecodeJSONNamesTheExpectedType(t *testing.T) {
 		}
 	}
 }
+
+func TestFieldPathNamesArrayElementsLikeTheServices(t *testing.T) {
+	t.Parallel()
+
+	for in, want := range map[string]string{
+		"email":          "email",
+		"ids.0":          "ids[0]",
+		"rows.12.seats":  "rows[12].seats",
+		"a.b.3.c.4":      "a.b[3].c[4]",
+		"rows.0.seats.1": "rows[0].seats[1]",
+	} {
+		if got := fieldPath(in); got != want {
+			t.Errorf("fieldPath(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

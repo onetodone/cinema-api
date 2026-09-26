@@ -3,17 +3,17 @@ package app
 import (
 	"context"
 	"log/slog"
-	"sync"
+	"net/http"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/prometheus/client_golang/prometheus"
 	"github.com/redis/go-redis/v9"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/onetodone/cinema-api/internal/config"
-	"github.com/onetodone/cinema-api/internal/platform/metrics"
 	"github.com/onetodone/cinema-api/internal/platform/pgpool"
 	redisrepo "github.com/onetodone/cinema-api/internal/repository/redis"
 	"github.com/onetodone/cinema-api/internal/service/booking"
+	"github.com/onetodone/cinema-api/internal/transport/httpapi/handler"
 	"github.com/onetodone/cinema-api/internal/worker"
 )
 
@@ -28,6 +28,7 @@ type Worker struct {
 	redis      *redis.Client
 	expirer    *worker.Expirer
 	reconciler *worker.Reconciler
+	server     *server // GET /metrics, /healthz, and /readyz
 }
 
 // NewWorker connects to PostgreSQL and Redis and builds the background jobs. Redis may be down: the jobs only use
@@ -45,35 +46,54 @@ func NewWorker(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Wo
 		return nil, err
 	}
 	rdb := newRedis(ctx, cfg.Redis, workerName, logger)
-	// The worker serves no metrics yet (Sprint 7), so they go to a registry of their own.
-	store := redisrepo.New(rdb, cfg.Redis.KeyPrefix, metrics.New(prometheus.NewRegistry()), logger)
-	bookingSvc := newBookingService(db, cfg, providers, logger,
+	m, metricsHandler := newMetrics()
+	store := redisrepo.New(rdb, cfg.Redis.KeyPrefix, m, logger)
+	bookingSvc := newBookingService(db, cfg, providers, m, logger,
 		booking.WithHoldGate(store.HoldGate()),
 		booking.WithSeatMapCache(store.CatalogCache(cfg.Cache.SeatMapTTL, cfg.Cache.ScheduleTTL)))
 	expirer := worker.NewExpirer(bookingSvc,
-		worker.ExpirerConfig{Interval: cfg.Expirer.Interval, BatchSize: cfg.Expirer.BatchSize}, logger)
+		worker.ExpirerConfig{Interval: cfg.Expirer.Interval, BatchSize: cfg.Expirer.BatchSize}, m, logger)
 	reconciler := worker.NewReconciler(bookingSvc,
-		worker.ReconcilerConfig{Interval: cfg.Reconciler.Interval, BatchSize: worker.DefaultReconcileBatchSize}, logger)
+		worker.ReconcilerConfig{Interval: cfg.Reconciler.Interval, BatchSize: worker.DefaultReconcileBatchSize}, m, logger)
 
-	return &Worker{cfg: cfg, logger: logger, db: db, redis: rdb, expirer: expirer, reconciler: reconciler}, nil
+	health := handler.NewHealth(logger, readinessTimeout, healthChecks(db, rdb)...)
+	mux := metricsMux(metricsHandler, map[string]http.HandlerFunc{
+		"GET /healthz": health.Live,
+		"GET /readyz":  health.Ready,
+	})
+
+	return &Worker{
+		cfg:        cfg,
+		logger:     logger,
+		db:         db,
+		redis:      rdb,
+		expirer:    expirer,
+		reconciler: reconciler,
+		server:     newServer("metrics server", cfg.Metrics.WorkerAddr, mux, cfg.HTTP, logger),
+	}, nil
 }
 
-// Run runs the jobs side by side until ctx is canceled. Each job finishes what it is working on before Run
-// returns.
+// Run runs the jobs side by side, and serves the metrics and health probes, until ctx is canceled. Each job
+// finishes what it is working on before Run returns. If the server fails, the jobs stop too, and Run returns the
+// error, so that an orchestrator restarts a worker it can no longer watch.
 func (w *Worker) Run(ctx context.Context) error {
+	if err := listen(ctx, w.server); err != nil {
+		return err
+	}
 	w.logger.InfoContext(ctx, "worker started",
 		slog.String("expirer_interval", w.cfg.Expirer.Interval.String()),
 		slog.Int("expirer_batch_size", w.cfg.Expirer.BatchSize),
 		slog.String("reconciler_interval", w.cfg.Reconciler.Interval.String()),
 		slog.String("payment_grace", w.cfg.Payment.Grace.String()))
 
-	var jobs sync.WaitGroup
-	jobs.Go(func() { w.expirer.Run(ctx) })
-	jobs.Go(func() { w.reconciler.Run(ctx) })
-	jobs.Wait()
+	g, ctx := errgroup.WithContext(ctx)
+	g.Go(func() error { w.expirer.Run(ctx); return nil })
+	g.Go(func() error { w.reconciler.Run(ctx); return nil })
+	g.Go(func() error { return w.server.serve(ctx, w.logger, w.cfg.HTTP.ShutdownTimeout) })
+	err := g.Wait()
 
 	w.logger.Info("worker stopped")
-	return nil
+	return err
 }
 
 // Close releases the database pool and the Redis client. Call it once, after Run has returned.

@@ -10,7 +10,15 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
+	"github.com/onetodone/cinema-api/internal/platform/metrics"
 )
+
+func newMetrics() *metrics.Metrics {
+	return metrics.New(prometheus.NewRegistry())
+}
 
 // failing returns an attempt function that fails with the given SQLSTATEs, one per call, and then succeeds.
 func failing(calls *int, codes ...string) func() error {
@@ -30,7 +38,8 @@ func TestRetryRerunsDeadlocksAndSerializationFailures(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(&logs, nil))
 	calls := 0
 
-	err := retry(t.Context(), logger, failing(&calls, sqlstateDeadlockDetected, sqlstateSerializationFailure))
+	m := newMetrics()
+	err := retry(t.Context(), logger, m, failing(&calls, sqlstateDeadlockDetected, sqlstateSerializationFailure))
 	if err != nil {
 		t.Fatalf("retry = %v, want success on the third attempt", err)
 	}
@@ -43,6 +52,11 @@ func TestRetryRerunsDeadlocksAndSerializationFailures(t *testing.T) {
 	if !strings.Contains(logs.String(), "sqlstate=40P01") || !strings.Contains(logs.String(), "sqlstate=40001") {
 		t.Errorf("retry logs do not name the SQLSTATE:\n%s", logs.String())
 	}
+	for _, code := range []string{metrics.SQLStateDeadlock, metrics.SQLStateSerializationFailure} {
+		if n := testutil.ToFloat64(m.TxRetries.WithLabelValues(code)); n != 1 {
+			t.Errorf("retries with SQLSTATE %s = %v, want 1", code, n)
+		}
+	}
 }
 
 func TestRetryGivesUpAfterMaxAttempts(t *testing.T) {
@@ -54,7 +68,7 @@ func TestRetryGivesUpAfterMaxAttempts(t *testing.T) {
 		codes[i] = sqlstateDeadlockDetected
 	}
 
-	err := retry(t.Context(), slog.New(slog.DiscardHandler), failing(&calls, codes...))
+	err := retry(t.Context(), slog.New(slog.DiscardHandler), newMetrics(), failing(&calls, codes...))
 	if pgErrorCode(err) != sqlstateDeadlockDetected {
 		t.Errorf("retry = %v, want the last deadlock error", err)
 	}
@@ -68,7 +82,7 @@ func TestRetryReturnsOtherErrorsAtOnce(t *testing.T) {
 
 	for _, code := range []string{sqlstateUniqueViolation, sqlstateLockNotAvailable} {
 		calls := 0
-		err := retry(t.Context(), slog.New(slog.DiscardHandler), failing(&calls, code))
+		err := retry(t.Context(), slog.New(slog.DiscardHandler), newMetrics(), failing(&calls, code))
 		if pgErrorCode(err) != code || calls != 1 {
 			t.Errorf("SQLSTATE %s: err %v after %d attempts, want it returned after 1", code, err, calls)
 		}
@@ -76,7 +90,7 @@ func TestRetryReturnsOtherErrorsAtOnce(t *testing.T) {
 
 	calls := 0
 	plain := errors.New("not a database error")
-	err := retry(t.Context(), slog.New(slog.DiscardHandler), func() error { calls++; return plain })
+	err := retry(t.Context(), slog.New(slog.DiscardHandler), newMetrics(), func() error { calls++; return plain })
 	if !errors.Is(err, plain) || calls != 1 {
 		t.Errorf("plain error: %v after %d attempts", err, calls)
 	}
@@ -89,7 +103,7 @@ func TestRetryStopsWhenTheContextEnds(t *testing.T) {
 	cancel()
 	calls := 0
 
-	err := retry(ctx, slog.New(slog.DiscardHandler), failing(&calls, sqlstateDeadlockDetected, sqlstateDeadlockDetected))
+	err := retry(ctx, slog.New(slog.DiscardHandler), newMetrics(), failing(&calls, sqlstateDeadlockDetected, sqlstateDeadlockDetected))
 	if pgErrorCode(err) != sqlstateDeadlockDetected || calls != 1 {
 		t.Errorf("err %v after %d attempts, want the first error and no retry", err, calls)
 	}

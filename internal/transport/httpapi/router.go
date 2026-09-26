@@ -26,10 +26,10 @@ type RouterDeps struct {
 	Payments *handler.Payments
 	Admin    *handler.Admin
 
-	// Metrics records what the request guards do; it may be nil only when no guard is set. MetricsHandler serves
-	// GET /metrics; nil leaves the route out.
-	Metrics        *metrics.Metrics
-	MetricsHandler http.Handler
+	// Metrics records request durations and what the request guards do. It may be nil only when no guard is set;
+	// then request durations are not recorded. The metrics are served on a listener of their own (see
+	// internal/app), not by this router, so that they stay off the public network.
+	Metrics *metrics.Metrics
 
 	// Request guards backed by Redis. A nil store still requires a well-formed Idempotency-Key where one is
 	// required, but stores nothing; a nil limiter turns its limit off.
@@ -43,9 +43,29 @@ type RouterDeps struct {
 
 // NewRouter registers all routes and wraps them in the shared middleware stack.
 func NewRouter(d RouterDeps) http.Handler {
-	mux := http.NewServeMux()
+	mux, _ := newMux(d)
 
-	// Access levels. Routes registered with mux.HandleFunc directly are public.
+	// Order matters: RequestID is outermost so every log line carries the ID, and Recover is innermost so that a
+	// recovered panic is still logged by AccessLog, and measured by Instrument, with its 500 status.
+	mws := []middleware.Middleware{middleware.RequestID, middleware.AccessLog(d.Logger)}
+	if d.Metrics != nil {
+		mws = append(mws, middleware.Instrument(d.Metrics))
+	}
+	mws = append(mws, middleware.Recover(d.Logger))
+	return middleware.Chain(problemFallback(mux), mws...)
+}
+
+// newMux registers every route on a new ServeMux, and returns it with the route patterns in registration order.
+// api/openapi.yaml must document exactly these routes; a test checks that.
+func newMux(d RouterDeps) (*http.ServeMux, []string) {
+	mux := http.NewServeMux()
+	var patterns []string
+	handle := func(pattern string, h http.Handler) {
+		mux.Handle(pattern, h)
+		patterns = append(patterns, pattern)
+	}
+
+	// Access levels.
 	authenticate := middleware.Authenticate(d.Tokens, d.Logger)
 	public := func(h http.HandlerFunc, mws ...middleware.Middleware) http.Handler {
 		return middleware.Chain(h, mws...)
@@ -71,39 +91,32 @@ func NewRouter(d RouterDeps) http.Handler {
 		return middleware.Idempotency(d.Idempotency, required, d.Metrics, d.Logger)
 	}
 
-	mux.HandleFunc("GET /healthz", d.Health.Live)
-	mux.HandleFunc("GET /readyz", d.Health.Ready)
-	if d.MetricsHandler != nil {
-		mux.Handle("GET /metrics", d.MetricsHandler)
-	}
+	handle("GET /healthz", public(d.Health.Live))
+	handle("GET /readyz", public(d.Health.Ready))
 
-	mux.Handle("POST /v1/auth/register", public(d.Auth.Register, limitAuthByIP))
-	mux.Handle("POST /v1/auth/login", public(d.Auth.Login, limitAuthByIP, limitLoginByEmail))
-	mux.Handle("GET /v1/me", user(d.Auth.Me))
+	handle("POST /v1/auth/register", public(d.Auth.Register, limitAuthByIP))
+	handle("POST /v1/auth/login", public(d.Auth.Login, limitAuthByIP, limitLoginByEmail))
+	handle("GET /v1/me", user(d.Auth.Me))
 
-	mux.HandleFunc("GET /v1/movies", d.Catalog.ListMovies)
-	mux.HandleFunc("GET /v1/movies/{movieID}", d.Catalog.GetMovie)
-	mux.HandleFunc("GET /v1/showtimes", d.Catalog.Schedule)
-	mux.HandleFunc("GET /v1/showtimes/{showtimeID}", d.Catalog.GetShowtime)
-	mux.HandleFunc("GET /v1/showtimes/{showtimeID}/seats", d.Catalog.SeatMap)
+	handle("GET /v1/movies", public(d.Catalog.ListMovies))
+	handle("GET /v1/movies/{movieID}", public(d.Catalog.GetMovie))
+	handle("GET /v1/showtimes", public(d.Catalog.Schedule))
+	handle("GET /v1/showtimes/{showtimeID}", public(d.Catalog.GetShowtime))
+	handle("GET /v1/showtimes/{showtimeID}/seats", public(d.Catalog.SeatMap))
 
-	mux.Handle("POST /v1/bookings", user(d.Bookings.Create, limitBookings, idempotent(false)))
-	mux.Handle("GET /v1/bookings", user(d.Bookings.List))
-	mux.Handle("GET /v1/bookings/{bookingID}", user(d.Bookings.Get))
-	mux.Handle("DELETE /v1/bookings/{bookingID}", user(d.Bookings.Cancel))
+	handle("POST /v1/bookings", user(d.Bookings.Create, limitBookings, idempotent(false)))
+	handle("GET /v1/bookings", user(d.Bookings.List))
+	handle("GET /v1/bookings/{bookingID}", user(d.Bookings.Get))
+	handle("DELETE /v1/bookings/{bookingID}", user(d.Bookings.Cancel))
 
-	mux.HandleFunc("GET /v1/payment-methods", d.Payments.ListMethods)
-	mux.Handle("POST /v1/bookings/{bookingID}/payments", user(d.Payments.Pay, idempotent(true)))
+	handle("GET /v1/payment-methods", public(d.Payments.ListMethods))
+	handle("POST /v1/bookings/{bookingID}/payments", user(d.Payments.Pay, idempotent(true)))
 
-	mux.Handle("POST /v1/admin/movies", admin(d.Admin.CreateMovie))
+	handle("POST /v1/admin/movies", admin(d.Admin.CreateMovie))
+	handle("POST /v1/admin/halls", admin(d.Admin.CreateHall))
+	handle("POST /v1/admin/showtimes", admin(d.Admin.CreateShowtime))
 
-	// Order matters: RequestID is outermost so every log line carries the ID, and Recover is innermost so that a
-	// recovered panic is still logged by AccessLog with its 500 status.
-	return middleware.Chain(problemFallback(mux),
-		middleware.RequestID,
-		middleware.AccessLog(d.Logger),
-		middleware.Recover(d.Logger),
-	)
+	return mux, patterns
 }
 
 // problemFallback serves mux but replaces its plain-text "404 page not found" and "405 method not allowed"

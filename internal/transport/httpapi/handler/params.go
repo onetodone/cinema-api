@@ -119,6 +119,20 @@ func (p *params) date(r *http.Request, name string) time.Time {
 	return d
 }
 
+// timestamp parses an optional RFC 3339 date-time from a request body field; empty means the zero time, which the
+// service reports as missing. The offset is required, so a time is never read in the wrong zone.
+func (p *params) timestamp(field, raw string) time.Time {
+	if raw == "" {
+		return time.Time{}
+	}
+	t, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		p.fail(field, "must be a date-time in RFC 3339 format with a time zone offset, such as 2026-10-01T19:30:00+02:00")
+		return time.Time{}
+	}
+	return t
+}
+
 // Cursors are opaque to clients: base64url of the last id. Opaque cursors let the pagination key change later
 // without breaking clients.
 func encodeCursor(afterID int64) string {

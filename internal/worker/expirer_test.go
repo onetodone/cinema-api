@@ -13,7 +13,11 @@ import (
 	"time"
 	"uuid"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	"github.com/onetodone/cinema-api/internal/domain"
+	"github.com/onetodone/cinema-api/internal/platform/metrics"
 	"github.com/onetodone/cinema-api/internal/service/booking"
 )
 
@@ -81,12 +85,18 @@ func (l *logBuffer) String() string {
 	return l.b.String()
 }
 
+// newMetrics returns metrics on a registry of their own.
+func newMetrics() *metrics.Metrics {
+	return metrics.New(prometheus.NewRegistry())
+}
+
 // runExpirer starts an Expirer over f in the background and returns a function that cancels it and waits for
-// Run to return. Call it inside a synctest bubble.
-func runExpirer(t *testing.T, f *fakeBookings, logs io.Writer) (stop func()) {
+// Run to return, and the metrics the Expirer records. Call it inside a synctest bubble.
+func runExpirer(t *testing.T, f *fakeBookings, logs io.Writer) (stop func(), m *metrics.Metrics) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(t.Context())
-	e := NewExpirer(f, ExpirerConfig{Interval: testInterval, BatchSize: testBatchSize}, slog.New(slog.NewTextHandler(logs, nil)))
+	m = newMetrics()
+	e := NewExpirer(f, ExpirerConfig{Interval: testInterval, BatchSize: testBatchSize}, m, slog.New(slog.NewTextHandler(logs, nil)))
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -95,14 +105,14 @@ func runExpirer(t *testing.T, f *fakeBookings, logs io.Writer) (stop func()) {
 	return func() {
 		cancel()
 		<-done
-	}
+	}, m
 }
 
 func TestExpirerSweepsAtStartAndThenAboutEveryInterval(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		f := &fakeBookings{}
 		began := time.Now()
-		stop := runExpirer(t, f, io.Discard)
+		stop, _ := runExpirer(t, f, io.Discard)
 		time.Sleep(20 * testInterval)
 		stop()
 
@@ -141,7 +151,7 @@ func TestExpirerDrainsFullBatchesWithinOneSweep(t *testing.T) {
 		}}
 		var logs logBuffer
 		began := time.Now()
-		stop := runExpirer(t, f, &logs)
+		stop, m := runExpirer(t, f, &logs)
 
 		synctest.Wait() // the first sweep is over, and the loop waits for the next one
 		calls := f.callTimes()
@@ -160,6 +170,9 @@ func TestExpirerDrainsFullBatchesWithinOneSweep(t *testing.T) {
 			strings.Count(out, "bookings expired") != 3 {
 			t.Errorf("want one log line per non-empty batch:\n%s", out)
 		}
+		if n := testutil.ToFloat64(m.BookingsExpired); n != 2*testBatchSize+1 {
+			t.Errorf("cinema_bookings_expired_total = %v, want %d", n, 2*testBatchSize+1)
+		}
 	})
 }
 
@@ -177,7 +190,7 @@ func TestExpirerRetriesFailedBatchesAtTheNextSweep(t *testing.T) {
 			return booking.ExpiredBatch{}, nil
 		}}
 		var logs logBuffer
-		stop := runExpirer(t, f, &logs)
+		stop, _ := runExpirer(t, f, &logs)
 
 		synctest.Wait()
 		if n := len(f.callTimes()); n != 1 {
@@ -217,7 +230,7 @@ func TestExpirerFinishesTheBatchInFlightOnShutdown(t *testing.T) {
 			return batchOf(testBatchSize), nil // a full batch: without the shutdown, another would follow
 		}}
 		ctx, cancel := context.WithCancel(t.Context())
-		e := NewExpirer(f, ExpirerConfig{Interval: testInterval, BatchSize: testBatchSize}, slog.New(slog.DiscardHandler))
+		e := NewExpirer(f, ExpirerConfig{Interval: testInterval, BatchSize: testBatchSize}, newMetrics(), slog.New(slog.DiscardHandler))
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
@@ -255,7 +268,7 @@ func TestExpirerGivesUpOnAHungBatch(t *testing.T) {
 		}}
 		var logs logBuffer
 		began := time.Now()
-		stop := runExpirer(t, f, &logs)
+		stop, _ := runExpirer(t, f, &logs)
 
 		time.Sleep(batchTimeout + testInterval*12/10)
 		stop()
@@ -278,7 +291,7 @@ func TestExpirerDoesNotSweepAfterCancel(t *testing.T) {
 		f := &fakeBookings{}
 		ctx, cancel := context.WithCancel(t.Context())
 		cancel()
-		NewExpirer(f, ExpirerConfig{Interval: testInterval, BatchSize: testBatchSize}, slog.New(slog.DiscardHandler)).Run(ctx)
+		NewExpirer(f, ExpirerConfig{Interval: testInterval, BatchSize: testBatchSize}, newMetrics(), slog.New(slog.DiscardHandler)).Run(ctx)
 		if n := len(f.callTimes()); n != 0 {
 			t.Errorf("%d sweeps with a canceled context, want none", n)
 		}
@@ -295,7 +308,7 @@ func TestNewExpirerRejectsAnInvalidConfig(t *testing.T) {
 					t.Errorf("NewExpirer(%+v) did not panic", cfg)
 				}
 			}()
-			NewExpirer(&fakeBookings{}, cfg, slog.New(slog.DiscardHandler))
+			NewExpirer(&fakeBookings{}, cfg, newMetrics(), slog.New(slog.DiscardHandler))
 		}()
 	}
 }

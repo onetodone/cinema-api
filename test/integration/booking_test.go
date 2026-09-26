@@ -15,10 +15,12 @@ import (
 	"uuid"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/onetodone/cinema-api/internal/domain"
 	"github.com/onetodone/cinema-api/internal/payment"
 	"github.com/onetodone/cinema-api/internal/payment/local"
+	"github.com/onetodone/cinema-api/internal/platform/metrics"
 	"github.com/onetodone/cinema-api/internal/repository/postgres"
 	"github.com/onetodone/cinema-api/internal/service/booking"
 )
@@ -54,11 +56,12 @@ func testProviders(t *testing.T) (*payment.Registry, *scriptedProvider) {
 	return providers, scripted
 }
 
-// newBookingService builds the booking service on pool the way internal/app does, with the test settings.
-func newBookingService(pool *pgxpool.Pool, lockTimeout time.Duration, providers *payment.Registry, logger *slog.Logger,
-	opts ...booking.Option,
+// newBookingService builds the booking service on pool the way internal/app does, with the test settings. Its
+// transaction retries count in m.
+func newBookingService(pool *pgxpool.Pool, lockTimeout time.Duration, providers *payment.Registry, m *metrics.Metrics,
+	logger *slog.Logger, opts ...booking.Option,
 ) *booking.Service {
-	return booking.New(postgres.NewUnitOfWork(pool, lockTimeout, logger), postgres.NewBookings(pool), providers,
+	return booking.New(postgres.NewUnitOfWork(pool, lockTimeout, m, logger), postgres.NewBookings(pool), providers,
 		booking.Config{
 			Location: time.UTC, Currency: "USD", HoldTTL: testHoldTTL, MaxSeats: 10, HoldClaimTTL: testHoldClaimTTL,
 			PaymentTimeout: testPaymentTimeout, PaymentGrace: testPaymentGrace,
@@ -78,6 +81,7 @@ type bookingEnv struct {
 	*fixture
 	svc      *booking.Service
 	uow      *postgres.UnitOfWork
+	metrics  *metrics.Metrics // of both svc and uow
 	logs     *logRecorder
 	scripted *scriptedProvider // the "scripted" payment provider
 	st       domain.Showtime   // Dune in Hall 1 at base
@@ -95,11 +99,13 @@ func newBookingEnvOn(t *testing.T, f *fixture, pool *pgxpool.Pool, lockTimeout t
 	t.Helper()
 	logs := &logRecorder{}
 	providers, scripted := testProviders(t)
+	m := metrics.New(prometheus.NewRegistry())
 	return &bookingEnv{
 		fixture:  f,
-		uow:      postgres.NewUnitOfWork(pool, lockTimeout, slog.New(logs)),
+		uow:      postgres.NewUnitOfWork(pool, lockTimeout, m, slog.New(logs)),
+		metrics:  m,
 		logs:     logs,
-		svc:      newBookingService(pool, lockTimeout, providers, slog.New(logs), opts...),
+		svc:      newBookingService(pool, lockTimeout, providers, m, slog.New(logs), opts...),
 		scripted: scripted,
 		st:       f.showtime(t, f.dune, f.hall, base),
 		seats:    seatIDsByLabel(t, f.pool, f.hall.ID),
@@ -442,6 +448,9 @@ func TestUnitOfWorkRetriesDeadlocks(t *testing.T) {
 	}
 	if got := env.logs.retried(); !slices.Equal(got, []string{"40P01"}) {
 		t.Errorf("retries = %v, want exactly one after a deadlock", got)
+	}
+	if n := testCount(env.metrics.TxRetries.WithLabelValues(metrics.SQLStateDeadlock)); n != 1 {
+		t.Errorf("cinema_db_tx_retries_total{sqlstate=40P01} = %v, want 1", n)
 	}
 	if n := attempts.Load(); n != 3 {
 		t.Errorf("attempts = %d, want 3 (two first tries and one retry)", n)

@@ -299,10 +299,11 @@ func sellSeats(ctx context.Context, r TxRepos, bookingID uuid.UUID) error {
 
 // ReconciledBatch reports what one ReconcileBatch call did.
 type ReconciledBatch struct {
-	Checked int       // stuck payments looked at
-	LastID  uuid.UUID // the last payment looked at; the next batch continues after it
-	Paid    int       // payments this call settled as succeeded: their bookings are paid
-	Failed  int       // payments this call settled as failed or refunded
+	Checked   int       // stuck payments looked at
+	LastID    uuid.UUID // the last payment looked at; the next batch continues after it
+	Paid      int       // payments this call settled as succeeded: their bookings are paid
+	Failed    int       // payments this call settled as failed or refunded
+	Unsettled int       // payments that could not be settled now; the returned error names each of them
 }
 
 // ReconcileBatch settles payments that have been in flight for longer than PaymentGrace. The API lost track of
@@ -337,6 +338,7 @@ func (s *Service) ReconcileBatch(ctx context.Context, afterID uuid.UUID, limit i
 		settled, changed, err := s.reconcile(context.WithoutCancel(ctx), p)
 		switch {
 		case err != nil:
+			batch.Unsettled++
 			errs = append(errs, fmt.Errorf("payment %s: %w", p.ID, err))
 		case !changed:
 		case settled.Status == domain.PaymentSucceeded:

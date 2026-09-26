@@ -12,6 +12,7 @@ import (
 	"uuid"
 
 	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 
 	"github.com/onetodone/cinema-api/internal/domain"
 	"github.com/onetodone/cinema-api/internal/payment"
@@ -96,11 +97,19 @@ func (localMethod) Methods() []payment.Method {
 	return []payment.Method{{ID: "local", Name: "Test card"}}
 }
 
-// echoAdmin creates every movie with id 1.
+// echoAdmin creates everything with id 1.
 type echoAdmin struct{}
 
 func (echoAdmin) CreateMovie(_ context.Context, m domain.NewMovie) (domain.Movie, error) {
 	return domain.Movie{ID: 1, Title: m.Title, DurationMin: m.DurationMin}, nil
+}
+
+func (echoAdmin) CreateHall(_ context.Context, h domain.NewHall) (domain.HallLayout, error) {
+	return domain.HallLayout{Hall: domain.Hall{ID: 1, Name: h.Name}}, nil
+}
+
+func (echoAdmin) CreateShowtime(_ context.Context, ns domain.NewShowtime) (domain.Showtime, error) {
+	return domain.Showtime{ID: 1, StartsAt: ns.StartsAt, EndsAt: ns.StartsAt.Add(time.Hour)}, nil
 }
 
 var testTokens = func() *auth.Tokens {
@@ -119,7 +128,7 @@ func newTestRouter() http.Handler {
 func testRouterDeps() RouterDeps {
 	logger := slog.New(slog.DiscardHandler)
 	user := domain.User{ID: uuid.NewV7(), Email: "ann@example.com", Role: domain.RoleCustomer}
-	registry := prometheus.NewRegistry()
+	m := metrics.New(prometheus.NewRegistry())
 	return RouterDeps{
 		Logger: logger,
 		Tokens: testTokens,
@@ -128,12 +137,11 @@ func testRouterDeps() RouterDeps {
 		),
 		Catalog:  handler.NewCatalog(emptyCatalog{}, "USD", logger),
 		Auth:     handler.NewAuth(oneUser{user: user}, testTokens, logger),
-		Bookings: handler.NewBookings(noBookings{}, "USD", logger),
-		Payments: handler.NewPayments(paysAll{}, localMethod{}, "USD", logger),
-		Admin:    handler.NewAdmin(echoAdmin{}, logger),
+		Bookings: handler.NewBookings(noBookings{}, "USD", m, logger),
+		Payments: handler.NewPayments(paysAll{}, localMethod{}, "USD", m, logger),
+		Admin:    handler.NewAdmin(echoAdmin{}, "USD", logger),
 
-		Metrics:        metrics.New(registry),
-		MetricsHandler: metrics.Handler(registry),
+		Metrics: m,
 	}
 }
 
@@ -178,7 +186,6 @@ func TestRouterServesRegisteredRoutes(t *testing.T) {
 		"/v1/movies", "/v1/movies/1",
 		"/v1/showtimes", "/v1/showtimes/1", "/v1/showtimes/1/seats",
 		"/v1/payment-methods",
-		"/metrics",
 	} {
 		t.Run(path, func(t *testing.T) {
 			t.Parallel()
@@ -260,6 +267,8 @@ func TestRouterEnforcesAccessLevels(t *testing.T) {
 	customer, admin := tokenFor(t, domain.RoleCustomer), tokenFor(t, domain.RoleAdmin)
 	credentials := `{"email":"ann@example.com","password":"correct horse"}`
 	movie := `{"title":"Dune","duration_min":155}`
+	hall := `{"name":"Hall 9","rows":[{"label":"A","seats":5}]}`
+	showtime := `{"movie_id":1,"hall_id":1,"starts_at":"2030-01-01T19:00:00Z","base_price_cents":900}`
 	seats := `{"showtime_id":1,"seat_ids":[1,2]}`
 	bookingPath := "/v1/bookings/" + uuid.NewV7().String()
 	pay := `{"payment_method":"local","payment_token":"tok_success"}`
@@ -293,10 +302,16 @@ func TestRouterEnforcesAccessLevels(t *testing.T) {
 		{name: "payment needs a token", method: http.MethodPost, path: bookingPath + "/payments", body: pay, status: http.StatusUnauthorized},
 		{name: "payment for a customer", method: http.MethodPost, path: bookingPath + "/payments", token: customer, body: pay, key: "k1", status: http.StatusOK},
 		{name: "payment needs an idempotency key", method: http.MethodPost, path: bookingPath + "/payments", token: customer, body: pay, status: http.StatusBadRequest},
-		{name: "metrics are public", method: http.MethodGet, path: "/metrics", status: http.StatusOK},
+		{name: "metrics are not on the public port", method: http.MethodGet, path: "/metrics", status: http.StatusNotFound},
 		{name: "admin route needs a token", method: http.MethodPost, path: "/v1/admin/movies", body: movie, status: http.StatusUnauthorized},
 		{name: "admin route refuses customers", method: http.MethodPost, path: "/v1/admin/movies", token: customer, body: movie, status: http.StatusForbidden},
 		{name: "admin route for an admin", method: http.MethodPost, path: "/v1/admin/movies", token: admin, body: movie, status: http.StatusCreated},
+		{name: "hall needs a token", method: http.MethodPost, path: "/v1/admin/halls", body: hall, status: http.StatusUnauthorized},
+		{name: "hall refuses customers", method: http.MethodPost, path: "/v1/admin/halls", token: customer, body: hall, status: http.StatusForbidden},
+		{name: "hall for an admin", method: http.MethodPost, path: "/v1/admin/halls", token: admin, body: hall, status: http.StatusCreated},
+		{name: "showtime needs a token", method: http.MethodPost, path: "/v1/admin/showtimes", body: showtime, status: http.StatusUnauthorized},
+		{name: "showtime refuses customers", method: http.MethodPost, path: "/v1/admin/showtimes", token: customer, body: showtime, status: http.StatusForbidden},
+		{name: "showtime for an admin", method: http.MethodPost, path: "/v1/admin/showtimes", token: admin, body: showtime, status: http.StatusCreated},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -332,4 +347,44 @@ func TestRouterLoginTokenOpensProtectedRoutes(t *testing.T) {
 	if rec := serveAs(t, router, http.MethodGet, "/v1/me", body.AccessToken, ""); rec.Code != http.StatusOK {
 		t.Errorf("GET /v1/me with the login token: status = %d, body %s", rec.Code, rec.Body.String())
 	}
+}
+
+func TestRouterMeasuresRequestsByRoute(t *testing.T) {
+	t.Parallel()
+
+	deps := testRouterDeps()
+	router := NewRouter(deps)
+	serve(t, router, http.MethodGet, "/v1/showtimes/1/seats")
+	serve(t, router, http.MethodGet, "/v1/showtimes/2/seats")
+	serve(t, router, http.MethodGet, "/v1/showtimes/x/seats")
+	serve(t, router, http.MethodGet, "/nope")
+	serve(t, router, http.MethodPost, "/v1/movies")
+
+	for _, tt := range []struct {
+		route, code string
+		want        uint64
+	}{
+		{route: "GET /v1/showtimes/{showtimeID}/seats", code: "200", want: 2},
+		{route: "GET /v1/showtimes/{showtimeID}/seats", code: "400", want: 1},
+		{route: metrics.RouteUnmatched, code: "404", want: 1},
+		{route: metrics.RouteUnmatched, code: "405", want: 1},
+	} {
+		if got := sampleCount(t, deps.Metrics, tt.route, tt.code); got != tt.want {
+			t.Errorf("requests measured for %s %s = %d, want %d", tt.route, tt.code, got, tt.want)
+		}
+	}
+}
+
+// sampleCount returns how many requests the duration histogram observed for a route and status code.
+func sampleCount(t *testing.T, m *metrics.Metrics, route, code string) uint64 {
+	t.Helper()
+	obs, err := m.HTTPRequestDuration.GetMetricWithLabelValues(route, code)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out dto.Metric
+	if err := obs.(prometheus.Metric).Write(&out); err != nil {
+		t.Fatal(err)
+	}
+	return out.GetHistogram().GetSampleCount()
 }

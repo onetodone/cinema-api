@@ -3,8 +3,10 @@ package domain
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestErrorKindsSurviveWrapping(t *testing.T) {
@@ -168,6 +170,114 @@ func TestNewMovieValidate(t *testing.T) {
 				got = append(got, f.Field)
 			}
 			if strings.Join(got, ",") != strings.Join(tt.fields, ",") {
+				t.Errorf("invalid fields = %v, want %v", got, tt.fields)
+			}
+		})
+	}
+}
+
+// invalidFields returns the fields a validation error names, or fails the test if err is not one.
+func invalidFields(t *testing.T, err error) []string {
+	t.Helper()
+	var ve *ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("Validate() = %v, want a validation error", err)
+	}
+	got := make([]string, 0, len(ve.Fields))
+	for _, f := range ve.Fields {
+		got = append(got, f.Field)
+	}
+	return got
+}
+
+func TestNewHallValidate(t *testing.T) {
+	t.Parallel()
+
+	valid := NewHall{Name: "Hall 4", Rows: []HallRow{
+		{Label: "A", Seats: 10, Type: SeatAccessible},
+		{Label: "B", Seats: MaxRowSeats, Type: SeatStandard},
+		{Label: "AA", Seats: 1, Type: SeatVIP},
+		{Label: "10", Seats: 1, Type: SeatStandard},
+	}}
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("valid hall: %v", err)
+	}
+
+	rowsOf := func(n, seats int) []HallRow {
+		rows := make([]HallRow, n)
+		for i := range rows {
+			rows[i] = HallRow{Label: fmt.Sprint(i + 1), Seats: seats, Type: SeatStandard}
+		}
+		return rows
+	}
+	tests := []struct {
+		name   string
+		edit   func(*NewHall)
+		fields []string
+	}{
+		{name: "missing name", edit: func(h *NewHall) { h.Name = "" }, fields: []string{"name"}},
+		{name: "long name", edit: func(h *NewHall) { h.Name = strings.Repeat("é", MaxHallNameLength+1) }, fields: []string{"name"}},
+		{name: "no rows", edit: func(h *NewHall) { h.Rows = nil }, fields: []string{"rows"}},
+		{name: "too many rows", edit: func(h *NewHall) { h.Rows = rowsOf(MaxHallRows+1, 1) }, fields: []string{"rows"}},
+		{name: "too many seats", edit: func(h *NewHall) { h.Rows = rowsOf(11, 100) }, fields: []string{"rows"}},
+		{name: "lowercase label", edit: func(h *NewHall) { h.Rows[1].Label = "b" }, fields: []string{"rows[1].label"}},
+		{name: "empty label", edit: func(h *NewHall) { h.Rows[0].Label = "" }, fields: []string{"rows[0].label"}},
+		{name: "long label", edit: func(h *NewHall) { h.Rows[0].Label = "ABCD" }, fields: []string{"rows[0].label"}},
+		{name: "duplicate label", edit: func(h *NewHall) { h.Rows[2].Label = "A" }, fields: []string{"rows[2].label"}},
+		{name: "empty row", edit: func(h *NewHall) { h.Rows[0].Seats = 0 }, fields: []string{"rows[0].seats"}},
+		{name: "long row", edit: func(h *NewHall) { h.Rows[0].Seats = MaxRowSeats + 1 }, fields: []string{"rows[0].seats"}},
+		{name: "unknown type", edit: func(h *NewHall) { h.Rows[3].Type = "balcony" }, fields: []string{"rows[3].type"}},
+		{name: "missing type", edit: func(h *NewHall) { h.Rows[3].Type = "" }, fields: []string{"rows[3].type"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			h := NewHall{Name: valid.Name, Rows: slices.Clone(valid.Rows)}
+			tt.edit(&h)
+			if got := invalidFields(t, h.Validate()); !slices.Equal(got, tt.fields) {
+				t.Errorf("invalid fields = %v, want %v", got, tt.fields)
+			}
+		})
+	}
+}
+
+func TestNewShowtimeValidate(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2030, 3, 1, 12, 0, 0, 0, time.UTC)
+	valid := NewShowtime{MovieID: 1, HallID: 2, StartsAt: now.Add(time.Minute), BasePriceCents: 900}
+	if err := valid.Validate(now); err != nil {
+		t.Fatalf("valid showtime: %v", err)
+	}
+	free := valid
+	free.BasePriceCents, free.StartsAt = 0, now.Add(MaxScheduleAhead)
+	if err := free.Validate(now); err != nil {
+		t.Errorf("a free showtime a year ahead: %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		edit   func(*NewShowtime)
+		fields []string
+	}{
+		{name: "no movie", edit: func(s *NewShowtime) { s.MovieID = 0 }, fields: []string{"movie_id"}},
+		{name: "no hall", edit: func(s *NewShowtime) { s.HallID = -1 }, fields: []string{"hall_id"}},
+		{name: "no start", edit: func(s *NewShowtime) { s.StartsAt = time.Time{} }, fields: []string{"starts_at"}},
+		{name: "starts now", edit: func(s *NewShowtime) { s.StartsAt = now }, fields: []string{"starts_at"}},
+		{name: "too far ahead", edit: func(s *NewShowtime) { s.StartsAt = now.Add(MaxScheduleAhead + time.Second) }, fields: []string{"starts_at"}},
+		{name: "negative price", edit: func(s *NewShowtime) { s.BasePriceCents = -1 }, fields: []string{"base_price_cents"}},
+		{name: "huge price", edit: func(s *NewShowtime) { s.BasePriceCents = MaxBasePriceCents + 1 }, fields: []string{"base_price_cents"}},
+		{name: "everything wrong", edit: func(s *NewShowtime) { *s = NewShowtime{BasePriceCents: -5} },
+			fields: []string{"movie_id", "hall_id", "starts_at", "base_price_cents"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			s := valid
+			tt.edit(&s)
+			if got := invalidFields(t, s.Validate(now)); !slices.Equal(got, tt.fields) {
 				t.Errorf("invalid fields = %v, want %v", got, tt.fields)
 			}
 		})

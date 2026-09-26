@@ -2,13 +2,16 @@ package handler
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"uuid"
 
 	"github.com/onetodone/cinema-api/internal/domain"
+	"github.com/onetodone/cinema-api/internal/platform/metrics"
 	"github.com/onetodone/cinema-api/internal/service/booking"
 	"github.com/onetodone/cinema-api/internal/transport/httpapi/dto"
+	"github.com/onetodone/cinema-api/internal/transport/httpapi/problem"
 	"github.com/onetodone/cinema-api/internal/transport/httpapi/render"
 )
 
@@ -24,12 +27,14 @@ type BookingService interface {
 type Bookings struct {
 	svc      BookingService
 	currency string
+	metrics  *metrics.Metrics
 	logger   *slog.Logger
 }
 
-// NewBookings returns the booking handlers. currency is the ISO 4217 code reported next to prices.
-func NewBookings(svc BookingService, currency string, logger *slog.Logger) *Bookings {
-	return &Bookings{svc: svc, currency: currency, logger: logger}
+// NewBookings returns the booking handlers. currency is the ISO 4217 code reported next to prices; every booking
+// attempt counts in m.
+func NewBookings(svc BookingService, currency string, m *metrics.Metrics, logger *slog.Logger) *Bookings {
+	return &Bookings{svc: svc, currency: currency, metrics: m, logger: logger}
 }
 
 // Create handles POST /v1/bookings. It answers 201 with the booking and its URL in Location.
@@ -44,12 +49,32 @@ func (h *Bookings) Create(w http.ResponseWriter, r *http.Request) {
 	}
 
 	b, err := h.svc.Create(r.Context(), p.UserID, req.NewBooking())
+	h.metrics.BookingAttempts.WithLabelValues(bookingResult(err)).Inc()
 	if err != nil {
 		writeError(h.logger, w, r, err)
 		return
 	}
 	w.Header().Set("Location", "/v1/bookings/"+b.ID.String())
 	render.JSON(w, http.StatusCreated, dto.NewBooking(b, h.currency))
+}
+
+// bookingResult classifies the outcome of a booking attempt for cinema_booking_attempts_total.
+func bookingResult(err error) string {
+	var de *domain.Error
+	switch {
+	case err == nil:
+		return metrics.BookingCreated
+	case errors.Is(err, domain.ErrBusy):
+		return metrics.BookingBusy
+	case errors.As(err, &de) && de.Code == domain.CodeSeatUnavailable:
+		return metrics.BookingSeatUnavailable
+	case errors.As(err, &de) && de.Code == domain.CodeActiveBookingExists:
+		return metrics.BookingActiveBookingExists
+	case problem.FromError(err).Status < http.StatusInternalServerError:
+		return metrics.BookingRejected
+	default:
+		return metrics.BookingFailed
+	}
 }
 
 // List handles GET /v1/bookings?limit=&cursor=.

@@ -239,9 +239,13 @@ func (tx *memTx) LockOrdered(_ context.Context, showtimeID int64, seatIDs []int6
 
 func (tx *memTx) LockByBookings(_ context.Context, bookingIDs ...uuid.UUID) ([]domain.ShowtimeSeat, error) {
 	tx.record("lock seats of %d bookings", len(bookingIDs))
+	// The seats live in a map, which Go iterates in random order; the port promises (showtime_id, seat_id) order.
+	keys := slices.SortedFunc(maps.Keys(tx.state.seats), func(a, b seatKey) int {
+		return cmp.Or(cmp.Compare(a.showtimeID, b.showtimeID), cmp.Compare(a.seatID, b.seatID))
+	})
 	var out []domain.ShowtimeSeat
-	for _, s := range tx.state.seats {
-		if slices.Contains(bookingIDs, s.bookingID) {
+	for _, k := range keys {
+		if s := tx.state.seats[k]; slices.Contains(bookingIDs, s.bookingID) {
 			out = append(out, s.locked())
 		}
 	}

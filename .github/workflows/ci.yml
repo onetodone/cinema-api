@@ -1,0 +1,116 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: go.mod and go.sum are tidy
+        run: go mod tidy -diff
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.14.0
+      - name: Lint the API contract
+        run: make lint-api
+
+  test:
+    name: Unit tests (race detector)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - run: make test
+
+  integration:
+    name: Integration tests (PostgreSQL 18, Redis 8)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      # testcontainers starts its own PostgreSQL and Redis containers on the runner's Docker.
+      - run: make test-integration
+
+  e2e:
+    name: End to end (image, migrations, seed, k6 race)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18.4-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: cinema
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres -d cinema"
+          --health-interval 2s --health-timeout 5s --health-retries 20
+      redis:
+        image: redis:8.8-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s --health-timeout 5s --health-retries 20
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/cinema?sslmode=disable
+      REDIS_ADDR: localhost:6379
+      JWT_SECRET: ci-only-secret-that-is-at-least-32-bytes-long
+      ADMIN_PASSWORD: ci-admin-password
+      PAYMENT_LOCAL_ENABLED: 'true'
+      # The race logs 500 accounts in from one address, and a cheaper hash keeps setup short.
+      AUTH_IP_RATE_LIMIT_PER_MIN: '0'
+      BCRYPT_COST: '10'
+      LOG_FORMAT: text
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build the image
+        run: docker build -t cinema-api:ci .
+      - name: Migrate and seed from the image
+        run: |
+          docker run --rm --network host -e DATABASE_URL --entrypoint /app/migrate cinema-api:ci up
+          docker run --rm --network host -e DATABASE_URL -e ADMIN_PASSWORD --entrypoint /app/seed cinema-api:ci
+      - name: Start the API and the worker
+        run: |
+          docker run -d --name api --network host \
+            -e DATABASE_URL -e REDIS_ADDR -e JWT_SECRET -e PAYMENT_LOCAL_ENABLED \
+            -e AUTH_IP_RATE_LIMIT_PER_MIN -e BCRYPT_COST -e LOG_FORMAT cinema-api:ci
+          docker run -d --name worker --network host \
+            -e DATABASE_URL -e REDIS_ADDR -e PAYMENT_LOCAL_ENABLED -e LOG_FORMAT \
+            --entrypoint /app/worker cinema-api:ci
+          for _ in $(seq 1 30); do
+            curl -fsS localhost:8080/readyz && curl -fsS localhost:9091/readyz && exit 0
+            sleep 1
+          done
+          exit 1
+      - uses: grafana/setup-k6-action@v1
+      - name: 500 users race for one seat
+        run: k6 run -e BASE_URL=http://localhost:8080 test/load/booking_race.js
+      - name: Metrics are served on the internal ports only
+        run: |
+          curl -fsS localhost:9090/metrics | grep -E '^cinema_(booking_attempts_total|hold_gate_rejections_total)'
+          curl -fsS localhost:9091/metrics | grep '^cinema_bookings_expired_total'
+          test "$(curl -s -o /dev/null -w '%{http_code}' localhost:8080/metrics)" = 404
+      - name: Logs of the API and the worker
+        if: failure()
+        run: |
+          docker logs api || true
+          docker logs worker || true

@@ -1,0 +1,1100 @@
+openapi: 3.1.0
+info:
+  title: Cinema Booking API
+  version: 1.0.0
+  summary: Browse showtimes, hold seats for 15 minutes, and pay for them, without ever selling a seat twice.
+  description: |
+    A REST API for cinema ticket booking.
+
+    - A booking holds 1 to 10 seats of one showtime for 15 minutes. Paying for it sells the seats; without a
+      payment, the hold expires and the seats are available again.
+    - PostgreSQL decides who gets a seat, under row locks taken in one global order. Redis is an accelerator
+      (hold gate, caches, idempotency records, rate limits) that fails open.
+
+    **Conventions**
+
+    - Times are RFC 3339. Showtime times carry the cinema's UTC offset; the timestamps of bookings, payments,
+      and accounts are in UTC. Schedule days start at midnight in the cinema's time zone.
+    - Money is in integer cents of the currency named next to it.
+    - Lists use keyset pagination: pass `next_cursor` of one page as `cursor` to get the next. A page without
+      `next_cursor` is the last one. Cursors are opaque.
+    - Errors are `application/problem+json` (RFC 9457) with `type: about:blank`. Clients branch on `code`,
+      which is stable; `detail` is for humans. Every problem carries `request_id`, which is also the
+      `X-Request-ID` response header. A client may send its own `X-Request-ID` (up to 128 URL-safe characters)
+      to trace a request across services.
+    - Request bodies are JSON objects sent with `Content-Type: application/json`, at most 64 KiB, without
+      unknown fields.
+    - `Retry-After` (seconds) marks answers that are worth retrying unchanged: 409 `SEAT_BUSY`,
+      `BOOKING_BUSY`, and `IDEMPOTENCY_IN_PROGRESS`, 429, and 503.
+    - Prometheus metrics are not part of this API: they are served on a separate internal port.
+servers:
+  - url: http://localhost:8080
+    description: Local development (`make run-api`)
+tags:
+  - name: Auth
+    description: Accounts and access tokens.
+  - name: Catalog
+    description: Movies, the schedule, and seat maps. Public.
+  - name: Bookings
+    description: Seat holds of the caller.
+  - name: Payments
+    description: Paying for a booking.
+  - name: Admin
+    description: Catalog management. Admins only.
+  - name: Health
+    description: Probes for load balancers and orchestrators.
+
+paths:
+  /healthz:
+    get:
+      tags: [Health]
+      operationId: live
+      summary: Liveness
+      security: []
+      description: Reports that the process runs. It never touches a dependency.
+      responses:
+        '200':
+          description: The process runs.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Liveness' }
+  /readyz:
+    get:
+      tags: [Health]
+      operationId: ready
+      summary: Readiness
+      security: []
+      description: |
+        Checks PostgreSQL and Redis. Only PostgreSQL is critical: without Redis the API works (fail open), so
+        it reports `degraded` with 200 and stays in the load balancer.
+      responses:
+        '200':
+          description: Ready to take traffic, possibly without Redis.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Readiness' }
+              examples:
+                ok: { value: { status: ok, checks: { postgres: up, redis: up } } }
+                degraded: { value: { status: degraded, checks: { postgres: up, redis: down } } }
+        '503':
+          description: PostgreSQL is unreachable.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Readiness' }
+              example: { status: unavailable, checks: { postgres: down, redis: up } }
+
+  /v1/auth/register:
+    post:
+      tags: [Auth]
+      operationId: register
+      summary: Create a customer account
+      security: []
+      description: The address is unique in any letter case and stored as typed. Limited per client address.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Credentials' }
+      responses:
+        '201':
+          description: The account.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409':
+          description: '`EMAIL_TAKEN`: an account with this address exists.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /v1/auth/login:
+    post:
+      tags: [Auth]
+      operationId: login
+      summary: Get an access token
+      security: []
+      description: |
+        Answers in the shape of an OAuth 2.0 token response. There are no refresh tokens: log in again when the
+        token expires. Limited per client address and per account address.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Credentials' }
+      responses:
+        '200':
+          description: The access token.
+          headers:
+            Cache-Control:
+              description: Always `no-store` (RFC 6749 §5.1).
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AccessToken' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401':
+          description: '`INVALID_CREDENTIALS`: the address or the password is wrong. The answer does not say which.'
+          headers:
+            WWW-Authenticate: { $ref: '#/components/headers/WWW-Authenticate' }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /v1/me:
+    get:
+      tags: [Auth]
+      operationId: me
+      summary: The caller's account
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: The account.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/movies:
+    get:
+      tags: [Catalog]
+      operationId: listMovies
+      summary: List movies
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page of movies, by id.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MovieList' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /v1/movies/{movieID}:
+    get:
+      tags: [Catalog]
+      operationId: getMovie
+      summary: A movie with its upcoming showtimes
+      security: []
+      description: Lists the showtimes that start within the next 14 days, at most 50.
+      parameters:
+        - $ref: '#/components/parameters/MovieID'
+      responses:
+        '200':
+          description: The movie.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MovieDetails' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /v1/showtimes:
+    get:
+      tags: [Catalog]
+      operationId: getSchedule
+      summary: The schedule of a day
+      security: []
+      description: |
+        Lists the scheduled showtimes that start on one day in the cinema's time zone, by start time. Served
+        from a cache: `seats_available` may be up to 10 seconds old; the seat map is fresher.
+      parameters:
+        - name: date
+          in: query
+          description: The day, `YYYY-MM-DD`. Today in the cinema's time zone when absent.
+          schema: { type: string, format: date, example: '2026-10-01' }
+        - name: movie_id
+          in: query
+          description: Only this movie's showtimes.
+          schema: { type: integer, format: int64, minimum: 1 }
+      responses:
+        '200':
+          description: The schedule.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Schedule' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /v1/showtimes/{showtimeID}:
+    get:
+      tags: [Catalog]
+      operationId: getShowtime
+      summary: A showtime
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/ShowtimeID'
+      responses:
+        '200':
+          description: The showtime with its live seat counts.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Showtime' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /v1/showtimes/{showtimeID}/seats:
+    get:
+      tags: [Catalog]
+      operationId: getSeatMap
+      summary: The seat map of a showtime
+      security: []
+      description: |
+        Every seat with its status and price, by row and number (row `AA` follows `Z`). Served from a cache
+        that every booking, cancellation, expiry, and sale clears at once; otherwise at most 5 seconds old. A
+        booking always checks the seats in the database, so a stale map never sells a seat twice.
+      parameters:
+        - $ref: '#/components/parameters/ShowtimeID'
+      responses:
+        '200':
+          description: The seat map.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SeatMap' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/bookings:
+    post:
+      tags: [Bookings]
+      operationId: createBooking
+      summary: Hold seats
+      description: |
+        Holds the seats for the caller until `expires_at` (15 minutes by default). All or nothing: if any seat
+        is taken, nothing is held, and `unavailable_seat_ids` lists every taken seat of the request.
+
+        A caller has at most one unpaid booking per showtime. Limited to 20 attempts per caller and minute.
+        With an `Idempotency-Key`, a retry gets the first answer again instead of a conflict.
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyOptional'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateBookingRequest' }
+      responses:
+        '201':
+          description: The booking, with its seats held.
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+            Idempotent-Replayed: { $ref: '#/components/headers/Idempotent-Replayed' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Booking' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: '`SHOWTIME_NOT_FOUND`.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '409':
+          description: |
+            - `SEAT_UNAVAILABLE`: seats are held or sold; `unavailable_seat_ids` lists them.
+            - `SEAT_BUSY`: another booking kept the seats locked for too long; retry after `Retry-After`.
+            - `BOOKING_BUSY`: another request of the caller for this showtime is running; retry.
+            - `ACTIVE_BOOKING_EXISTS`: the caller has an unpaid booking for this showtime.
+            - `SHOWTIME_NOT_BOOKABLE`: the showtime has started or was canceled.
+            - `IDEMPOTENCY_IN_PROGRESS`: the first request with this key is still running; retry.
+          headers:
+            Retry-After: { $ref: '#/components/headers/Retry-After' }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              examples:
+                unavailable:
+                  value:
+                    type: about:blank
+                    title: Conflict
+                    status: 409
+                    detail: seats 61, 62 are already held or sold
+                    instance: /v1/bookings
+                    code: SEAT_UNAVAILABLE
+                    request_id: 0199a1f0-7c1e-7d2a-9b3e-5f0c2d1e4a77
+                    unavailable_seat_ids: [61, 62]
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '422':
+          description: |
+            - `UNKNOWN_SEAT`: seats that are not part of the showtime.
+            - `IDEMPOTENCY_KEY_REUSED`: the key was used for a request with another body.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    get:
+      tags: [Bookings]
+      operationId: listBookings
+      summary: List the caller's bookings
+      description: Newest first.
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page of bookings.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BookingList' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /v1/bookings/{bookingID}:
+    get:
+      tags: [Bookings]
+      operationId: getBooking
+      summary: A booking of the caller
+      description: Another user's booking is reported as not found, so ids do not leak.
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/BookingID'
+      responses:
+        '200':
+          description: The booking.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Booking' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    delete:
+      tags: [Bookings]
+      operationId: cancelBooking
+      summary: Cancel a booking
+      description: |
+        Releases the seats of an unpaid booking. Canceling a booking that is already canceled or expired
+        succeeds without changes, so a retry gets the same answer.
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/BookingID'
+      responses:
+        '204':
+          description: The booking holds no seats.
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: |
+            - `BOOKING_NOT_CANCELABLE`: a payment is in progress, or the booking is paid.
+            - `BOOKING_BUSY`: another request holds the booking; retry after `Retry-After`.
+          headers:
+            Retry-After: { $ref: '#/components/headers/Retry-After' }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/payment-methods:
+    get:
+      tags: [Payments]
+      operationId: listPaymentMethods
+      summary: The payment methods that take payments
+      security: []
+      responses:
+        '200':
+          description: The enabled payment providers.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PaymentMethodList' }
+              example: { items: [{ id: local, name: Test card }] }
+  /v1/bookings/{bookingID}/payments:
+    post:
+      tags: [Payments]
+      operationId: payBooking
+      summary: Pay for a booking
+      description: |
+        Charges a pending booking through a payment method and, on success, sells its seats.
+
+        The booking must be pending and its hold not over by the database clock. While the provider works,
+        the booking is `processing`, so the expiry worker leaves it alone and a charge that completes after the
+        deadline still gets its seats.
+
+        When the provider does not answer in time, the answer is 202: the payment stays `pending`, the booking
+        `processing`, and the worker settles both within a few minutes; follow `Location`. An `Idempotency-Key`
+        is required, so a retry after a lost answer gets that answer again instead of paying twice.
+
+        The local test provider (development only) takes these tokens: `tok_success`; `tok_slow` (succeeds
+        after 5 s); `tok_declined`, `tok_insufficient_funds`, `tok_expired_card` (402); `tok_unavailable`
+        (503); `tok_error` and `tok_timeout` (202).
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/BookingID'
+        - $ref: '#/components/parameters/IdempotencyKeyRequired'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PayRequest' }
+      responses:
+        '200':
+          description: Paid; the seats are sold.
+          headers:
+            Idempotent-Replayed: { $ref: '#/components/headers/Idempotent-Replayed' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PaymentResult' }
+        '202':
+          description: The outcome is not known yet. The payment is `pending` and the booking `processing`.
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+            Idempotent-Replayed: { $ref: '#/components/headers/Idempotent-Replayed' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PaymentResult' }
+        '400':
+          description: '`VALIDATION_FAILED`, also for a missing or malformed `Idempotency-Key`, or `MALFORMED_BODY`.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402':
+          description: '`PAYMENT_DECLINED`: the provider declined; `decline_code` says why. The booking is pending again.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              example:
+                type: about:blank
+                title: Payment Required
+                status: 402
+                detail: the payment was declined (insufficient_funds); nothing was charged
+                instance: /v1/bookings/0199a1f0-7c1e-7d2a-9b3e-5f0c2d1e4a77/payments
+                code: PAYMENT_DECLINED
+                request_id: 0199a1f0-8d2f-7e3b-8c4f-6a1d3e2f5b88
+                decline_code: insufficient_funds
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: |
+            - `PAYMENT_IN_PROGRESS`: another payment of the booking is in flight.
+            - `BOOKING_ALREADY_PAID`, `BOOKING_CANCELED`.
+            - `BOOKING_BUSY`: another request holds the booking; retry after `Retry-After`.
+            - `PAYMENT_REFUNDED`: the charge went through only after the booking had stopped waiting for it,
+              and was refunded.
+            - `IDEMPOTENCY_IN_PROGRESS`: the first request with this key is still running; retry.
+          headers:
+            Retry-After: { $ref: '#/components/headers/Retry-After' }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '410':
+          description: '`BOOKING_EXPIRED`: the hold ran out; the seats may be someone else''s now.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '422':
+          description: |
+            - `PAYMENT_METHOD_UNAVAILABLE`: the method is unknown or disabled; see `GET /v1/payment-methods`.
+            - `IDEMPOTENCY_KEY_REUSED`: the key was used for a request with another body.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '500': { $ref: '#/components/responses/InternalError' }
+        '503':
+          description: |
+            `PAYMENT_PROVIDER_UNAVAILABLE`: the provider refused the request. Nothing was charged, and the
+            booking is pending again; retry after `Retry-After` with a new `Idempotency-Key`.
+          headers:
+            Retry-After: { $ref: '#/components/headers/Retry-After' }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /v1/admin/movies:
+    post:
+      tags: [Admin]
+      operationId: createMovie
+      summary: Add a movie
+      description: Surrounding space is trimmed from every text field.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateMovieRequest' }
+      responses:
+        '201':
+          description: The movie.
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Movie' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /v1/admin/halls:
+    post:
+      tags: [Admin]
+      operationId: createHall
+      summary: Add a hall with its seats
+      description: |
+        Each row gets seats numbered from 1. The answer lists every seat with its id; halls have no URL of their
+        own, and showtimes and seat maps show them.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateHallRequest' }
+      responses:
+        '201':
+          description: The hall and its seats, by row and number.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Hall' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: '`HALL_NAME_TAKEN`.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /v1/admin/showtimes:
+    post:
+      tags: [Admin]
+      operationId: createShowtime
+      summary: Schedule a showtime
+      description: |
+        Puts every seat of the hall on sale: standard and accessible seats at the base price, VIP seats at 1.5
+        times the base price. The showtime occupies the hall from its start until the movie and 15 minutes of
+        cleaning are over. A hall cannot host two overlapping showtimes; the database enforces that with an
+        exclusion constraint, so two admins who schedule the same slot at once cannot both succeed.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateShowtimeRequest' }
+      responses:
+        '201':
+          description: The showtime.
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Showtime' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: '`MOVIE_NOT_FOUND` or `HALL_NOT_FOUND`.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '409':
+          description: '`HALL_OVERLAP`: another scheduled showtime occupies the hall at an overlapping time.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: The `access_token` from `POST /v1/auth/login`, valid for an hour by default.
+
+  parameters:
+    MovieID:
+      name: movieID
+      in: path
+      required: true
+      schema: { type: integer, format: int64, minimum: 1 }
+    ShowtimeID:
+      name: showtimeID
+      in: path
+      required: true
+      schema: { type: integer, format: int64, minimum: 1 }
+    BookingID:
+      name: bookingID
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    Limit:
+      name: limit
+      in: query
+      description: Page size.
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+    Cursor:
+      name: cursor
+      in: query
+      description: The `next_cursor` of the previous page.
+      schema: { type: string }
+    IdempotencyKeyOptional:
+      name: Idempotency-Key
+      in: header
+      description: |
+        A key of the caller's choice, such as a UUID. A retry with the same key and body gets the stored answer
+        for 24 hours, with `Idempotent-Replayed: true`.
+      schema: { $ref: '#/components/schemas/IdempotencyKey' }
+    IdempotencyKeyRequired:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        A key of the caller's choice, such as a UUID, new for every payment attempt. A retry with the same key
+        and body gets the stored answer for 24 hours, with `Idempotent-Replayed: true`.
+      schema: { $ref: '#/components/schemas/IdempotencyKey' }
+
+  headers:
+    Location:
+      description: The URL of the resource.
+      schema: { type: string, format: uri-reference }
+    Retry-After:
+      description: Seconds to wait before retrying the same request.
+      schema: { type: integer, minimum: 1 }
+    Idempotent-Replayed:
+      description: '`true` when the answer repeats the stored answer of an earlier request with the same key.'
+      schema: { type: string, const: 'true' }
+    WWW-Authenticate:
+      description: The bearer challenge (RFC 6750), with `error="invalid_token"` for a rejected token.
+      schema: { type: string, example: 'Bearer realm="cinema-api", error="invalid_token"' }
+
+  responses:
+    BadRequest:
+      description: |
+        - `VALIDATION_FAILED`: invalid parameters or fields; `errors` lists every one of them.
+        - `MALFORMED_BODY`: the body is not one JSON object, or has unknown fields.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example:
+            type: about:blank
+            title: Bad Request
+            status: 400
+            detail: The request has invalid parameters.
+            instance: /v1/admin/halls
+            code: VALIDATION_FAILED
+            request_id: 0199a1f0-7c1e-7d2a-9b3e-5f0c2d1e4a77
+            errors:
+              - { field: name, message: is required }
+              - { field: 'rows[1].seats', message: must be between 1 and 100 }
+    Unauthorized:
+      description: '`UNAUTHENTICATED` (no bearer token), `INVALID_TOKEN`, or `TOKEN_EXPIRED`.'
+      headers:
+        WWW-Authenticate: { $ref: '#/components/headers/WWW-Authenticate' }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Forbidden:
+      description: '`FORBIDDEN`: the caller is not an admin.'
+      headers:
+        WWW-Authenticate: { $ref: '#/components/headers/WWW-Authenticate' }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    NotFound:
+      description: '`MOVIE_NOT_FOUND`, `SHOWTIME_NOT_FOUND`, or `BOOKING_NOT_FOUND`.'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    PayloadTooLarge:
+      description: '`BODY_TOO_LARGE`: the body is larger than 64 KiB.'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    UnsupportedMediaType:
+      description: '`UNSUPPORTED_MEDIA_TYPE`: the body must be sent as `application/json`.'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    TooManyRequests:
+      description: '`RATE_LIMITED`: too many attempts; retry after `Retry-After`.'
+      headers:
+        Retry-After: { $ref: '#/components/headers/Retry-After' }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    InternalError:
+      description: '`INTERNAL`: an unexpected error. The details are in the server log under `request_id`.'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+  schemas:
+    Problem:
+      type: object
+      description: RFC 9457 problem details.
+      required: [type, title, status, code]
+      properties:
+        type: { type: string, const: about:blank }
+        title: { type: string, description: The HTTP status phrase., example: Conflict }
+        status: { type: integer, example: 409 }
+        detail: { type: string, description: 'What went wrong, for humans.' }
+        instance: { type: string, description: The request path., example: /v1/bookings }
+        code:
+          type: string
+          description: Stable machine-readable code.
+          example: SEAT_UNAVAILABLE
+        request_id: { type: string, description: The request's `X-Request-ID`. }
+        errors:
+          type: array
+          description: With `VALIDATION_FAILED`, every invalid field.
+          items: { $ref: '#/components/schemas/FieldError' }
+        unavailable_seat_ids:
+          type: array
+          description: With `SEAT_UNAVAILABLE`, the requested seats that are taken.
+          items: { type: integer, format: int64 }
+        decline_code:
+          type: string
+          description: With `PAYMENT_DECLINED`, the provider's reason.
+          example: insufficient_funds
+    FieldError:
+      type: object
+      required: [field, message]
+      properties:
+        field:
+          type: string
+          description: The parameter, header, or body field, such as `seat_ids`, `Idempotency-Key`, or `rows[2].label`.
+        message: { type: string, example: is required }
+
+    Liveness:
+      type: object
+      required: [status]
+      properties:
+        status: { type: string, const: ok }
+    Readiness:
+      type: object
+      required: [status, checks]
+      properties:
+        status: { type: string, enum: [ok, degraded, unavailable] }
+        checks:
+          type: object
+          additionalProperties: { type: string, enum: [up, down] }
+
+    Credentials:
+      type: object
+      required: [email, password]
+      additionalProperties: false
+      properties:
+        email: { type: string, format: email, maxLength: 254, example: ann@example.com }
+        password:
+          type: string
+          minLength: 8
+          description: 8 characters to 72 bytes.
+          example: correct horse battery
+    User:
+      type: object
+      required: [id, email, role, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string, format: email }
+        role: { type: string, enum: [customer, admin] }
+        created_at: { type: string, format: date-time }
+    AccessToken:
+      type: object
+      required: [access_token, token_type, expires_in]
+      properties:
+        access_token: { type: string }
+        token_type: { type: string, const: Bearer }
+        expires_in: { type: integer, description: Seconds until the token expires., example: 3600 }
+
+    Movie:
+      type: object
+      required: [id, title, duration_min]
+      properties:
+        id: { type: integer, format: int64 }
+        title: { type: string, example: The Last Projectionist }
+        description: { type: string }
+        duration_min: { type: integer, example: 118 }
+        age_rating: { type: string, example: PG-13 }
+        poster_url: { type: string, format: uri }
+    MovieList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Movie' }
+        next_cursor: { type: string, description: Absent on the last page. }
+    MovieDetails:
+      allOf:
+        - $ref: '#/components/schemas/Movie'
+        - type: object
+          required: [upcoming_showtimes]
+          properties:
+            upcoming_showtimes:
+              type: array
+              items: { $ref: '#/components/schemas/Showtime' }
+    MovieRef:
+      type: object
+      required: [id, title, duration_min]
+      properties:
+        id: { type: integer, format: int64 }
+        title: { type: string }
+        duration_min: { type: integer }
+        age_rating: { type: string }
+    HallRef:
+      type: object
+      required: [id, name]
+      properties:
+        id: { type: integer, format: int64 }
+        name: { type: string, example: Hall 1 }
+    Showtime:
+      type: object
+      required: [id, movie, hall, starts_at, ends_at, status, base_price_cents, currency, seats_available, seats_total]
+      properties:
+        id: { type: integer, format: int64 }
+        movie: { $ref: '#/components/schemas/MovieRef' }
+        hall: { $ref: '#/components/schemas/HallRef' }
+        starts_at: { type: string, format: date-time, example: '2026-10-01T19:30:00+02:00' }
+        ends_at:
+          type: string
+          format: date-time
+          description: When the hall is free again, cleaning included.
+        status: { type: string, enum: [scheduled, canceled] }
+        base_price_cents: { type: integer, example: 1300 }
+        currency: { type: string, example: USD }
+        seats_available: { type: integer }
+        seats_total: { type: integer }
+    Schedule:
+      type: object
+      required: [date, items]
+      properties:
+        date: { type: string, format: date }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Showtime' }
+    SeatType:
+      type: string
+      enum: [standard, vip, accessible]
+    SeatStatus:
+      type: string
+      enum: [available, held, sold]
+    Seat:
+      type: object
+      required: [id, row, number, type, price_cents, status]
+      properties:
+        id: { type: integer, format: int64, description: The seat id to book. }
+        row: { type: string, example: C }
+        number: { type: integer, example: 7 }
+        type: { $ref: '#/components/schemas/SeatType' }
+        price_cents: { type: integer, example: 1300 }
+        status: { $ref: '#/components/schemas/SeatStatus' }
+    SeatMap:
+      type: object
+      required: [showtime_id, movie, hall, starts_at, currency, summary, seats]
+      properties:
+        showtime_id: { type: integer, format: int64 }
+        movie: { $ref: '#/components/schemas/MovieRef' }
+        hall: { $ref: '#/components/schemas/HallRef' }
+        starts_at: { type: string, format: date-time }
+        currency: { type: string }
+        summary:
+          type: object
+          required: [available, held, sold, total]
+          properties:
+            available: { type: integer }
+            held: { type: integer }
+            sold: { type: integer }
+            total: { type: integer }
+        seats:
+          type: array
+          items: { $ref: '#/components/schemas/Seat' }
+
+    CreateBookingRequest:
+      type: object
+      required: [showtime_id, seat_ids]
+      additionalProperties: false
+      properties:
+        showtime_id: { type: integer, format: int64, minimum: 1 }
+        seat_ids:
+          type: array
+          description: 1 to 10 distinct seat ids of the showtime, as its seat map lists them.
+          minItems: 1
+          maxItems: 10
+          uniqueItems: true
+          items: { type: integer, format: int64, minimum: 1 }
+          example: [61, 62]
+    BookedSeat:
+      type: object
+      required: [id, row, number, type, price_cents]
+      properties:
+        id: { type: integer, format: int64 }
+        row: { type: string }
+        number: { type: integer }
+        type: { $ref: '#/components/schemas/SeatType' }
+        price_cents: { type: integer, description: The price the seat was booked for. }
+    Booking:
+      type: object
+      required: [id, status, showtime, seats, total_cents, currency, expires_at, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        status:
+          type: string
+          description: |
+            `pending` (seats held until `expires_at`), `processing` (a payment is in flight), `paid` (seats
+            sold), `expired` (the hold ran out; seats released), `canceled` (by the owner; seats released).
+          enum: [pending, processing, paid, expired, canceled]
+        showtime:
+          type: object
+          required: [id, movie, hall, starts_at]
+          properties:
+            id: { type: integer, format: int64 }
+            movie: { $ref: '#/components/schemas/MovieRef' }
+            hall: { $ref: '#/components/schemas/HallRef' }
+            starts_at: { type: string, format: date-time }
+        seats:
+          type: array
+          description: By row and number.
+          items: { $ref: '#/components/schemas/BookedSeat' }
+        total_cents: { type: integer }
+        currency: { type: string }
+        expires_at: { type: string, format: date-time, description: 'When the hold runs out, in UTC.' }
+        paid_at: { type: string, format: date-time, description: Only on paid bookings. }
+        created_at: { type: string, format: date-time }
+    BookingList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Booking' }
+        next_cursor: { type: string, description: Absent on the last page. }
+
+    PaymentMethod:
+      type: object
+      required: [id, name]
+      properties:
+        id: { type: string, description: The value of `payment_method`., example: local }
+        name: { type: string, example: Test card }
+    PaymentMethodList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/PaymentMethod' }
+    PayRequest:
+      type: object
+      required: [payment_method, payment_token]
+      additionalProperties: false
+      properties:
+        payment_method: { type: string, description: An id from `GET /v1/payment-methods`., example: local }
+        payment_token:
+          type: string
+          maxLength: 255
+          description: Stands for the payment source at the provider; opaque to this API.
+          example: tok_success
+    Payment:
+      type: object
+      required: [id, status, payment_method, amount_cents, currency, created_at]
+      properties:
+        id: { type: string, format: uuid, description: Also the idempotency key of every call to the provider. }
+        status: { type: string, enum: [pending, succeeded, failed, refunded] }
+        payment_method: { type: string }
+        amount_cents: { type: integer }
+        currency: { type: string }
+        failure_reason:
+          type: string
+          description: Why a payment failed or was refunded, such as a decline code.
+        created_at: { type: string, format: date-time }
+    PaymentResult:
+      type: object
+      required: [payment, booking]
+      properties:
+        payment: { $ref: '#/components/schemas/Payment' }
+        booking: { $ref: '#/components/schemas/Booking' }
+
+    CreateMovieRequest:
+      type: object
+      required: [title, duration_min]
+      additionalProperties: false
+      properties:
+        title: { type: string, maxLength: 200 }
+        description: { type: string, maxLength: 5000 }
+        duration_min: { type: integer, minimum: 1, maximum: 600 }
+        age_rating: { type: string, maxLength: 16 }
+        poster_url: { type: string, format: uri, maxLength: 2048, description: An absolute http or https URL. }
+    CreateHallRequest:
+      type: object
+      required: [name, rows]
+      additionalProperties: false
+      properties:
+        name: { type: string, maxLength: 100, description: Unique., example: Hall 4 }
+        rows:
+          type: array
+          description: At most 1 000 seats in all.
+          minItems: 1
+          maxItems: 50
+          items:
+            type: object
+            required: [label, seats]
+            additionalProperties: false
+            properties:
+              label:
+                type: string
+                pattern: '^[A-Z0-9]{1,3}$'
+                description: Unique in the hall.
+                example: A
+              seats: { type: integer, minimum: 1, maximum: 100 }
+              type:
+                allOf: [{ $ref: '#/components/schemas/SeatType' }]
+                default: standard
+          example:
+            - { label: A, seats: 12, type: accessible }
+            - { label: B, seats: 14 }
+            - { label: C, seats: 14, type: vip }
+    HallSeat:
+      type: object
+      required: [id, row, number, type]
+      properties:
+        id: { type: integer, format: int64, description: The seat id of every showtime in the hall. }
+        row: { type: string }
+        number: { type: integer }
+        type: { $ref: '#/components/schemas/SeatType' }
+    Hall:
+      type: object
+      required: [id, name, seats_total, seats]
+      properties:
+        id: { type: integer, format: int64 }
+        name: { type: string }
+        seats_total: { type: integer }
+        seats:
+          type: array
+          items: { $ref: '#/components/schemas/HallSeat' }
+    CreateShowtimeRequest:
+      type: object
+      required: [movie_id, hall_id, starts_at, base_price_cents]
+      additionalProperties: false
+      properties:
+        movie_id: { type: integer, format: int64, minimum: 1 }
+        hall_id: { type: integer, format: int64, minimum: 1 }
+        starts_at:
+          type: string
+          format: date-time
+          description: In the future and at most 366 days ahead, with a UTC offset.
+          example: '2026-10-01T19:30:00+02:00'
+        base_price_cents: { type: integer, minimum: 0, maximum: 1000000, example: 1300 }
+
+    IdempotencyKey:
+      type: string
+      minLength: 1
+      maxLength: 255
+      pattern: '^[\x20-\x7E]+$'
+      description: Printable ASCII.
+      example: 0199a1f0-9e3a-7f4c-9d5a-7b2e4f3a6c99

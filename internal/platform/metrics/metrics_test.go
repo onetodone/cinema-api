@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestHandlerServesEveryMetricFromZero(t *testing.T) {
@@ -15,6 +16,9 @@ func TestHandlerServesEveryMetricFromZero(t *testing.T) {
 	m := New(reg)
 	m.HoldGateRejections.Inc()
 	m.RedisFailOpen.WithLabelValues(OpCacheGet).Add(2)
+	m.InitPayments("local")
+	m.ObserveRequest("GET /v1/movies", 200, 3*time.Millisecond)
+	m.ObserveRequest("", 404, time.Millisecond)
 
 	rec := httptest.NewRecorder()
 	Handler(reg).ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil))
@@ -30,6 +34,14 @@ func TestHandlerServesEveryMetricFromZero(t *testing.T) {
 		`cinema_cache_requests_total{cache="seatmap",result="hit"} 0`,
 		`cinema_rate_limit_rejections_total{limit="login_email"} 0`,
 		`cinema_idempotency_requests_total{result="replayed"} 0`,
+		`cinema_booking_attempts_total{result="seat_unavailable"} 0`,
+		`cinema_db_tx_retries_total{sqlstate="40P01"} 0`,
+		"cinema_bookings_expired_total 0",
+		`cinema_payments_total{provider="local",result="pending"} 0`,
+		`cinema_payments_reconciled_total{result="unsettled"} 0`,
+		`cinema_http_request_duration_seconds_bucket{code="200",route="GET /v1/movies",le="0.005"} 1`,
+		`cinema_http_request_duration_seconds_bucket{code="200",route="GET /v1/movies",le="0.0025"} 0`,
+		`cinema_http_request_duration_seconds_count{code="404",route="unmatched"} 1`,
 		"go_goroutines",
 		"process_cpu_seconds_total",
 	} {

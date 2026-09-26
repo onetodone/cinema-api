@@ -120,6 +120,92 @@ type HallRow struct {
 	Type  SeatType
 }
 
+// Hall limits.
+const (
+	MaxHallNameLength = 100
+	MaxHallRows       = 50
+	MaxRowLabelLength = 3
+	MaxRowSeats       = 100
+	// MaxHallSeats bounds the rows that scheduling one showtime of the hall inserts.
+	MaxHallSeats = 1000
+)
+
+// NewHall holds the fields needed to create a hall with its seats. Each row gets seats numbered from 1.
+type NewHall struct {
+	Name string
+	Rows []HallRow
+}
+
+// Validate reports every invalid field of h as a *ValidationError, or returns nil. Fields of a row are named
+// like rows[2].seats, counting from 0.
+func (h NewHall) Validate() error {
+	var v Violations
+	switch n := utf8.RuneCountInString(h.Name); {
+	case n == 0:
+		v.Add("name", "is required")
+	case n > MaxHallNameLength:
+		v.Add("name", "must be at most %d characters", MaxHallNameLength)
+	}
+	switch n := len(h.Rows); {
+	case n == 0:
+		v.Add("rows", "must contain at least 1 row")
+	case n > MaxHallRows:
+		v.Add("rows", "must contain at most %d rows", MaxHallRows)
+	}
+
+	seen := make(map[string]bool, len(h.Rows))
+	total := 0
+	for i, r := range h.Rows {
+		field := fmt.Sprintf("rows[%d].", i)
+		switch {
+		case !isRowLabel(r.Label):
+			v.Add(field+"label", "must be 1 to %d uppercase letters or digits", MaxRowLabelLength)
+		case seen[r.Label]:
+			v.Add(field+"label", "must be unique, but row %s appears more than once", r.Label)
+		}
+		seen[r.Label] = true
+		if r.Seats < 1 || r.Seats > MaxRowSeats {
+			v.Add(field+"seats", "must be between 1 and %d", MaxRowSeats)
+		}
+		if !r.Type.Valid() {
+			v.Add(field+"type", "must be %s, %s, or %s", SeatStandard, SeatVIP, SeatAccessible)
+		}
+		total += r.Seats
+	}
+	if total > MaxHallSeats {
+		v.Add("rows", "must contain at most %d seats in all, got %d", MaxHallSeats, total)
+	}
+	return v.Err()
+}
+
+// isRowLabel accepts short labels of uppercase letters and digits, such as A, AA, or 12. Seat maps sort rows by
+// label length first, so AA follows Z and 10 follows 9.
+func isRowLabel(s string) bool {
+	if s == "" || len(s) > MaxRowLabelLength {
+		return false
+	}
+	for _, c := range s {
+		if (c < 'A' || c > 'Z') && (c < '0' || c > '9') {
+			return false
+		}
+	}
+	return true
+}
+
+// HallSeat is a physical seat of a hall.
+type HallSeat struct {
+	ID     int64
+	Row    string
+	Number int
+	Type   SeatType
+}
+
+// HallLayout is a hall with its seats, in seat map order.
+type HallLayout struct {
+	Hall
+	Seats []HallSeat
+}
+
 // SeatStatus is the state of a seat for one showtime.
 type SeatStatus string
 
@@ -158,6 +244,39 @@ type NewShowtime struct {
 	HallID         int64
 	StartsAt       time.Time
 	BasePriceCents int64
+}
+
+// Showtime limits.
+const (
+	// MaxBasePriceCents keeps every price and booking total far below the 32-bit integer columns that store them:
+	// a VIP seat costs 1.5 times the base price, and a booking has at most 50 seats.
+	MaxBasePriceCents = 1_000_000
+	// MaxScheduleAhead is how far in the future a showtime may start.
+	MaxScheduleAhead = 366 * 24 * time.Hour
+)
+
+// Validate reports every invalid field of s as a *ValidationError, or returns nil. A showtime must start after
+// now and at most MaxScheduleAhead later.
+func (s NewShowtime) Validate(now time.Time) error {
+	var v Violations
+	if s.MovieID <= 0 {
+		v.Add("movie_id", "must be a positive integer")
+	}
+	if s.HallID <= 0 {
+		v.Add("hall_id", "must be a positive integer")
+	}
+	switch {
+	case s.StartsAt.IsZero():
+		v.Add("starts_at", "is required")
+	case !s.StartsAt.After(now):
+		v.Add("starts_at", "must be in the future")
+	case s.StartsAt.After(now.Add(MaxScheduleAhead)):
+		v.Add("starts_at", "must be at most %d days ahead", int(MaxScheduleAhead/(24*time.Hour)))
+	}
+	if s.BasePriceCents < 0 || s.BasePriceCents > MaxBasePriceCents {
+		v.Add("base_price_cents", "must be between 0 and %d", MaxBasePriceCents)
+	}
+	return v.Err()
 }
 
 // ShowtimeFilter selects showtimes that start in [From, To).

@@ -84,6 +84,25 @@ func TestLoadAppliesDefaults(t *testing.T) {
 	if len(cfg.HTTP.TrustedProxies) != 0 {
 		t.Errorf("HTTP.TrustedProxies = %v, want none", cfg.HTTP.TrustedProxies)
 	}
+	if want := (MetricsConfig{Addr: ":9090", WorkerAddr: ":9091"}); cfg.Metrics != want {
+		t.Errorf("Metrics = %+v, want %+v", cfg.Metrics, want)
+	}
+}
+
+func TestLoadReadsMetricsListeners(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := loadFrom(t, map[string]string{
+		"DATABASE_URL":        testDSN,
+		"METRICS_ADDR":        "127.0.0.1:9100",
+		"WORKER_METRICS_ADDR": ":0",
+	})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if want := (MetricsConfig{Addr: "127.0.0.1:9100", WorkerAddr: ":0"}); cfg.Metrics != want {
+		t.Errorf("Metrics = %+v, want %+v", cfg.Metrics, want)
+	}
 }
 
 func TestLoadReadsRedisLayerSettings(t *testing.T) {
@@ -205,7 +224,7 @@ func TestLoadReadsOverrides(t *testing.T) {
 
 	cfg, err := loadFrom(t, map[string]string{
 		"DATABASE_URL":          testDSN,
-		"HTTP_ADDR":             ":9090",
+		"HTTP_ADDR":             ":9000",
 		"HTTP_SHUTDOWN_TIMEOUT": "3s",
 		"DB_MAX_CONNS":          "50",
 		"REDIS_ADDR":            "redis:6379",
@@ -217,8 +236,8 @@ func TestLoadReadsOverrides(t *testing.T) {
 		t.Fatalf("load: %v", err)
 	}
 
-	if cfg.HTTP.Addr != ":9090" || cfg.HTTP.ShutdownTimeout != 3*time.Second {
-		t.Errorf("HTTP = %q/%s, want :9090/3s", cfg.HTTP.Addr, cfg.HTTP.ShutdownTimeout)
+	if cfg.HTTP.Addr != ":9000" || cfg.HTTP.ShutdownTimeout != 3*time.Second {
+		t.Errorf("HTTP = %q/%s, want :9000/3s", cfg.HTTP.Addr, cfg.HTTP.ShutdownTimeout)
 	}
 	if cfg.DB.MaxConns != 50 {
 		t.Errorf("DB.MaxConns = %d, want 50", cfg.DB.MaxConns)
@@ -463,6 +482,21 @@ func TestLoadRejectsInvalidInput(t *testing.T) {
 			name:    "trusted proxy without a prefix length",
 			vars:    map[string]string{"DATABASE_URL": testDSN, "HTTP_TRUSTED_PROXIES": "10.0.0.1"},
 			wantErr: "HTTP_TRUSTED_PROXIES",
+		},
+		{
+			name:    "api address without a port",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "HTTP_ADDR": "localhost"},
+			wantErr: `HTTP_ADDR must be host:port or :port, got "localhost"`,
+		},
+		{
+			name:    "metrics address without a port",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "WORKER_METRICS_ADDR": "9091"},
+			wantErr: "WORKER_METRICS_ADDR",
+		},
+		{
+			name:    "metrics on the api address",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "HTTP_ADDR": ":8080", "METRICS_ADDR": ":8080"},
+			wantErr: "METRICS_ADDR must differ from HTTP_ADDR",
 		},
 	}
 

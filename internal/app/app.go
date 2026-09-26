@@ -1,20 +1,17 @@
-// Package app is the composition root: it builds concrete dependencies and wires them into the HTTP server.
+// Package app is the composition root: it builds concrete dependencies and wires them into the processes.
 package app
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
-	"net"
-	"net/http"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/onetodone/cinema-api/internal/config"
-	"github.com/onetodone/cinema-api/internal/platform/metrics"
 	"github.com/onetodone/cinema-api/internal/platform/pgpool"
 	"github.com/onetodone/cinema-api/internal/platform/redisclient"
 	"github.com/onetodone/cinema-api/internal/repository/postgres"
@@ -38,14 +35,15 @@ const (
 
 // API is the HTTP API process with its external resources.
 type API struct {
-	cfg    config.Config
-	logger *slog.Logger
-	db     *pgxpool.Pool
-	redis  *redis.Client
-	server *http.Server
+	cfg     config.Config
+	logger  *slog.Logger
+	db      *pgxpool.Pool
+	redis   *redis.Client
+	server  *server // the public API
+	metrics *server // GET /metrics, on an internal address
 }
 
-// NewAPI connects to PostgreSQL and Redis and builds the HTTP server.
+// NewAPI connects to PostgreSQL and Redis and builds the HTTP servers.
 // PostgreSQL must be reachable, because it is the source of truth. Redis may be down: the API starts anyway
 // and keeps working correctly in fail-open mode.
 func NewAPI(ctx context.Context, cfg config.Config, logger *slog.Logger) (*API, error) {
@@ -68,12 +66,7 @@ func NewAPI(ctx context.Context, cfg config.Config, logger *slog.Logger) (*API, 
 
 	rdb := newRedis(ctx, cfg.Redis, appName, logger)
 
-	health := handler.NewHealth(logger, readinessTimeout,
-		handler.Check{Name: "postgres", Critical: true, Probe: db.Ping},
-		handler.Check{Name: "redis", Critical: false, Probe: func(ctx context.Context) error {
-			return rdb.Ping(ctx).Err()
-		}},
-	)
+	health := handler.NewHealth(logger, readinessTimeout, healthChecks(db, rdb)...)
 
 	providers, err := newPaymentProviders(cfg.Payment)
 	if err != nil {
@@ -82,14 +75,17 @@ func NewAPI(ctx context.Context, cfg config.Config, logger *slog.Logger) (*API, 
 	}
 	logPaymentMethods(logger, providers)
 
-	registry := metrics.NewRegistry()
-	m := metrics.New(registry)
+	m, metricsHandler := newMetrics()
+	for _, method := range providers.Methods() {
+		m.InitPayments(method.ID)
+	}
 	store := redisrepo.New(rdb, cfg.Redis.KeyPrefix, m, logger)
 	catalogCache := store.CatalogCache(cfg.Cache.SeatMapTTL, cfg.Cache.ScheduleTTL)
 
 	catalogRepo := postgres.NewCatalog(db)
 	catalogSvc := catalog.New(catalogRepo, cfg.Cinema.Location, catalog.WithCache(catalogCache))
-	bookingSvc := newBookingService(db, cfg, providers, logger,
+	adminSvc := admin.New(catalogRepo, cfg.Cinema.Location, admin.WithScheduleCache(catalogCache))
+	bookingSvc := newBookingService(db, cfg, providers, m, logger,
 		booking.WithHoldGate(store.HoldGate()), booking.WithSeatMapCache(catalogCache))
 
 	router := httpapi.NewRouter(httpapi.RouterDeps{
@@ -98,12 +94,11 @@ func NewAPI(ctx context.Context, cfg config.Config, logger *slog.Logger) (*API, 
 		Health:   health,
 		Catalog:  handler.NewCatalog(catalogSvc, cfg.Cinema.Currency, logger),
 		Auth:     handler.NewAuth(authSvc, tokens, logger),
-		Bookings: handler.NewBookings(bookingSvc, cfg.Cinema.Currency, logger),
-		Payments: handler.NewPayments(bookingSvc, providers, cfg.Cinema.Currency, logger),
-		Admin:    handler.NewAdmin(admin.New(catalogRepo), logger),
+		Bookings: handler.NewBookings(bookingSvc, cfg.Cinema.Currency, m, logger),
+		Payments: handler.NewPayments(bookingSvc, providers, cfg.Cinema.Currency, m, logger),
+		Admin:    handler.NewAdmin(adminSvc, cfg.Cinema.Currency, logger),
 
 		Metrics:           m,
-		MetricsHandler:    metrics.Handler(registry),
 		Idempotency:       store.Idempotency(),
 		BookingLimiter:    rateLimiter(store, "book", cfg.RateLimit.BookingPerMin),
 		AuthIPLimiter:     rateLimiter(store, "auth-ip", cfg.RateLimit.AuthIPPerMin),
@@ -111,17 +106,23 @@ func NewAPI(ctx context.Context, cfg config.Config, logger *slog.Logger) (*API, 
 		TrustedProxies:    cfg.HTTP.TrustedProxies,
 	})
 
-	server := &http.Server{
-		Addr:              cfg.HTTP.Addr,
-		Handler:           router,
-		ReadHeaderTimeout: cfg.HTTP.ReadHeaderTimeout,
-		ReadTimeout:       cfg.HTTP.ReadTimeout,
-		WriteTimeout:      cfg.HTTP.WriteTimeout,
-		IdleTimeout:       cfg.HTTP.IdleTimeout,
-		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelWarn),
-	}
+	return &API{
+		cfg:     cfg,
+		logger:  logger,
+		db:      db,
+		redis:   rdb,
+		server:  newServer("http server", cfg.HTTP.Addr, router, cfg.HTTP, logger),
+		metrics: newServer("metrics server", cfg.Metrics.Addr, metricsMux(metricsHandler, nil), cfg.HTTP, logger),
+	}, nil
+}
 
-	return &API{cfg: cfg, logger: logger, db: db, redis: rdb, server: server}, nil
+// healthChecks are the readiness checks of a process: PostgreSQL is critical, Redis is not, because every use of
+// it fails open.
+func healthChecks(db *pgxpool.Pool, rdb *redis.Client) []handler.Check {
+	return []handler.Check{
+		{Name: "postgres", Critical: true, Probe: db.Ping},
+		{Name: "redis", Critical: false, Probe: func(ctx context.Context) error { return rdb.Ping(ctx).Err() }},
+	}
 }
 
 // newRedis returns a Redis client. Redis may be down at startup: the process starts anyway and works without it
@@ -146,39 +147,17 @@ func rateLimiter(store *redisrepo.Store, name string, perMinute int) middleware.
 	return store.RateLimiter(name, perMinute, rateLimitWindow)
 }
 
-// Run serves HTTP until ctx is canceled, then stops accepting connections and waits for in-flight requests
-// for at most HTTP_SHUTDOWN_TIMEOUT.
+// Run serves the API and its metrics until ctx is canceled, then stops accepting connections and waits for
+// requests in flight for at most HTTP_SHUTDOWN_TIMEOUT. If one server fails, the other one stops too.
 func (a *API) Run(ctx context.Context) error {
-	var lc net.ListenConfig
-	ln, err := lc.Listen(ctx, "tcp", a.server.Addr)
-	if err != nil {
-		return fmt.Errorf("listen on %s: %w", a.server.Addr, err)
+	if err := listen(ctx, a.server, a.metrics); err != nil {
+		return err
 	}
-
-	serveErr := make(chan error, 1)
-	go func() { serveErr <- a.server.Serve(ln) }()
-	a.logger.InfoContext(ctx, "http server started", slog.String("addr", ln.Addr().String()))
-
-	select {
-	case err := <-serveErr:
-		return fmt.Errorf("http server: %w", err)
-	case <-ctx.Done():
+	g, ctx := errgroup.WithContext(ctx)
+	for _, s := range []*server{a.server, a.metrics} {
+		g.Go(func() error { return s.serve(ctx, a.logger, a.cfg.HTTP.ShutdownTimeout) })
 	}
-
-	a.logger.Info("shutdown signal received; draining connections",
-		slog.String("timeout", a.cfg.HTTP.ShutdownTimeout.String()))
-
-	shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), a.cfg.HTTP.ShutdownTimeout)
-	defer cancel()
-	if err := a.server.Shutdown(shutdownCtx); err != nil {
-		return fmt.Errorf("graceful shutdown: %w", err)
-	}
-	if err := <-serveErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return fmt.Errorf("http server: %w", err)
-	}
-
-	a.logger.Info("http server stopped")
-	return nil
+	return g.Wait()
 }
 
 // Close releases the database pool and the Redis client. Call it once, after Run has returned.

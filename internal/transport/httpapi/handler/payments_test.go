@@ -53,7 +53,7 @@ func paidResult() booking.PayResult {
 // servePayments sends a request as sampleUser, or anonymously when anonymous is set.
 func servePayments(t *testing.T, svc PaymentService, method, target, body string, anonymous bool) *httptest.ResponseRecorder {
 	t.Helper()
-	h := NewPayments(svc, stubMethods{{ID: "local", Name: "Test card"}}, "USD", slog.New(slog.DiscardHandler))
+	h := NewPayments(svc, stubMethods{{ID: "local", Name: "Test card"}}, "USD", newTestMetrics(), slog.New(slog.DiscardHandler))
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/payment-methods", h.ListMethods)
 	mux.HandleFunc("POST /v1/bookings/{bookingID}/payments", h.Pay)
@@ -85,7 +85,7 @@ func TestListPaymentMethods(t *testing.T) {
 	}
 
 	// No provider enabled: an empty list, not null.
-	h := NewPayments(&stubPayments{}, stubMethods{}, "USD", slog.New(slog.DiscardHandler))
+	h := NewPayments(&stubPayments{}, stubMethods{}, "USD", newTestMetrics(), slog.New(slog.DiscardHandler))
 	rec = httptest.NewRecorder()
 	h.ListMethods(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/v1/payment-methods", nil))
 	if got := strings.TrimSpace(rec.Body.String()); got != `{"items":[]}` {
@@ -225,7 +225,7 @@ func TestPayLogsServerSideFailures(t *testing.T) {
 		{err: errors.New("database is down"), want: `level=ERROR msg="request failed" error="database is down"`},
 	} {
 		var logs strings.Builder
-		h := NewPayments(&stubPayments{err: tt.err}, stubMethods{}, "USD", slog.New(slog.NewTextHandler(&logs, nil)))
+		h := NewPayments(&stubPayments{err: tt.err}, stubMethods{}, "USD", newTestMetrics(), slog.New(slog.NewTextHandler(&logs, nil)))
 		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, payPath,
 			strings.NewReader(`{"payment_method":"local","payment_token":"tok_success"}`))
 		req.SetPathValue("bookingID", sampleBooking.ID.String())

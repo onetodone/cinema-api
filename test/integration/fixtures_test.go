@@ -38,10 +38,10 @@ func newFixture(t *testing.T) *fixture {
 		{Label: "AA", Seats: 1, Type: domain.SeatAccessible},
 		{Label: "B", Seats: 2, Type: domain.SeatVIP},
 		{Label: "A", Seats: 2, Type: domain.SeatStandard},
-	}))(t)
+	}))(t).Hall
 	f.hall2 = must(f.catalog.CreateHall(ctx, "Hall 2", []domain.HallRow{
 		{Label: "A", Seats: 3, Type: domain.SeatStandard},
-	}))(t)
+	}))(t).Hall
 	return f
 }
 

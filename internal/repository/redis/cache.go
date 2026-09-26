@@ -18,7 +18,9 @@ import (
 
 // CatalogCache implements catalog.Cache and booking.SeatMapCache. It keeps seat maps and day schedules as JSON
 // for a short TTL. The booking service deletes the seat map of a showtime after every committed seat change;
-// schedules only expire. A TTL of 0 turns that cache off: lookups miss without asking Redis.
+// the admin service deletes the schedule of a day when it adds a showtime to it. Bookings do not change schedules
+// other than their free seat counts, so those counts are up to the schedule TTL old. A TTL of 0 turns that cache
+// off: lookups miss without asking Redis.
 //
 // Keys are named <prefix>:seatmap:{<showtimeID>} and <prefix>:schedule:<yyyy-mm-dd>, the day in the cinema's
 // time zone.
@@ -81,6 +83,18 @@ func (c *CatalogCache) InvalidateSeatMaps(ctx context.Context, showtimeIDs ...in
 	if err != nil {
 		c.s.failed(ctx, metrics.OpCacheInvalidate, err)
 		return fmt.Errorf("invalidate the seat maps of showtimes %v: %w", showtimeIDs, err)
+	}
+	return nil
+}
+
+// InvalidateSchedule deletes the cached schedule of a day.
+func (c *CatalogCache) InvalidateSchedule(ctx context.Context, day string) error {
+	if c.scheduleTTL <= 0 {
+		return nil
+	}
+	if err := c.s.rdb.Del(ctx, c.scheduleKey(day)).Err(); err != nil {
+		c.s.failed(ctx, metrics.OpCacheInvalidate, err)
+		return fmt.Errorf("invalidate the schedule of %s: %w", day, err)
 	}
 	return nil
 }

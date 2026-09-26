@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/onetodone/cinema-api/internal/domain"
+	"github.com/onetodone/cinema-api/internal/platform/metrics"
 	"github.com/onetodone/cinema-api/internal/service/booking"
 )
 
@@ -35,16 +36,18 @@ type ExpirerConfig struct {
 type Expirer struct {
 	bookings BookingExpirer
 	cfg      ExpirerConfig
+	metrics  *metrics.Metrics
 	logger   *slog.Logger
 }
 
-// NewExpirer returns an Expirer. It panics if the interval or the batch size is not positive.
-func NewExpirer(bookings BookingExpirer, cfg ExpirerConfig, logger *slog.Logger) *Expirer {
+// NewExpirer returns an Expirer that counts the bookings it expires in m. It panics if the interval or the batch
+// size is not positive.
+func NewExpirer(bookings BookingExpirer, cfg ExpirerConfig, m *metrics.Metrics, logger *slog.Logger) *Expirer {
 	if cfg.Interval <= 0 || cfg.BatchSize <= 0 {
 		panic(fmt.Sprintf("worker: expirer interval and batch size must be positive, got %s and %d",
 			cfg.Interval, cfg.BatchSize))
 	}
-	return &Expirer{bookings: bookings, cfg: cfg, logger: logger.With(slog.String("job", "expirer"))}
+	return &Expirer{bookings: bookings, cfg: cfg, metrics: m, logger: logger.With(slog.String("job", "expirer"))}
 }
 
 // Run sweeps at once and then about every interval until ctx is canceled. A failed batch is logged and
@@ -80,6 +83,7 @@ func (e *Expirer) expireBatch(ctx context.Context) (int, error) {
 	case err != nil:
 		e.logger.ErrorContext(ctx, "expiry batch failed; the next sweep retries it", slog.Any("error", err))
 	case len(batch.BookingIDs) > 0:
+		e.metrics.BookingsExpired.Add(float64(len(batch.BookingIDs)))
 		e.logger.InfoContext(ctx, "bookings expired",
 			slog.Int("bookings", len(batch.BookingIDs)),
 			slog.Int64("seats", batch.Seats),

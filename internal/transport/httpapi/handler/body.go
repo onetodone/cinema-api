@@ -8,6 +8,7 @@ import (
 	"mime"
 	"net/http"
 	"reflect"
+	"strconv"
 	"strings"
 
 	"github.com/onetodone/cinema-api/internal/transport/httpapi/problem"
@@ -69,7 +70,7 @@ func bodyProblem(err error) problem.Problem {
 		if typeErr.Field == "" {
 			return malformedBody("The request body must be a JSON object.")
 		}
-		return problem.Validation(problem.FieldError{Field: typeErr.Field, Message: "must be " + jsonKind(typeErr.Type)})
+		return problem.Validation(problem.FieldError{Field: fieldPath(typeErr.Field), Message: "must be " + jsonKind(typeErr.Type)})
 	case strings.HasPrefix(err.Error(), "json: unknown field "):
 		// encoding/json has no error type for this case, only this message.
 		field := strings.TrimPrefix(err.Error(), "json: unknown field ")
@@ -77,6 +78,24 @@ func bodyProblem(err error) problem.Problem {
 	default:
 		return malformedBody("The request body could not be read.")
 	}
+}
+
+// fieldPath turns a field path as encoding/json reports it, such as rows.0.seats, into the form the services use
+// in validation errors, rows[0].seats, so that clients see one naming scheme.
+func fieldPath(jsonPath string) string {
+	parts := strings.Split(jsonPath, ".")
+	var b strings.Builder
+	for i, part := range parts {
+		if _, err := strconv.Atoi(part); err == nil && i > 0 {
+			b.WriteString("[" + part + "]")
+			continue
+		}
+		if i > 0 {
+			b.WriteByte('.')
+		}
+		b.WriteString(part)
+	}
+	return b.String()
 }
 
 func malformedBody(detail string) problem.Problem {

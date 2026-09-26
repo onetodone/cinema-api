@@ -2,12 +2,14 @@ package handler
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"uuid"
 
 	"github.com/onetodone/cinema-api/internal/domain"
 	"github.com/onetodone/cinema-api/internal/payment"
+	"github.com/onetodone/cinema-api/internal/platform/metrics"
 	"github.com/onetodone/cinema-api/internal/service/booking"
 	"github.com/onetodone/cinema-api/internal/transport/httpapi/dto"
 	"github.com/onetodone/cinema-api/internal/transport/httpapi/render"
@@ -28,12 +30,14 @@ type Payments struct {
 	svc      PaymentService
 	methods  PaymentMethods
 	currency string
+	metrics  *metrics.Metrics
 	logger   *slog.Logger
 }
 
-// NewPayments returns the payment handlers. currency is the ISO 4217 code reported next to amounts.
-func NewPayments(svc PaymentService, methods PaymentMethods, currency string, logger *slog.Logger) *Payments {
-	return &Payments{svc: svc, methods: methods, currency: currency, logger: logger}
+// NewPayments returns the payment handlers. currency is the ISO 4217 code reported next to amounts; every payment
+// counts in m.
+func NewPayments(svc PaymentService, methods PaymentMethods, currency string, m *metrics.Metrics, logger *slog.Logger) *Payments {
+	return &Payments{svc: svc, methods: methods, currency: currency, metrics: m, logger: logger}
 }
 
 // ListMethods handles GET /v1/payment-methods: the payment providers that take payments now.
@@ -62,6 +66,9 @@ func (h *Payments) Pay(w http.ResponseWriter, r *http.Request) {
 	}
 
 	res, err := h.svc.Pay(r.Context(), p.UserID, bookingID, req.NewPayment())
+	if result, ok := paymentResult(res, err); ok {
+		h.metrics.Payments.WithLabelValues(req.PaymentMethod, result).Inc()
+	}
 	if err != nil {
 		writeError(h.logger, w, r, err)
 		return
@@ -72,4 +79,29 @@ func (h *Payments) Pay(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusAccepted
 	}
 	render.JSON(w, status, dto.NewPaymentResult(res, h.currency))
+}
+
+// paymentResult classifies the outcome of a payment for cinema_payments_total. ok is false when the request was
+// turned away before a payment started, such as for an expired booking or an unknown payment method: only
+// payments that reached an enabled provider count, which also keeps the provider label to known values.
+func paymentResult(res booking.PayResult, err error) (result string, ok bool) {
+	var de *domain.Error
+	switch {
+	case err == nil && res.Payment.Status == domain.PaymentPending:
+		return metrics.PaymentPending, true
+	case err == nil:
+		return metrics.PaymentSucceeded, true
+	case !errors.As(err, &de):
+		return "", false
+	}
+	switch de.Code {
+	case domain.CodePaymentDeclined:
+		return metrics.PaymentDeclined, true
+	case domain.CodePaymentProviderUnavailable:
+		return metrics.PaymentProviderUnavailable, true
+	case domain.CodePaymentRefunded:
+		return metrics.PaymentRefunded, true
+	default:
+		return "", false
+	}
 }

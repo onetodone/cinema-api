@@ -12,7 +12,7 @@ import (
 // Store is the write access the seeder needs. It is implemented by repository/postgres.Catalog.
 type Store interface {
 	CreateMovie(ctx context.Context, m domain.NewMovie) (domain.Movie, error)
-	CreateHall(ctx context.Context, name string, rows []domain.HallRow) (domain.Hall, error)
+	CreateHall(ctx context.Context, name string, rows []domain.HallRow) (domain.HallLayout, error)
 	CreateShowtime(ctx context.Context, s domain.NewShowtime) (domain.Showtime, error)
 }
 

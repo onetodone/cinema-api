@@ -14,8 +14,10 @@ import (
 	"uuid"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/onetodone/cinema-api/internal/domain"
+	"github.com/onetodone/cinema-api/internal/platform/metrics"
 	"github.com/onetodone/cinema-api/internal/service/booking"
 	"github.com/onetodone/cinema-api/internal/worker"
 )
@@ -204,10 +206,11 @@ func startExpirers(t *testing.T, pool *pgxpool.Pool, n, batchSize int, logs *log
 	recorders := make([]*recordingExpirer, n)
 	for i := range recorders {
 		providers, _ := testProviders(t)
-		svc := newBookingService(newPoolOf(t, pool, 2), raceLockTimeout, providers, slog.New(logs))
+		m := metrics.New(prometheus.NewRegistry())
+		svc := newBookingService(newPoolOf(t, pool, 2), raceLockTimeout, providers, m, slog.New(logs))
 		recorders[i] = &recordingExpirer{svc: svc, firstCall: firstCall}
 		e := worker.NewExpirer(recorders[i], worker.ExpirerConfig{Interval: 20 * time.Millisecond, BatchSize: batchSize},
-			slog.New(logs))
+			m, slog.New(logs))
 		wg.Go(func() { e.Run(ctx) })
 	}
 
@@ -238,7 +241,7 @@ func bigHall(t *testing.T, f *fixture) (domain.Hall, []int64) {
 	for i := range rows {
 		rows[i] = domain.HallRow{Label: string(rune('A' + i)), Seats: 25, Type: domain.SeatStandard}
 	}
-	hall := must(f.catalog.CreateHall(t.Context(), "Big hall", rows))(t)
+	hall := must(f.catalog.CreateHall(t.Context(), "Big hall", rows))(t).Hall
 	seats := slices.Sorted(maps.Values(seatIDsByLabel(t, f.pool, hall.ID)))
 	if len(seats) != 500 {
 		t.Fatalf("big hall has %d seats, want 500", len(seats))

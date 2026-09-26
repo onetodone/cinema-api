@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/jackc/pgx/v5"
 
@@ -23,9 +24,10 @@ RETURNING `+movieColumns,
 	return m, nil
 }
 
-// CreateHall inserts a hall and generates its seats row by row, in one transaction.
-func (c *Catalog) CreateHall(ctx context.Context, name string, rows []domain.HallRow) (domain.Hall, error) {
-	var hall domain.Hall
+// CreateHall inserts a hall and generates its seats row by row, in one transaction, and returns the hall with
+// its seats in seat map order. A name that another hall has fails with HALL_NAME_TAKEN.
+func (c *Catalog) CreateHall(ctx context.Context, name string, rows []domain.HallRow) (domain.HallLayout, error) {
+	var hall domain.HallLayout
 	err := pgx.BeginFunc(ctx, c.pool, func(tx pgx.Tx) error {
 		err := tx.QueryRow(ctx, `INSERT INTO halls (name) VALUES ($1) RETURNING id, name`, name).
 			Scan(&hall.ID, &hall.Name)
@@ -37,19 +39,32 @@ func (c *Catalog) CreateHall(ctx context.Context, name string, rows []domain.Hal
 		}
 
 		for _, r := range rows {
-			_, err := tx.Exec(ctx, `
+			seatRows, err := tx.Query(ctx, `
 INSERT INTO hall_seats (hall_id, row_label, seat_number, seat_type)
-SELECT $1, $2, n, $4::seat_type FROM generate_series(1, $3::int) AS n`,
+SELECT $1, $2, n, $4::seat_type FROM generate_series(1, $3::int) AS n
+RETURNING id, row_label, seat_number, seat_type`,
 				hall.ID, r.Label, r.Seats, string(r.Type))
 			if err != nil {
 				return fmt.Errorf("insert seats of row %q: %w", r.Label, err)
 			}
+			seats, err := pgx.CollectRows(seatRows, func(row pgx.CollectableRow) (domain.HallSeat, error) {
+				var s domain.HallSeat
+				err := row.Scan(&s.ID, &s.Row, &s.Number, &s.Type)
+				return s, err
+			})
+			if err != nil {
+				return fmt.Errorf("insert seats of row %q: %w", r.Label, err)
+			}
+			hall.Seats = append(hall.Seats, seats...)
 		}
 		return nil
 	})
 	if err != nil {
-		return domain.Hall{}, fmt.Errorf("create hall %q: %w", name, err)
+		return domain.HallLayout{}, fmt.Errorf("create hall %q: %w", name, err)
 	}
+	slices.SortFunc(hall.Seats, func(a, b domain.HallSeat) int {
+		return domain.CompareSeatPositions(a.Row, a.Number, b.Row, b.Number)
+	})
 	return hall, nil
 }
 

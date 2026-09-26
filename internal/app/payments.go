@@ -8,6 +8,7 @@ import (
 	"github.com/onetodone/cinema-api/internal/config"
 	"github.com/onetodone/cinema-api/internal/payment"
 	"github.com/onetodone/cinema-api/internal/payment/local"
+	"github.com/onetodone/cinema-api/internal/platform/metrics"
 	"github.com/onetodone/cinema-api/internal/repository/postgres"
 	"github.com/onetodone/cinema-api/internal/service/booking"
 )
@@ -46,11 +47,11 @@ func logPaymentMethods(logger *slog.Logger, providers *payment.Registry) {
 }
 
 // newBookingService builds the booking use cases on db, the same way for the API and the worker.
-func newBookingService(db *pgxpool.Pool, cfg config.Config, providers *payment.Registry, logger *slog.Logger,
-	opts ...booking.Option,
+func newBookingService(db *pgxpool.Pool, cfg config.Config, providers *payment.Registry, m *metrics.Metrics,
+	logger *slog.Logger, opts ...booking.Option,
 ) *booking.Service {
 	return booking.New(
-		postgres.NewUnitOfWork(db, cfg.DB.LockTimeout, logger),
+		postgres.NewUnitOfWork(db, cfg.DB.LockTimeout, m, logger),
 		postgres.NewBookings(db),
 		providers,
 		booking.Config{

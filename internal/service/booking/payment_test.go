@@ -673,7 +673,7 @@ func TestReconcileBatchLeavesUnsettledPayments(t *testing.T) {
 	})
 
 	batch, err := svc.ReconcileBatch(t.Context(), uuid.UUID{}, 10)
-	if batch.Checked != 3 || batch.Failed != 1 || batch.Paid != 0 {
+	if batch.Checked != 3 || batch.Failed != 1 || batch.Paid != 0 || batch.Unsettled != 2 {
 		t.Errorf("batch = %+v", batch)
 	}
 	for _, want := range []string{

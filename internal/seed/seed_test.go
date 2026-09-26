@@ -122,9 +122,9 @@ func (m *memStore) CreateMovie(_ context.Context, nm domain.NewMovie) (domain.Mo
 	return domain.Movie{ID: int64(m.movies), Title: nm.Title, DurationMin: nm.DurationMin}, nil
 }
 
-func (m *memStore) CreateHall(_ context.Context, name string, _ []domain.HallRow) (domain.Hall, error) {
+func (m *memStore) CreateHall(_ context.Context, name string, _ []domain.HallRow) (domain.HallLayout, error) {
 	m.halls = append(m.halls, name)
-	return domain.Hall{ID: int64(len(m.halls)), Name: name}, nil
+	return domain.HallLayout{Hall: domain.Hall{ID: int64(len(m.halls)), Name: name}}, nil
 }
 
 func (m *memStore) CreateShowtime(_ context.Context, ns domain.NewShowtime) (domain.Showtime, error) {

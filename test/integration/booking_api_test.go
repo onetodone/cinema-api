@@ -63,7 +63,7 @@ func newAPIServerWith(t *testing.T, f *fixture, opts apiOptions) apiClient {
 	}
 	providers, _ := testProviders(t)
 	cache := env.store.CatalogCache(testSeatMapTTL, testScheduleTTL)
-	bookingSvc := newBookingService(f.pool, 3*time.Second, providers, logger, withRedis(env)...)
+	bookingSvc := newBookingService(f.pool, 3*time.Second, providers, env.metrics, logger, withRedis(env)...)
 	limiter := func(name string, perMinute int) middleware.RateLimiter {
 		if perMinute == 0 {
 			return nil
@@ -77,9 +77,9 @@ func newAPIServerWith(t *testing.T, f *fixture, opts apiOptions) apiClient {
 		Health:   handler.NewHealth(logger, time.Second),
 		Catalog:  handler.NewCatalog(catalog.New(f.catalog, time.UTC, catalog.WithCache(cache)), "USD", logger),
 		Auth:     handler.NewAuth(authSvc, tokens, logger),
-		Bookings: handler.NewBookings(bookingSvc, "USD", logger),
-		Payments: handler.NewPayments(bookingSvc, providers, "USD", logger),
-		Admin:    handler.NewAdmin(admin.New(f.catalog), logger),
+		Bookings: handler.NewBookings(bookingSvc, "USD", env.metrics, logger),
+		Payments: handler.NewPayments(bookingSvc, providers, "USD", env.metrics, logger),
+		Admin:    handler.NewAdmin(admin.New(f.catalog, time.UTC, admin.WithScheduleCache(cache)), "USD", logger),
 
 		Metrics:           env.metrics,
 		Idempotency:       env.store.Idempotency(),

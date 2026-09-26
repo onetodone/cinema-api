@@ -13,6 +13,9 @@ import (
 	"time"
 	"uuid"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
+	"github.com/onetodone/cinema-api/internal/platform/metrics"
 	"github.com/onetodone/cinema-api/internal/service/booking"
 )
 
@@ -54,11 +57,12 @@ func (f *fakePayments) recorded() []reconcileCall {
 }
 
 // runReconciler starts a Reconciler over f in the background and returns a function that cancels it and waits
-// for Run to return. Call it inside a synctest bubble.
-func runReconciler(t *testing.T, f *fakePayments, logs io.Writer) (stop func()) {
+// for Run to return, and the metrics the Reconciler records. Call it inside a synctest bubble.
+func runReconciler(t *testing.T, f *fakePayments, logs io.Writer) (stop func(), m *metrics.Metrics) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(t.Context())
-	r := NewReconciler(f, ReconcilerConfig{Interval: testInterval, BatchSize: testReconcileBatch},
+	m = newMetrics()
+	r := NewReconciler(f, ReconcilerConfig{Interval: testInterval, BatchSize: testReconcileBatch}, m,
 		slog.New(slog.NewTextHandler(logs, nil)))
 	done := make(chan struct{})
 	go func() {
@@ -68,14 +72,14 @@ func runReconciler(t *testing.T, f *fakePayments, logs io.Writer) (stop func()) 
 	return func() {
 		cancel()
 		<-done
-	}
+	}, m
 }
 
 func TestReconcilerPassesAtStartAndThenAboutEveryInterval(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		f := &fakePayments{}
 		began := time.Now()
-		stop := runReconciler(t, f, io.Discard)
+		stop, _ := runReconciler(t, f, io.Discard)
 		time.Sleep(10 * testInterval)
 		stop()
 
@@ -112,7 +116,7 @@ func TestReconcilerWorksThroughEveryStuckPayment(t *testing.T) {
 			return booking.ReconciledBatch{LastID: after}, nil
 		}}
 		var logs logBuffer
-		stop := runReconciler(t, f, &logs)
+		stop, m := runReconciler(t, f, &logs)
 		synctest.Wait()
 
 		calls := f.recorded()
@@ -137,6 +141,11 @@ func TestReconcilerWorksThroughEveryStuckPayment(t *testing.T) {
 		if n := strings.Count(out, "stuck payments settled"); n != 2 {
 			t.Errorf("%d log lines, want one per batch that settled something:\n%s", n, out)
 		}
+		for result, want := range map[string]float64{metrics.ReconciledPaid: 1, metrics.ReconciledFailed: 2, metrics.ReconciledUnsettled: 0} {
+			if n := testutil.ToFloat64(m.PaymentsReconciled.WithLabelValues(result)); n != want {
+				t.Errorf("cinema_payments_reconciled_total{result=%q} = %v, want %v", result, n, want)
+			}
+		}
 	})
 }
 
@@ -147,7 +156,7 @@ func TestReconcilerLogsFailures(t *testing.T) {
 			switch n {
 			case 1:
 				// Some payments of a full batch failed: the pass still goes on after them.
-				return booking.ReconciledBatch{Checked: 2, LastID: stuck, Failed: 1},
+				return booking.ReconciledBatch{Checked: 2, LastID: stuck, Failed: 1, Unsettled: 1},
 					errors.New("payment x: ask payment provider local: unreachable")
 			case 2:
 				return booking.ReconciledBatch{LastID: after}, errors.New("connection refused")
@@ -155,10 +164,13 @@ func TestReconcilerLogsFailures(t *testing.T) {
 			return booking.ReconciledBatch{LastID: after}, nil
 		}}
 		var logs logBuffer
-		stop := runReconciler(t, f, &logs)
+		stop, m := runReconciler(t, f, &logs)
 		synctest.Wait()
 		stop()
 
+		if n := testutil.ToFloat64(m.PaymentsReconciled.WithLabelValues(metrics.ReconciledUnsettled)); n != 1 {
+			t.Errorf("unsettled payments counted = %v, want 1", n)
+		}
 		if calls := f.recorded(); len(calls) != 2 || calls[1].after != stuck {
 			t.Errorf("calls = %+v, want the pass to go on after the failed payments", calls)
 		}
@@ -184,7 +196,7 @@ func TestReconcilerStopsQuietly(t *testing.T) {
 			return booking.ReconciledBatch{LastID: after}, ctx.Err()
 		}}
 		var logs logBuffer
-		NewReconciler(f, ReconcilerConfig{Interval: testInterval, BatchSize: testReconcileBatch},
+		NewReconciler(f, ReconcilerConfig{Interval: testInterval, BatchSize: testReconcileBatch}, newMetrics(),
 			slog.New(slog.NewTextHandler(&logs, nil))).Run(ctx)
 
 		if n := len(f.recorded()); n != 1 {
@@ -206,7 +218,7 @@ func TestNewReconcilerRejectsAnInvalidConfig(t *testing.T) {
 					t.Errorf("NewReconciler(%+v) did not panic", cfg)
 				}
 			}()
-			NewReconciler(&fakePayments{}, cfg, slog.New(slog.DiscardHandler))
+			NewReconciler(&fakePayments{}, cfg, newMetrics(), slog.New(slog.DiscardHandler))
 		}()
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/netip"
 	"reflect"
 	"strings"
@@ -16,6 +17,7 @@ import (
 // Config is the complete runtime configuration shared by all binaries.
 type Config struct {
 	HTTP       HTTPConfig
+	Metrics    MetricsConfig
 	DB         DBConfig
 	Redis      RedisConfig
 	Log        LogConfig
@@ -178,6 +180,16 @@ type HTTPConfig struct {
 	// one of them is attributed to the client address its X-Forwarded-For header names; any other request to its
 	// connection's address. Empty trusts nobody, which is right when clients connect directly.
 	TrustedProxies []netip.Prefix `env:"HTTP_TRUSTED_PROXIES" envSeparator:","`
+}
+
+// MetricsConfig configures the listeners that serve the Prometheus metrics. They are separate from HTTP_ADDR, so
+// that the metrics can stay on an internal network while the API is public.
+type MetricsConfig struct {
+	// Addr is the API's listener for GET /metrics.
+	Addr string `env:"METRICS_ADDR" envDefault:":9090"`
+	// WorkerAddr is the worker's listener for GET /metrics, /healthz, and /readyz. Workers that run on one host
+	// need an address each; a port of 0 picks a free port, which the worker logs.
+	WorkerAddr string `env:"WORKER_METRICS_ADDR" envDefault:":9091"`
 }
 
 // DBConfig configures the PostgreSQL connection pool.
@@ -386,6 +398,19 @@ func (c Config) Validate() error {
 		if n < 0 || n > maxRateLimit {
 			errs = append(errs, fmt.Errorf("%s must be between 0 (off) and %d, got %d", name, maxRateLimit, n))
 		}
+	}
+	listeners := map[string]string{
+		"HTTP_ADDR":           c.HTTP.Addr,
+		"METRICS_ADDR":        c.Metrics.Addr,
+		"WORKER_METRICS_ADDR": c.Metrics.WorkerAddr,
+	}
+	for name, addr := range listeners {
+		if _, _, err := net.SplitHostPort(addr); err != nil {
+			errs = append(errs, fmt.Errorf("%s must be host:port or :port, got %q", name, addr))
+		}
+	}
+	if _, port, _ := net.SplitHostPort(c.HTTP.Addr); c.Metrics.Addr == c.HTTP.Addr && port != "0" {
+		errs = append(errs, fmt.Errorf("METRICS_ADDR must differ from HTTP_ADDR (%s)", c.HTTP.Addr))
 	}
 	if !isCurrencyCode(c.Cinema.Currency) {
 		errs = append(errs, fmt.Errorf("CINEMA_CURRENCY must be a 3-letter uppercase ISO 4217 code, got %q",

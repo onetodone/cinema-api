@@ -209,7 +209,7 @@ func testBookingOverlappingMultiSeat(t *testing.T, opts ...booking.Option) (*boo
 	raceHall := must(f.catalog.CreateHall(ctx, "Race hall", []domain.HallRow{
 		{Label: "A", Seats: 10, Type: domain.SeatStandard},
 		{Label: "B", Seats: 10, Type: domain.SeatVIP},
-	}))(t)
+	}))(t).Hall
 	st := f.showtime(t, f.short, raceHall, base)
 	var allSeats []int64
 	for _, id := range seatIDsByLabel(t, f.pool, raceHall.ID) {

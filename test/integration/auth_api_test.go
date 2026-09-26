@@ -105,7 +105,7 @@ func TestAuthAPI(t *testing.T) {
 		Health:  handler.NewHealth(logger, time.Second),
 		Catalog: handler.NewCatalog(catalog.New(catalogRepo, time.UTC), "USD", logger),
 		Auth:    handler.NewAuth(authSvc, tokens, logger),
-		Admin:   handler.NewAdmin(admin.New(catalogRepo), logger),
+		Admin:   handler.NewAdmin(admin.New(catalogRepo, time.UTC), "USD", logger),
 	})
 	srv := httptest.NewServer(router)
 	t.Cleanup(srv.Close)

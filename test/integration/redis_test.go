@@ -145,6 +145,12 @@ func TestCatalogCache(t *testing.T) {
 	if _, ok, _ := cache.SeatMap(ctx, 5); ok {
 		t.Error("the seat map is still cached after its invalidation")
 	}
+	if err := cache.InvalidateSchedule(ctx, "2030-01-01"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := cache.Schedule(ctx, "2030-01-01"); ok {
+		t.Error("the schedule is still cached after its invalidation")
+	}
 	if hits, misses := env.cacheRequests(metrics.CacheSeatMap, metrics.CacheHit), env.cacheRequests(metrics.CacheSeatMap, metrics.CacheMiss); hits != 1 || misses != 2 {
 		t.Errorf("seat map hits/misses = %v/%v, want 1/2", hits, misses)
 	}

@@ -1,0 +1,10 @@
+# Configuration of `redocly lint` for the API contract (run by `make lint-api` and in CI).
+extends:
+  - recommended
+rules:
+  # The project has not chosen a license.
+  info-license: off
+  # The only server is the local development address on purpose; deployments put their own in front.
+  no-server-example.com: off
+  # Health probes and the payment method list have no client errors to document.
+  operation-4xx-response: off

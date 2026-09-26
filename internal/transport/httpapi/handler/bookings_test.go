@@ -71,7 +71,7 @@ func (s *stubBookings) Cancel(_ context.Context, userID, id uuid.UUID) error {
 // serveBookings sends a request as sampleUser, or anonymously when anonymous is set.
 func serveBookings(t *testing.T, svc BookingService, method, target, body string, anonymous bool) *httptest.ResponseRecorder {
 	t.Helper()
-	h := NewBookings(svc, "USD", slog.New(slog.DiscardHandler))
+	h := NewBookings(svc, "USD", newTestMetrics(), slog.New(slog.DiscardHandler))
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/bookings", h.Create)
 	mux.HandleFunc("GET /v1/bookings", h.List)

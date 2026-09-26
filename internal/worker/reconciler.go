@@ -8,6 +8,7 @@ import (
 	"time"
 	"uuid"
 
+	"github.com/onetodone/cinema-api/internal/platform/metrics"
 	"github.com/onetodone/cinema-api/internal/service/booking"
 )
 
@@ -38,16 +39,18 @@ type ReconcilerConfig struct {
 type Reconciler struct {
 	payments PaymentReconciler
 	cfg      ReconcilerConfig
+	metrics  *metrics.Metrics
 	logger   *slog.Logger
 }
 
-// NewReconciler returns a Reconciler. It panics if the interval or the batch size is not positive.
-func NewReconciler(payments PaymentReconciler, cfg ReconcilerConfig, logger *slog.Logger) *Reconciler {
+// NewReconciler returns a Reconciler that counts what it does in m. It panics if the interval or the batch size
+// is not positive.
+func NewReconciler(payments PaymentReconciler, cfg ReconcilerConfig, m *metrics.Metrics, logger *slog.Logger) *Reconciler {
 	if cfg.Interval <= 0 || cfg.BatchSize <= 0 {
 		panic(fmt.Sprintf("worker: reconciler interval and batch size must be positive, got %s and %d",
 			cfg.Interval, cfg.BatchSize))
 	}
-	return &Reconciler{payments: payments, cfg: cfg, logger: logger.With(slog.String("job", "reconciler"))}
+	return &Reconciler{payments: payments, cfg: cfg, metrics: m, logger: logger.With(slog.String("job", "reconciler"))}
 }
 
 // Run passes over the stuck payments at once and then about every interval until ctx is canceled. A payment
@@ -64,6 +67,9 @@ func (r *Reconciler) pass(ctx context.Context) {
 	for ctx.Err() == nil {
 		start := time.Now()
 		batch, err := r.payments.ReconcileBatch(ctx, after, r.cfg.BatchSize)
+		r.metrics.PaymentsReconciled.WithLabelValues(metrics.ReconciledPaid).Add(float64(batch.Paid))
+		r.metrics.PaymentsReconciled.WithLabelValues(metrics.ReconciledFailed).Add(float64(batch.Failed))
+		r.metrics.PaymentsReconciled.WithLabelValues(metrics.ReconciledUnsettled).Add(float64(batch.Unsettled))
 		switch {
 		case err != nil && batch.Checked == 0:
 			if !errors.Is(err, context.Canceled) || ctx.Err() == nil {
