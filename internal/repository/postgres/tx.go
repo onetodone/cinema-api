@@ -85,3 +85,4 @@ type txRepos struct {
 func (r txRepos) Showtimes() booking.ShowtimeRepo { return showtimeStore(r) }
 func (r txRepos) Seats() booking.SeatRepo         { return seatStore(r) }
 func (r txRepos) Bookings() booking.Repo          { return bookingStore(r) }
+func (r txRepos) Payments() booking.PaymentRepo   { return paymentStore(r) }

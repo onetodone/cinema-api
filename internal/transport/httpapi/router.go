@@ -21,6 +21,7 @@ type RouterDeps struct {
 	Catalog  *handler.Catalog
 	Auth     *handler.Auth
 	Bookings *handler.Bookings
+	Payments *handler.Payments
 	Admin    *handler.Admin
 }
 
@@ -54,6 +55,9 @@ func NewRouter(d RouterDeps) http.Handler {
 	mux.Handle("GET /v1/bookings", user(d.Bookings.List))
 	mux.Handle("GET /v1/bookings/{bookingID}", user(d.Bookings.Get))
 	mux.Handle("DELETE /v1/bookings/{bookingID}", user(d.Bookings.Cancel))
+
+	mux.HandleFunc("GET /v1/payment-methods", d.Payments.ListMethods)
+	mux.Handle("POST /v1/bookings/{bookingID}/payments", user(d.Payments.Pay))
 
 	mux.Handle("POST /v1/admin/movies", admin(d.Admin.CreateMovie))
 

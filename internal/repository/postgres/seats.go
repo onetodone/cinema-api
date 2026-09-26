@@ -88,6 +88,18 @@ WHERE booking_id = ANY($1::uuid[]) AND status = 'held'`, bookingIDs)
 	return tag.RowsAffected(), nil
 }
 
+// Sell flips the held seats of a booking to sold. The booking keeps them as their buyer.
+func (s seatStore) Sell(ctx context.Context, bookingID uuid.UUID) (int64, error) {
+	tag, err := s.q.Exec(ctx, `
+UPDATE showtime_seats
+SET status = 'sold', updated_at = now()
+WHERE booking_id = $1 AND status = 'held'`, bookingID)
+	if err != nil {
+		return 0, fmt.Errorf("sell seats of booking %s: %w", bookingID, err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 func scanShowtimeSeat(row pgx.CollectableRow) (domain.ShowtimeSeat, error) {
 	var s domain.ShowtimeSeat
 	err := row.Scan(&s.SeatID, &s.Row, &s.Number, &s.Type, &s.PriceCents, &s.Status)

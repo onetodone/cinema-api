@@ -12,6 +12,7 @@ import (
 	"uuid"
 
 	"github.com/onetodone/cinema-api/internal/domain"
+	"github.com/onetodone/cinema-api/internal/payment"
 	"github.com/onetodone/cinema-api/internal/service/auth"
 	"github.com/onetodone/cinema-api/internal/service/booking"
 	"github.com/onetodone/cinema-api/internal/service/catalog"
@@ -75,6 +76,23 @@ func (noBookings) List(context.Context, uuid.UUID, uuid.UUID, int) (booking.Page
 
 func (noBookings) Cancel(context.Context, uuid.UUID, uuid.UUID) error { return nil }
 
+// paysAll settles every payment as succeeded.
+type paysAll struct{}
+
+func (paysAll) Pay(_ context.Context, userID, bookingID uuid.UUID, np domain.NewPayment) (booking.PayResult, error) {
+	return booking.PayResult{
+		Payment: domain.Payment{ID: uuid.NewV7(), BookingID: bookingID, Provider: np.Method, Status: domain.PaymentSucceeded},
+		Booking: domain.Booking{ID: bookingID, UserID: userID, Status: domain.BookingPaid},
+	}, nil
+}
+
+// localMethod offers the local test provider.
+type localMethod struct{}
+
+func (localMethod) Methods() []payment.Method {
+	return []payment.Method{{ID: "local", Name: "Test card"}}
+}
+
 // echoAdmin creates every movie with id 1.
 type echoAdmin struct{}
 
@@ -102,6 +120,7 @@ func newTestRouter() http.Handler {
 		Catalog:  handler.NewCatalog(emptyCatalog{}, "USD", logger),
 		Auth:     handler.NewAuth(oneUser{user: user}, testTokens, logger),
 		Bookings: handler.NewBookings(noBookings{}, "USD", logger),
+		Payments: handler.NewPayments(paysAll{}, localMethod{}, "USD", logger),
 		Admin:    handler.NewAdmin(echoAdmin{}, logger),
 	})
 }
@@ -143,6 +162,7 @@ func TestRouterServesRegisteredRoutes(t *testing.T) {
 		"/healthz", "/readyz",
 		"/v1/movies", "/v1/movies/1",
 		"/v1/showtimes", "/v1/showtimes/1", "/v1/showtimes/1/seats",
+		"/v1/payment-methods",
 	} {
 		t.Run(path, func(t *testing.T) {
 			t.Parallel()
@@ -226,6 +246,7 @@ func TestRouterEnforcesAccessLevels(t *testing.T) {
 	movie := `{"title":"Dune","duration_min":155}`
 	seats := `{"showtime_id":1,"seat_ids":[1,2]}`
 	bookingPath := "/v1/bookings/" + uuid.NewV7().String()
+	pay := `{"payment_method":"local","payment_token":"tok_success"}`
 
 	tests := []struct {
 		name   string
@@ -251,6 +272,9 @@ func TestRouterEnforcesAccessLevels(t *testing.T) {
 		{name: "booking read for a customer", method: http.MethodGet, path: bookingPath, token: customer, status: http.StatusNotFound},
 		{name: "booking cancel needs a token", method: http.MethodDelete, path: bookingPath, status: http.StatusUnauthorized},
 		{name: "booking cancel for a customer", method: http.MethodDelete, path: bookingPath, token: customer, status: http.StatusNoContent},
+		{name: "payment methods are public", method: http.MethodGet, path: "/v1/payment-methods", status: http.StatusOK},
+		{name: "payment needs a token", method: http.MethodPost, path: bookingPath + "/payments", body: pay, status: http.StatusUnauthorized},
+		{name: "payment for a customer", method: http.MethodPost, path: bookingPath + "/payments", token: customer, body: pay, status: http.StatusOK},
 		{name: "admin route needs a token", method: http.MethodPost, path: "/v1/admin/movies", body: movie, status: http.StatusUnauthorized},
 		{name: "admin route refuses customers", method: http.MethodPost, path: "/v1/admin/movies", token: customer, body: movie, status: http.StatusForbidden},
 		{name: "admin route for an admin", method: http.MethodPost, path: "/v1/admin/movies", token: admin, body: movie, status: http.StatusCreated},

@@ -18,8 +18,11 @@ func writeError(logger *slog.Logger, w http.ResponseWriter, r *http.Request, err
 	p := problem.FromError(err)
 	if p.Status >= http.StatusInternalServerError {
 		level := slog.LevelError
-		if errors.Is(err, context.Canceled) {
+		switch {
+		case errors.Is(err, context.Canceled):
 			level = slog.LevelInfo // the client went away; nothing is broken
+		case errors.Is(err, domain.ErrUnavailable):
+			level = slog.LevelWarn // a dependency refused the request; this service works as intended
 		}
 		logger.Log(r.Context(), level, "request failed", slog.Any("error", err))
 	}

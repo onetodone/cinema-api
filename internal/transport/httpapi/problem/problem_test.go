@@ -58,6 +58,13 @@ func TestFromErrorMapsDomainKinds(t *testing.T) {
 			detail: "admins only",
 		},
 		{
+			name:   "gone",
+			err:    domain.Gone(domain.CodeBookingExpired, "the hold has run out"),
+			status: http.StatusGone,
+			code:   domain.CodeBookingExpired,
+			detail: "the hold has run out",
+		},
+		{
 			name:   "unknown error is hidden",
 			err:    errors.New("pq: password authentication failed for user postgres"),
 			status: http.StatusInternalServerError,
@@ -124,6 +131,23 @@ func TestBusyErrorsAskForARetry(t *testing.T) {
 	}
 	if _, leaked := body["RetryAfter"]; leaked {
 		t.Error("RetryAfter is part of the body")
+	}
+}
+
+func TestPaymentErrors(t *testing.T) {
+	t.Parallel()
+
+	p := FromError(fmt.Errorf("pay: %w", domain.PaymentDeclined("insufficient_funds")))
+	if p.Status != http.StatusPaymentRequired || p.Code != domain.CodePaymentDeclined || p.DeclineCode != "insufficient_funds" {
+		t.Errorf("declined = %+v, want 402 PAYMENT_DECLINED with the decline code", p)
+	}
+
+	p = FromError(domain.Unavailable(domain.CodePaymentProviderUnavailable, "try later"))
+	if p.Status != http.StatusServiceUnavailable || p.Code != domain.CodePaymentProviderUnavailable || p.RetryAfter != 5 {
+		t.Errorf("unavailable = %+v, want 503 with a retry after 5 s", p)
+	}
+	if p.DeclineCode != "" {
+		t.Errorf("a non-decline got a decline code: %+v", p)
 	}
 }
 

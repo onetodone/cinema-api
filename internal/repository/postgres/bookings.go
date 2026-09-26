@@ -216,32 +216,44 @@ FROM unnest($3::bigint[], $4::bigint[]) AS seat (id, price_cents)`,
 	return b, nil
 }
 
-func (s bookingStore) LockForUser(ctx context.Context, id, userID uuid.UUID) (domain.Booking, error) {
+func (s bookingStore) LockForUser(ctx context.Context, id, userID uuid.UUID) (domain.Booking, bool, error) {
+	return s.lock(ctx, id, &userID)
+}
+
+func (s bookingStore) Lock(ctx context.Context, id uuid.UUID) (domain.Booking, bool, error) {
+	return s.lock(ctx, id, nil)
+}
+
+// lock locks a booking row, of userID only when it is not nil. FOR NO KEY UPDATE: the status UPDATE that
+// follows changes no key column, and this lock does not block the foreign key checks of rows that reference the
+// booking, such as its payments.
+func (s bookingStore) lock(ctx context.Context, id uuid.UUID, userID *uuid.UUID) (domain.Booking, bool, error) {
 	var (
-		b      domain.Booking
-		paidAt *time.Time
+		b        domain.Booking
+		paidAt   *time.Time
+		holdOver bool
 	)
-	// FOR NO KEY UPDATE: the status UPDATE that follows changes no key column, and this lock does not block
-	// the foreign key checks of rows that reference the booking.
 	err := s.q.QueryRow(ctx, `
-SELECT id, user_id, showtime_id, status, total_cents, expires_at, paid_at, created_at, updated_at
+SELECT id, user_id, showtime_id, status, total_cents, expires_at, paid_at, created_at, updated_at,
+       expires_at <= now()
 FROM bookings
-WHERE id = $1 AND user_id = $2
+WHERE id = $1 AND ($2::uuid IS NULL OR user_id = $2)
 FOR NO KEY UPDATE`, id, userID).Scan(
-		&b.ID, &b.UserID, &b.Showtime.ID, &b.Status, &b.TotalCents, &b.ExpiresAt, &paidAt, &b.CreatedAt, &b.UpdatedAt)
+		&b.ID, &b.UserID, &b.Showtime.ID, &b.Status, &b.TotalCents, &b.ExpiresAt, &paidAt, &b.CreatedAt, &b.UpdatedAt,
+		&holdOver)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
-		return domain.Booking{}, domain.BookingNotFound(id)
+		return domain.Booking{}, false, domain.BookingNotFound(id)
 	case pgErrorCode(err) == sqlstateLockNotAvailable:
-		return domain.Booking{}, domain.Busy(domain.CodeBookingBusy,
+		return domain.Booking{}, false, domain.Busy(domain.CodeBookingBusy,
 			"booking %s is being changed by another request; try again in a moment", id)
 	case err != nil:
-		return domain.Booking{}, fmt.Errorf("lock booking %s: %w", id, err)
+		return domain.Booking{}, false, fmt.Errorf("lock booking %s: %w", id, err)
 	}
 	if paidAt != nil {
 		b.PaidAt = *paidAt
 	}
-	return b, nil
+	return b, holdOver, nil
 }
 
 // LockExpired claims due bookings for the expiry worker. Two details let several workers run side by side:
@@ -274,7 +286,9 @@ FOR NO KEY UPDATE SKIP LOCKED`, limit)
 func (s bookingStore) SetStatus(ctx context.Context, from, to domain.BookingStatus, ids ...uuid.UUID) error {
 	tag, err := s.q.Exec(ctx, `
 UPDATE bookings
-SET status = $3::booking_status, updated_at = now()
+SET status = $3::booking_status,
+    paid_at = CASE WHEN $3::booking_status = 'paid' THEN now() ELSE paid_at END,
+    updated_at = now()
 WHERE id = ANY($1::uuid[]) AND status = $2::booking_status`, ids, string(from), string(to))
 	if err != nil {
 		return fmt.Errorf("set status of %d bookings to %s: %w", len(ids), to, err)

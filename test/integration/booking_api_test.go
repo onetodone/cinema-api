@@ -16,7 +16,6 @@ import (
 	"github.com/onetodone/cinema-api/internal/repository/postgres"
 	"github.com/onetodone/cinema-api/internal/service/admin"
 	"github.com/onetodone/cinema-api/internal/service/auth"
-	"github.com/onetodone/cinema-api/internal/service/booking"
 	"github.com/onetodone/cinema-api/internal/service/catalog"
 	"github.com/onetodone/cinema-api/internal/transport/httpapi"
 	"github.com/onetodone/cinema-api/internal/transport/httpapi/handler"
@@ -35,8 +34,8 @@ func newAPIServer(t *testing.T, f *fixture) apiClient {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bookingSvc := booking.New(postgres.NewUnitOfWork(f.pool, 3*time.Second, logger), postgres.NewBookings(f.pool),
-		time.UTC, booking.Config{HoldTTL: testHoldTTL, MaxSeats: 10})
+	providers, _ := testProviders(t)
+	bookingSvc := newBookingService(f.pool, 3*time.Second, providers, logger)
 
 	router := httpapi.NewRouter(httpapi.RouterDeps{
 		Logger:   logger,
@@ -45,6 +44,7 @@ func newAPIServer(t *testing.T, f *fixture) apiClient {
 		Catalog:  handler.NewCatalog(catalog.New(f.catalog, time.UTC), "USD", logger),
 		Auth:     handler.NewAuth(authSvc, tokens, logger),
 		Bookings: handler.NewBookings(bookingSvc, "USD", logger),
+		Payments: handler.NewPayments(bookingSvc, providers, "USD", logger),
 		Admin:    handler.NewAdmin(admin.New(f.catalog), logger),
 	})
 	srv := httptest.NewServer(router)

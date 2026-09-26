@@ -19,7 +19,6 @@ import (
 	"github.com/onetodone/cinema-api/internal/repository/postgres"
 	"github.com/onetodone/cinema-api/internal/service/admin"
 	"github.com/onetodone/cinema-api/internal/service/auth"
-	"github.com/onetodone/cinema-api/internal/service/booking"
 	"github.com/onetodone/cinema-api/internal/service/catalog"
 	"github.com/onetodone/cinema-api/internal/transport/httpapi"
 	"github.com/onetodone/cinema-api/internal/transport/httpapi/handler"
@@ -76,14 +75,16 @@ func NewAPI(ctx context.Context, cfg config.Config, logger *slog.Logger) (*API, 
 		}},
 	)
 
+	providers, err := newPaymentProviders(cfg.Payment)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	logPaymentMethods(logger, providers)
+
 	catalogRepo := postgres.NewCatalog(db)
 	catalogSvc := catalog.New(catalogRepo, cfg.Cinema.Location)
-	bookingSvc := booking.New(
-		postgres.NewUnitOfWork(db, cfg.DB.LockTimeout, logger),
-		postgres.NewBookings(db),
-		cfg.Cinema.Location,
-		booking.Config{HoldTTL: cfg.Booking.HoldTTL, MaxSeats: cfg.Booking.MaxSeats},
-	)
+	bookingSvc := newBookingService(db, cfg, providers, logger)
 
 	router := httpapi.NewRouter(httpapi.RouterDeps{
 		Logger:   logger,
@@ -92,6 +93,7 @@ func NewAPI(ctx context.Context, cfg config.Config, logger *slog.Logger) (*API, 
 		Catalog:  handler.NewCatalog(catalogSvc, cfg.Cinema.Currency, logger),
 		Auth:     handler.NewAuth(authSvc, tokens, logger),
 		Bookings: handler.NewBookings(bookingSvc, cfg.Cinema.Currency, logger),
+		Payments: handler.NewPayments(bookingSvc, providers, cfg.Cinema.Currency, logger),
 		Admin:    handler.NewAdmin(admin.New(catalogRepo), logger),
 	})
 

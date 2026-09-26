@@ -1,8 +1,9 @@
 // Command worker runs the background jobs of the cinema booking API: it expires unpaid bookings whose hold
-// has run out and makes their seats available again.
+// has run out and makes their seats available again, and it settles payments whose outcome the API did not
+// record, by asking their payment provider.
 //
-// Several workers may run at once, for example one per replica: they split the work between them through
-// row locks in the database and never expire a booking twice.
+// Several workers may run at once, for example one per replica: they split the expiry work between them
+// through row locks in the database and never expire a booking or settle a payment twice.
 package main
 
 import (

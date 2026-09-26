@@ -33,6 +33,7 @@ type memState struct {
 	showtimes map[int64]memShowtime
 	seats     map[seatKey]memSeat
 	bookings  map[uuid.UUID]domain.Booking
+	payments  map[uuid.UUID]domain.Payment
 }
 
 func (s memState) clone() memState {
@@ -40,6 +41,7 @@ func (s memState) clone() memState {
 		showtimes: maps.Clone(s.showtimes),
 		seats:     maps.Clone(s.seats),
 		bookings:  maps.Clone(s.bookings),
+		payments:  maps.Clone(s.payments),
 	}
 }
 
@@ -50,9 +52,11 @@ type memDB struct {
 	state memState
 	now   time.Time
 
-	calls         []string // repository calls of the last transactions, for checking the lock order
+	calls         []string // repository calls of the last transaction, for checking the lock order
 	holdShortfall int64    // Hold reports this many fewer changed seats than it changed
 	releaseExtra  int64    // Release reports this many more changed seats than it changed
+	sellShortfall int64    // Sell reports this many fewer changed seats than it changed
+	finishErr     error    // Finish fails with this error
 	listLimit     int      // the limit the last ListBookings call received
 }
 
@@ -63,6 +67,7 @@ func newMemDB(now time.Time) *memDB {
 			showtimes: map[int64]memShowtime{},
 			seats:     map[seatKey]memSeat{},
 			bookings:  map[uuid.UUID]domain.Booking{},
+			payments:  map[uuid.UUID]domain.Payment{},
 		},
 	}
 }
@@ -95,6 +100,39 @@ func (db *memDB) booking(id uuid.UUID) (domain.Booking, bool) {
 	defer db.mu.Unlock()
 	b, ok := db.state.bookings[id]
 	return b, ok
+}
+
+func (db *memDB) payment(id uuid.UUID) domain.Payment {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	return db.state.payments[id]
+}
+
+// paymentsOf returns the payments of a booking, oldest first.
+func (db *memDB) paymentsOf(bookingID uuid.UUID) []domain.Payment {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	var out []domain.Payment
+	for _, p := range db.state.payments {
+		if p.BookingID == bookingID {
+			out = append(out, p)
+		}
+	}
+	slices.SortFunc(out, func(a, b domain.Payment) int { return a.ID.Compare(b.ID) })
+	return out
+}
+
+// lastCalls returns the repository calls of the last transaction.
+func (db *memDB) lastCalls() []string {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	return slices.Clone(db.calls)
+}
+
+func (db *memDB) setFinishErr(err error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	db.finishErr = err
 }
 
 // advance moves the fake database clock forward.
@@ -151,7 +189,20 @@ func (db *memDB) ListBookings(_ context.Context, userID, beforeID uuid.UUID, lim
 	return out, nil
 }
 
-// memTx implements TxRepos and all three repositories on a private copy of the state.
+func (db *memDB) ListStuckPayments(_ context.Context, age time.Duration, afterID uuid.UUID, limit int) ([]domain.Payment, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	var out []domain.Payment
+	for _, p := range db.state.payments {
+		if p.Status == domain.PaymentPending && !p.CreatedAt.After(db.now.Add(-age)) && p.ID.Compare(afterID) > 0 {
+			out = append(out, p)
+		}
+	}
+	slices.SortFunc(out, func(a, b domain.Payment) int { return a.ID.Compare(b.ID) })
+	return out[:min(limit, len(out))], nil
+}
+
+// memTx implements TxRepos and the showtime, seat, and booking repositories on a private copy of the state.
 type memTx struct {
 	db    *memDB
 	state memState
@@ -160,6 +211,7 @@ type memTx struct {
 func (tx *memTx) Showtimes() ShowtimeRepo { return tx }
 func (tx *memTx) Seats() SeatRepo         { return tx }
 func (tx *memTx) Bookings() Repo          { return tx }
+func (tx *memTx) Payments() PaymentRepo   { return memPayments{tx} }
 
 func (tx *memTx) record(format string, args ...any) {
 	tx.db.calls = append(tx.db.calls, fmt.Sprintf(format, args...))
@@ -223,6 +275,19 @@ func (tx *memTx) Release(_ context.Context, bookingIDs ...uuid.UUID) (int64, err
 	return n + tx.db.releaseExtra, nil
 }
 
+func (tx *memTx) Sell(_ context.Context, bookingID uuid.UUID) (int64, error) {
+	tx.record("sell seats")
+	var n int64
+	for k, s := range tx.state.seats {
+		if s.bookingID == bookingID && s.seat.Status == domain.SeatHeld {
+			s.seat.Status = domain.SeatSold
+			tx.state.seats[k] = s
+			n++
+		}
+	}
+	return n - tx.db.sellShortfall, nil
+}
+
 func (tx *memTx) Create(_ context.Context, b domain.Booking, holdTTL time.Duration) (domain.Booking, error) {
 	tx.record("insert booking")
 	for _, other := range tx.state.bookings {
@@ -237,13 +302,30 @@ func (tx *memTx) Create(_ context.Context, b domain.Booking, holdTTL time.Durati
 	return b, nil
 }
 
-func (tx *memTx) LockForUser(_ context.Context, id, userID uuid.UUID) (domain.Booking, error) {
+func (tx *memTx) LockForUser(_ context.Context, id, userID uuid.UUID) (domain.Booking, bool, error) {
 	tx.record("lock booking")
 	b, ok := tx.state.bookings[id]
 	if !ok || b.UserID != userID {
-		return domain.Booking{}, domain.BookingNotFound(id)
+		return domain.Booking{}, false, domain.BookingNotFound(id)
 	}
-	return domain.Booking{ID: b.ID, UserID: b.UserID, Showtime: domain.ShowtimeRef{ID: b.Showtime.ID}, Status: b.Status}, nil
+	return tx.ownColumns(b), !b.ExpiresAt.After(tx.db.now), nil
+}
+
+func (tx *memTx) Lock(_ context.Context, id uuid.UUID) (domain.Booking, bool, error) {
+	tx.record("lock booking")
+	b, ok := tx.state.bookings[id]
+	if !ok {
+		return domain.Booking{}, false, domain.BookingNotFound(id)
+	}
+	return tx.ownColumns(b), !b.ExpiresAt.After(tx.db.now), nil
+}
+
+// ownColumns keeps what a lock loads from the bookings row alone.
+func (*memTx) ownColumns(b domain.Booking) domain.Booking {
+	return domain.Booking{
+		ID: b.ID, UserID: b.UserID, Showtime: domain.ShowtimeRef{ID: b.Showtime.ID}, Status: b.Status,
+		TotalCents: b.TotalCents, ExpiresAt: b.ExpiresAt, PaidAt: b.PaidAt, CreatedAt: b.CreatedAt, UpdatedAt: b.UpdatedAt,
+	}
 }
 
 // LockExpired returns the pending bookings whose hold ended at or before the fake clock. The fake runs one
@@ -272,7 +354,51 @@ func (tx *memTx) SetStatus(_ context.Context, from, to domain.BookingStatus, ids
 			return fmt.Errorf("booking %s is no longer %s", id, from)
 		}
 		b.Status = to
+		if to == domain.BookingPaid {
+			b.PaidAt = tx.db.now
+		}
 		tx.state.bookings[id] = b
 	}
 	return nil
+}
+
+// memPayments implements PaymentRepo on a transaction of the fake.
+type memPayments struct {
+	tx *memTx
+}
+
+func (m memPayments) Create(_ context.Context, p domain.Payment) (domain.Payment, error) {
+	m.tx.record("insert payment")
+	for _, other := range m.tx.state.payments {
+		if other.BookingID == p.BookingID && other.Status == domain.PaymentPending {
+			return domain.Payment{}, domain.Conflict(domain.CodePaymentInProgress, "one pending payment per booking")
+		}
+	}
+	p.Status = domain.PaymentPending
+	p.CreatedAt, p.UpdatedAt = m.tx.db.now, m.tx.db.now
+	m.tx.state.payments[p.ID] = p
+	return p, nil
+}
+
+func (m memPayments) Get(_ context.Context, id uuid.UUID) (domain.Payment, error) {
+	m.tx.record("get payment")
+	p, ok := m.tx.state.payments[id]
+	if !ok {
+		return domain.Payment{}, fmt.Errorf("payment %s not found", id)
+	}
+	return p, nil
+}
+
+func (m memPayments) Finish(_ context.Context, id uuid.UUID, from domain.PaymentStatus, out domain.PaymentOutcome) (domain.Payment, error) {
+	m.tx.record("finish payment %s", out.Status)
+	if m.tx.db.finishErr != nil {
+		return domain.Payment{}, m.tx.db.finishErr
+	}
+	p := m.tx.state.payments[id]
+	if p.Status != from {
+		return domain.Payment{}, fmt.Errorf("payment %s is no longer %s", id, from)
+	}
+	p.Status, p.ProviderRef, p.FailureReason, p.UpdatedAt = out.Status, out.ProviderRef, out.FailureReason, m.tx.db.now
+	m.tx.state.payments[id] = p
+	return p, nil
 }

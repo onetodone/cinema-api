@@ -2,12 +2,14 @@ package booking
 
 import (
 	"errors"
+	"log/slog"
 	"slices"
 	"testing"
 	"time"
 	"uuid"
 
 	"github.com/onetodone/cinema-api/internal/domain"
+	"github.com/onetodone/cinema-api/internal/payment"
 )
 
 var (
@@ -17,13 +19,25 @@ var (
 	bob     = uuid.NewV7()
 )
 
-const holdTTL = 15 * time.Minute
+const (
+	holdTTL        = 15 * time.Minute
+	paymentTimeout = 10 * time.Second
+	paymentGrace   = 2 * time.Minute
+)
 
 // newTestService returns a service over a fake database with three showtimes:
 //   - 1: scheduled, seats 1-4 (seat 4 is VIP);
 //   - 2: scheduled but already started, seat 10;
 //   - 3: canceled, seat 20.
 func newTestService(t *testing.T) (*Service, *memDB) {
+	t.Helper()
+	svc, db, _ := newPayTestService(t)
+	return svc, db
+}
+
+// newPayTestService is newTestService with the payment provider "card", whose answers the test scripts. By
+// default it charges every payment. A second provider, "old", is registered but takes no new payments.
+func newPayTestService(t *testing.T) (*Service, *memDB, *fakeProvider) {
 	t.Helper()
 	db := newMemDB(testNow)
 	st := func(id int64, status domain.ShowtimeStatus) domain.ShowtimeRef {
@@ -35,7 +49,22 @@ func newTestService(t *testing.T) (*Service, *memDB) {
 	db.addShowtime(st(1, domain.ShowtimeScheduled), false, 1, 1000, 1000, 1000, 1500)
 	db.addShowtime(st(2, domain.ShowtimeScheduled), true, 10, 1000)
 	db.addShowtime(st(3, domain.ShowtimeCanceled), false, 20, 1000)
-	return New(db, db, cinema, Config{HoldTTL: holdTTL, MaxSeats: 4}), db
+
+	card := &fakeProvider{id: "card"}
+	providers := payment.NewRegistry()
+	for _, reg := range []struct {
+		p       payment.Provider
+		enabled bool
+	}{{card, true}, {&fakeProvider{id: "old"}, false}} {
+		if err := providers.Register(reg.p, reg.enabled); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := Config{
+		Location: cinema, Currency: "EUR", HoldTTL: holdTTL, MaxSeats: 4,
+		PaymentTimeout: paymentTimeout, PaymentGrace: paymentGrace,
+	}
+	return New(db, db, providers, cfg, slog.New(slog.DiscardHandler)), db, card
 }
 
 func code(err error) string {

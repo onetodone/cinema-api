@@ -1,9 +1,11 @@
-// Package booking implements seat holds: creating, reading, listing, canceling, and expiring bookings.
+// Package booking implements seat holds and their payment: creating, reading, listing, canceling, expiring,
+// and paying for bookings, and settling payments whose outcome the API did not record.
 package booking
 
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"slices"
 	"time"
 	"uuid"
@@ -19,21 +21,29 @@ const (
 
 // Config holds the booking rules that come from configuration.
 type Config struct {
-	HoldTTL  time.Duration // how long a booking holds its seats while waiting for payment
-	MaxSeats int           // most seats one booking may hold
+	Location *time.Location // the cinema's time zone, for the showtimes of returned bookings
+	Currency string         // ISO 4217 code of all prices, sent to payment providers
+	HoldTTL  time.Duration  // how long a booking holds its seats while waiting for payment
+	MaxSeats int            // most seats one booking may hold
+	// PaymentTimeout bounds each call to a payment provider.
+	PaymentTimeout time.Duration
+	// PaymentGrace is how long a payment may stay in flight before ReconcileBatch asks its provider about it.
+	// It must be longer than PaymentTimeout, so that the API has given up on the charge by then.
+	PaymentGrace time.Duration
 }
 
 // Service runs the booking use cases. Times of returned showtimes are in the cinema's time zone.
 type Service struct {
-	uow    UnitOfWork
-	reader Reader
-	loc    *time.Location
-	cfg    Config
+	uow       UnitOfWork
+	reader    Reader
+	providers PaymentProviders
+	cfg       Config
+	logger    *slog.Logger
 }
 
-// New returns a booking Service. loc is the cinema's time zone.
-func New(uow UnitOfWork, reader Reader, loc *time.Location, cfg Config) *Service {
-	return &Service{uow: uow, reader: reader, loc: loc, cfg: cfg}
+// New returns a booking Service.
+func New(uow UnitOfWork, reader Reader, providers PaymentProviders, cfg Config, logger *slog.Logger) *Service {
+	return &Service{uow: uow, reader: reader, providers: providers, cfg: cfg, logger: logger}
 }
 
 // Create holds seats of one showtime for userID until the hold expires. The request is all or nothing: if
@@ -195,7 +205,7 @@ func (s *Service) List(ctx context.Context, userID, beforeID uuid.UUID, limit in
 func (s *Service) Cancel(ctx context.Context, userID, id uuid.UUID) error {
 	return s.uow.Do(ctx, func(ctx context.Context, r TxRepos) error {
 		// Lock order: the booking first, then its seats.
-		b, err := r.Bookings().LockForUser(ctx, id, userID)
+		b, _, err := r.Bookings().LockForUser(ctx, id, userID)
 		if err != nil {
 			return err
 		}
@@ -278,6 +288,6 @@ func releaseSeats(ctx context.Context, r TxRepos, bookingIDs ...uuid.UUID) (int6
 }
 
 func (s *Service) localize(b domain.Booking) domain.Booking {
-	b.Showtime.StartsAt = b.Showtime.StartsAt.In(s.loc)
+	b.Showtime.StartsAt = b.Showtime.StartsAt.In(s.cfg.Location)
 	return b
 }

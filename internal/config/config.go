@@ -14,14 +14,16 @@ import (
 
 // Config is the complete runtime configuration shared by all binaries.
 type Config struct {
-	HTTP    HTTPConfig
-	DB      DBConfig
-	Redis   RedisConfig
-	Log     LogConfig
-	Cinema  CinemaConfig
-	Auth    AuthConfig
-	Booking BookingConfig
-	Expirer ExpirerConfig
+	HTTP       HTTPConfig
+	DB         DBConfig
+	Redis      RedisConfig
+	Log        LogConfig
+	Cinema     CinemaConfig
+	Auth       AuthConfig
+	Booking    BookingConfig
+	Expirer    ExpirerConfig
+	Payment    PaymentConfig
+	Reconciler ReconcilerConfig
 }
 
 // Limits for authentication settings.
@@ -48,6 +50,44 @@ const (
 	// maxExpirerBatchSize bounds the rows one transaction locks: up to BOOKING_MAX_SEATS seats per booking.
 	maxExpirerBatchSize = 5000
 )
+
+// Limits for payments.
+const (
+	minPaymentTimeout = time.Second
+	maxPaymentGrace   = time.Hour
+)
+
+// Limits for the payment reconciler.
+const (
+	minReconcilerInterval = time.Second
+	maxReconcilerInterval = 10 * time.Minute
+)
+
+// PaymentConfig configures payments and the payment providers. Each provider has its own block of settings; a
+// provider that is not enabled takes no new payments, but still settles the payments it has in flight.
+type PaymentConfig struct {
+	// Timeout bounds each call to a payment provider. A charge without an answer by then is settled later by
+	// the worker.
+	Timeout time.Duration `env:"PAYMENT_TIMEOUT" envDefault:"10s"`
+	// Grace is how long a payment may stay in flight before the worker asks its provider what became of it.
+	// It must be longer than Timeout, so the API has given up on the charge by then.
+	Grace time.Duration `env:"PAYMENT_GRACE" envDefault:"2m"`
+	Local LocalPaymentConfig
+}
+
+// LocalPaymentConfig configures the local test provider (internal/payment/local).
+type LocalPaymentConfig struct {
+	// Enabled offers the local provider to clients. It accepts test tokens and moves no money, so anyone could
+	// buy tickets for free: it is off unless switched on, and must stay off in production.
+	Enabled bool `env:"PAYMENT_LOCAL_ENABLED" envDefault:"false"`
+}
+
+// ReconcilerConfig configures the worker job that settles payments the API did not settle.
+type ReconcilerConfig struct {
+	// Interval is the average pause between two passes over stuck payments, varied by up to 20% like the
+	// expirer's.
+	Interval time.Duration `env:"RECONCILER_INTERVAL" envDefault:"30s"`
+}
 
 // ExpirerConfig configures the worker that expires unpaid bookings.
 type ExpirerConfig struct {
@@ -263,6 +303,18 @@ func (c Config) Validate() error {
 	if c.Expirer.BatchSize < 1 || c.Expirer.BatchSize > maxExpirerBatchSize {
 		errs = append(errs, fmt.Errorf("EXPIRER_BATCH_SIZE must be between 1 and %d, got %d",
 			maxExpirerBatchSize, c.Expirer.BatchSize))
+	}
+	if c.Payment.Timeout < minPaymentTimeout || c.Payment.Timeout >= c.HTTP.WriteTimeout {
+		errs = append(errs, fmt.Errorf("PAYMENT_TIMEOUT must be at least %s and shorter than HTTP_WRITE_TIMEOUT (%s), got %s",
+			minPaymentTimeout, c.HTTP.WriteTimeout, c.Payment.Timeout))
+	}
+	if c.Payment.Grace <= c.Payment.Timeout || c.Payment.Grace > maxPaymentGrace {
+		errs = append(errs, fmt.Errorf("PAYMENT_GRACE must be longer than PAYMENT_TIMEOUT (%s) and at most %s, got %s",
+			c.Payment.Timeout, maxPaymentGrace, c.Payment.Grace))
+	}
+	if c.Reconciler.Interval < minReconcilerInterval || c.Reconciler.Interval > maxReconcilerInterval {
+		errs = append(errs, fmt.Errorf("RECONCILER_INTERVAL must be between %s and %s, got %s",
+			minReconcilerInterval, maxReconcilerInterval, c.Reconciler.Interval))
 	}
 	if !isCurrencyCode(c.Cinema.Currency) {
 		errs = append(errs, fmt.Errorf("CINEMA_CURRENCY must be a 3-letter uppercase ISO 4217 code, got %q",

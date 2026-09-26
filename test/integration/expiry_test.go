@@ -16,7 +16,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/onetodone/cinema-api/internal/domain"
-	"github.com/onetodone/cinema-api/internal/repository/postgres"
 	"github.com/onetodone/cinema-api/internal/service/booking"
 	"github.com/onetodone/cinema-api/internal/worker"
 )
@@ -58,7 +57,7 @@ func TestExpireBatch(t *testing.T) {
 	backdate(t, env.pool, 3*time.Minute, annB.ID)
 	backdate(t, env.pool, 2*time.Minute, bobB.ID)
 	backdate(t, env.pool, time.Minute, catB.ID)
-	// Due as well, but a payment is in progress (Sprint 5 reconciles those), or the booking is already paid.
+	// Due as well, but a payment is in progress (the reconciliation settles those), or the booking is already paid.
 	backdate(t, env.pool, 10*time.Minute, eveB.ID, fayB.ID)
 	exec(t, env.pool, `UPDATE bookings SET status = 'processing' WHERE id = $1`, eveB.ID)
 	exec(t, env.pool, `UPDATE bookings SET status = 'paid', paid_at = now() WHERE id = $1`, fayB.ID)
@@ -204,9 +203,8 @@ func startExpirers(t *testing.T, pool *pgxpool.Pool, n, batchSize int, logs *log
 	var wg sync.WaitGroup
 	recorders := make([]*recordingExpirer, n)
 	for i := range recorders {
-		p := newPoolOf(t, pool, 2)
-		svc := booking.New(postgres.NewUnitOfWork(p, raceLockTimeout, slog.New(logs)), postgres.NewBookings(p),
-			time.UTC, booking.Config{HoldTTL: testHoldTTL, MaxSeats: 10})
+		providers, _ := testProviders(t)
+		svc := newBookingService(newPoolOf(t, pool, 2), raceLockTimeout, providers, slog.New(logs))
 		recorders[i] = &recordingExpirer{svc: svc, firstCall: firstCall}
 		e := worker.NewExpirer(recorders[i], worker.ExpirerConfig{Interval: 20 * time.Millisecond, BatchSize: batchSize},
 			slog.New(logs))

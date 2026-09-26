@@ -35,9 +35,15 @@ type FieldError struct {
 	Message string `json:"message"`
 }
 
-// busyRetryAfterSeconds is the Retry-After of a 409 caused by a lock held by a concurrent request. Booking
-// transactions hold their locks for milliseconds, so one second is plenty.
-const busyRetryAfterSeconds = 1
+// Retry-After values, in seconds.
+const (
+	// busyRetryAfterSeconds is for a 409 caused by a lock held by a concurrent request. Booking transactions
+	// hold their locks for milliseconds, so one second is plenty.
+	busyRetryAfterSeconds = 1
+	// unavailableRetryAfterSeconds is for a 503 caused by a dependency, such as a payment provider, that
+	// refused the request.
+	unavailableRetryAfterSeconds = 5
+)
 
 // Problem is an RFC 9457 problem details object. Type is "about:blank", so Title is the HTTP status phrase;
 // clients branch on Code, which is stable across releases.
@@ -52,6 +58,8 @@ type Problem struct {
 	Errors    []FieldError `json:"errors,omitempty"`
 	// UnavailableSeatIDs lists the requested seats that are taken, with code SEAT_UNAVAILABLE.
 	UnavailableSeatIDs []int64 `json:"unavailable_seat_ids,omitempty"`
+	// DeclineCode is the payment provider's reason, with code PAYMENT_DECLINED.
+	DeclineCode string `json:"decline_code,omitempty"`
 	// RetryAfter, in seconds, is sent as the Retry-After header when positive.
 	RetryAfter int `json:"-"`
 }
@@ -80,14 +88,20 @@ func Internal() Problem {
 }
 
 // FromError maps err to a problem. A *domain.ValidationError becomes a 400 that lists its fields. Other domain
-// errors keep their code and client-safe message; a *domain.SeatsUnavailableError adds the taken seats, and a
-// busy error becomes a 409 with Retry-After. Any other error becomes a generic 500, so internal details never
-// reach clients.
+// errors keep their code and client-safe message; a *domain.SeatsUnavailableError adds the taken seats, a
+// *domain.PaymentDeclinedError the decline code, and busy and unavailable errors get a Retry-After. Any other
+// error becomes a generic 500, so internal details never reach clients.
 func FromError(err error) Problem {
 	p := fromError(err)
-	var unavailable *domain.SeatsUnavailableError
+	var (
+		unavailable *domain.SeatsUnavailableError
+		declined    *domain.PaymentDeclinedError
+	)
 	if errors.As(err, &unavailable) {
 		p.UnavailableSeatIDs = unavailable.SeatIDs
+	}
+	if errors.As(err, &declined) {
+		p.DeclineCode = declined.DeclineCode
 	}
 	return p
 }
@@ -122,6 +136,14 @@ func fromError(err error) Problem {
 		return New(http.StatusUnauthorized, de.Code, de.Message)
 	case errors.Is(de.Kind, domain.ErrForbidden):
 		return New(http.StatusForbidden, de.Code, de.Message)
+	case errors.Is(de.Kind, domain.ErrGone):
+		return New(http.StatusGone, de.Code, de.Message)
+	case errors.Is(de.Kind, domain.ErrPaymentRequired):
+		return New(http.StatusPaymentRequired, de.Code, de.Message)
+	case errors.Is(de.Kind, domain.ErrUnavailable):
+		p := New(http.StatusServiceUnavailable, de.Code, de.Message)
+		p.RetryAfter = unavailableRetryAfterSeconds
+		return p
 	default:
 		return Internal()
 	}

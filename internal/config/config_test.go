@@ -64,6 +64,33 @@ func TestLoadAppliesDefaults(t *testing.T) {
 	if cfg.Expirer.Interval != 5*time.Second || cfg.Expirer.BatchSize != 500 {
 		t.Errorf("Expirer interval/batch size = %s/%d, want 5s/500", cfg.Expirer.Interval, cfg.Expirer.BatchSize)
 	}
+	if cfg.Payment.Timeout != 10*time.Second || cfg.Payment.Grace != 2*time.Minute || cfg.Payment.Local.Enabled {
+		t.Errorf("Payment = %+v, want 10s/2m with the local provider off", cfg.Payment)
+	}
+	if cfg.Reconciler.Interval != 30*time.Second {
+		t.Errorf("Reconciler interval = %s, want 30s", cfg.Reconciler.Interval)
+	}
+}
+
+func TestLoadReadsPaymentSettings(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := loadFrom(t, map[string]string{
+		"DATABASE_URL":          testDSN,
+		"PAYMENT_TIMEOUT":       "3s",
+		"PAYMENT_GRACE":         "4s",
+		"PAYMENT_LOCAL_ENABLED": "true",
+		"RECONCILER_INTERVAL":   "1s",
+	})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Payment.Timeout != 3*time.Second || cfg.Payment.Grace != 4*time.Second || !cfg.Payment.Local.Enabled {
+		t.Errorf("Payment = %+v", cfg.Payment)
+	}
+	if cfg.Reconciler.Interval != time.Second {
+		t.Errorf("Reconciler = %+v", cfg.Reconciler)
+	}
 }
 
 func TestLoadReadsBookingSettings(t *testing.T) {
@@ -295,6 +322,41 @@ func TestLoadRejectsInvalidInput(t *testing.T) {
 			name:    "huge expirer batch size",
 			vars:    map[string]string{"DATABASE_URL": testDSN, "EXPIRER_BATCH_SIZE": "5001"},
 			wantErr: "EXPIRER_BATCH_SIZE",
+		},
+		{
+			name:    "sub-second payment timeout",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "PAYMENT_TIMEOUT": "500ms"},
+			wantErr: "PAYMENT_TIMEOUT must be at least 1s and shorter than HTTP_WRITE_TIMEOUT (15s), got 500ms",
+		},
+		{
+			name:    "payment timeout not below the write timeout",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "PAYMENT_TIMEOUT": "15s", "PAYMENT_GRACE": "1m"},
+			wantErr: "PAYMENT_TIMEOUT",
+		},
+		{
+			name:    "payment grace not above the payment timeout",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "PAYMENT_TIMEOUT": "10s", "PAYMENT_GRACE": "10s"},
+			wantErr: "PAYMENT_GRACE must be longer than PAYMENT_TIMEOUT (10s) and at most 1h0m0s, got 10s",
+		},
+		{
+			name:    "payment grace above an hour",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "PAYMENT_GRACE": "61m"},
+			wantErr: "PAYMENT_GRACE",
+		},
+		{
+			name:    "malformed local provider switch",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "PAYMENT_LOCAL_ENABLED": "sure"},
+			wantErr: "PAYMENT_LOCAL_ENABLED",
+		},
+		{
+			name:    "sub-second reconciler interval",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "RECONCILER_INTERVAL": "100ms"},
+			wantErr: "RECONCILER_INTERVAL must be between 1s and 10m0s, got 100ms",
+		},
+		{
+			name:    "reconciler interval above ten minutes",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "RECONCILER_INTERVAL": "11m"},
+			wantErr: "RECONCILER_INTERVAL",
 		},
 		{
 			name:    "unknown log level",

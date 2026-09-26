@@ -17,20 +17,58 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/onetodone/cinema-api/internal/domain"
+	"github.com/onetodone/cinema-api/internal/payment"
+	"github.com/onetodone/cinema-api/internal/payment/local"
 	"github.com/onetodone/cinema-api/internal/repository/postgres"
 	"github.com/onetodone/cinema-api/internal/service/booking"
 )
 
 const testHoldTTL = 15 * time.Minute
 
+// Payment settings of the tests. The local provider's tok_slow takes testSlowDelay, and a charge without an
+// answer is given up after testPaymentTimeout.
+const (
+	testPaymentTimeout = time.Second
+	testPaymentGrace   = time.Minute
+	testSlowDelay      = 300 * time.Millisecond
+)
+
+// testProviders returns the payment providers of the tests: the local provider and a scripted one, both
+// enabled, and another scripted one, "retired", that takes no new payments.
+func testProviders(t *testing.T) (*payment.Registry, *scriptedProvider) {
+	t.Helper()
+	scripted := newScriptedProvider("scripted")
+	providers := payment.NewRegistry()
+	for _, err := range []error{
+		providers.Register(local.New(local.Config{SlowDelay: testSlowDelay}), true),
+		providers.Register(scripted, true),
+		providers.Register(newScriptedProvider("retired"), false),
+	} {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	return providers, scripted
+}
+
+// newBookingService builds the booking service on pool the way internal/app does, with the test settings.
+func newBookingService(pool *pgxpool.Pool, lockTimeout time.Duration, providers *payment.Registry, logger *slog.Logger) *booking.Service {
+	return booking.New(postgres.NewUnitOfWork(pool, lockTimeout, logger), postgres.NewBookings(pool), providers,
+		booking.Config{
+			Location: time.UTC, Currency: "USD", HoldTTL: testHoldTTL, MaxSeats: 10,
+			PaymentTimeout: testPaymentTimeout, PaymentGrace: testPaymentGrace,
+		}, logger)
+}
+
 // bookingEnv is the fixture catalog with the booking service on top of the real repositories.
 type bookingEnv struct {
 	*fixture
-	svc   *booking.Service
-	uow   *postgres.UnitOfWork
-	logs  *logRecorder
-	st    domain.Showtime  // Dune in Hall 1 at base
-	seats map[string]int64 // seat ids of Hall 1 by label, such as "A1" and "AA1"
+	svc      *booking.Service
+	uow      *postgres.UnitOfWork
+	logs     *logRecorder
+	scripted *scriptedProvider // the "scripted" payment provider
+	st       domain.Showtime   // Dune in Hall 1 at base
+	seats    map[string]int64  // seat ids of Hall 1 by label, such as "A1" and "AA1"
 }
 
 func newBookingEnv(t *testing.T, lockTimeout time.Duration) *bookingEnv {
@@ -43,17 +81,16 @@ func newBookingEnv(t *testing.T, lockTimeout time.Duration) *bookingEnv {
 func newBookingEnvOn(t *testing.T, f *fixture, pool *pgxpool.Pool, lockTimeout time.Duration) *bookingEnv {
 	t.Helper()
 	logs := &logRecorder{}
-	uow := postgres.NewUnitOfWork(pool, lockTimeout, slog.New(logs))
-	env := &bookingEnv{
-		fixture: f,
-		uow:     uow,
-		logs:    logs,
-		svc: booking.New(uow, postgres.NewBookings(pool), time.UTC,
-			booking.Config{HoldTTL: testHoldTTL, MaxSeats: 10}),
-		st:    f.showtime(t, f.dune, f.hall, base),
-		seats: seatIDsByLabel(t, f.pool, f.hall.ID),
+	providers, scripted := testProviders(t)
+	return &bookingEnv{
+		fixture:  f,
+		uow:      postgres.NewUnitOfWork(pool, lockTimeout, slog.New(logs)),
+		logs:     logs,
+		svc:      newBookingService(pool, lockTimeout, providers, slog.New(logs)),
+		scripted: scripted,
+		st:       f.showtime(t, f.dune, f.hall, base),
+		seats:    seatIDsByLabel(t, f.pool, f.hall.ID),
 	}
-	return env
 }
 
 // seatIDsByLabel maps "A1", "B2", ... to the seat ids of a hall.
@@ -268,7 +305,7 @@ func TestBookingLifecycle(t *testing.T) {
 		t.Errorf("bob's list = %+v", page.Bookings)
 	}
 
-	// A paid booking cannot be canceled. (Payments arrive in a later sprint; the state is set directly.)
+	// A paid booking cannot be canceled.
 	exec(t, env.pool, `UPDATE bookings SET status = 'paid', paid_at = now() WHERE id = $1`, again.ID)
 	exec(t, env.pool, `UPDATE showtime_seats SET status = 'sold' WHERE booking_id = $1`, again.ID)
 	if err := env.svc.Cancel(ctx, ann, again.ID); domainCode(err) != domain.CodeBookingNotCancelable {

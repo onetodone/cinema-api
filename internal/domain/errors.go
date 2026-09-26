@@ -17,6 +17,13 @@ var (
 	// ErrBusy means another operation holds a lock on the same data. The request itself is fine and is likely
 	// to succeed when retried shortly.
 	ErrBusy = errors.New("busy")
+	// ErrGone means the target can never be acted on again, such as a booking whose hold has run out.
+	ErrGone = errors.New("gone")
+	// ErrPaymentRequired means a payment provider refused the charge. Another payment source may succeed.
+	ErrPaymentRequired = errors.New("payment required")
+	// ErrUnavailable means a service the request depends on cannot take it right now. Nothing was changed, and
+	// a later retry may succeed.
+	ErrUnavailable = errors.New("unavailable")
 )
 
 // Stable, machine-readable error codes returned to API clients.
@@ -43,6 +50,15 @@ const (
 	CodeBookingBusy          = "BOOKING_BUSY"
 	CodeActiveBookingExists  = "ACTIVE_BOOKING_EXISTS"
 	CodeBookingNotCancelable = "BOOKING_NOT_CANCELABLE"
+
+	CodePaymentMethodUnavailable   = "PAYMENT_METHOD_UNAVAILABLE"
+	CodePaymentInProgress          = "PAYMENT_IN_PROGRESS"
+	CodePaymentDeclined            = "PAYMENT_DECLINED"
+	CodePaymentProviderUnavailable = "PAYMENT_PROVIDER_UNAVAILABLE"
+	CodePaymentRefunded            = "PAYMENT_REFUNDED"
+	CodeBookingExpired             = "BOOKING_EXPIRED"
+	CodeBookingAlreadyPaid         = "BOOKING_ALREADY_PAID"
+	CodeBookingCanceled            = "BOOKING_CANCELED"
 )
 
 // Error is a business error. Its message is safe to show to API clients; Code is stable across releases.
@@ -85,6 +101,16 @@ func Forbidden(code, format string, args ...any) error {
 // Busy builds an ErrBusy error: the data is locked by a concurrent operation, and a retry will likely succeed.
 func Busy(code, format string, args ...any) error {
 	return &Error{Kind: ErrBusy, Code: code, Message: fmt.Sprintf(format, args...)}
+}
+
+// Gone builds an ErrGone error: the target can never be acted on again.
+func Gone(code, format string, args ...any) error {
+	return &Error{Kind: ErrGone, Code: code, Message: fmt.Sprintf(format, args...)}
+}
+
+// Unavailable builds an ErrUnavailable error: a service the request depends on cannot take it right now.
+func Unavailable(code, format string, args ...any) error {
+	return &Error{Kind: ErrUnavailable, Code: code, Message: fmt.Sprintf(format, args...)}
 }
 
 // FieldError explains why one input field is invalid. Field is the API's name for it, such as "email".
