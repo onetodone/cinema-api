@@ -1,0 +1,18 @@
+# Only the Go sources are needed to build the image.
+.git
+.gitignore
+.dockerignore
+.vscode
+.idea
+.claude
+.agents
+bin
+coverage.out
+*.test
+.env
+.env.*
+*.md
+Dockerfile
+Makefile
+.golangci.yml
+skills-lock.json

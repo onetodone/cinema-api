@@ -1,0 +1,21 @@
+# AI Helpers
+/.agents/
+/.claude/
+/AGENTS.md
+/CLAUDE.md
+/PLAN.md
+/SPEC.md
+/PROGRESS.md
+/skills-lock.json
+
+# IDE
+/.idea/
+/.vscode/
+
+# Build and test output
+/bin/
+/coverage.out
+*.test
+
+# Local environment
+/.env
