@@ -14,10 +14,20 @@ import (
 
 // Config is the complete runtime configuration shared by all binaries.
 type Config struct {
-	HTTP  HTTPConfig
-	DB    DBConfig
-	Redis RedisConfig
-	Log   LogConfig
+	HTTP   HTTPConfig
+	DB     DBConfig
+	Redis  RedisConfig
+	Log    LogConfig
+	Cinema CinemaConfig
+}
+
+// CinemaConfig describes the cinema itself.
+type CinemaConfig struct {
+	// Location is the cinema's IANA time zone. Schedule days start at local midnight, and times in responses
+	// carry this zone's offset.
+	Location *time.Location `env:"CINEMA_TIMEZONE" envDefault:"UTC"`
+	// Currency is the ISO 4217 code of all prices.
+	Currency string `env:"CINEMA_CURRENCY" envDefault:"USD"`
 }
 
 // HTTPConfig configures the HTTP server.
@@ -161,6 +171,22 @@ func (c Config) Validate() error {
 	if c.Log.Format != "json" && c.Log.Format != "text" {
 		errs = append(errs, fmt.Errorf("LOG_FORMAT must be %q or %q, got %q", "json", "text", c.Log.Format))
 	}
+	if !isCurrencyCode(c.Cinema.Currency) {
+		errs = append(errs, fmt.Errorf("CINEMA_CURRENCY must be a 3-letter uppercase ISO 4217 code, got %q",
+			c.Cinema.Currency))
+	}
 
 	return errors.Join(errs...)
+}
+
+func isCurrencyCode(s string) bool {
+	if len(s) != 3 {
+		return false
+	}
+	for _, c := range s {
+		if c < 'A' || c > 'Z' {
+			return false
+		}
+	}
+	return true
 }

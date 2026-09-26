@@ -1,12 +1,12 @@
 package middleware
 
 import (
-	"context"
 	"log/slog"
 	"net/http"
 	"uuid"
 
 	"github.com/onetodone/cinema-api/internal/platform/logging"
+	"github.com/onetodone/cinema-api/internal/transport/httpapi/requestid"
 )
 
 // RequestIDHeader is the header used to receive and return the request ID.
@@ -14,11 +14,9 @@ const RequestIDHeader = "X-Request-ID"
 
 const maxRequestIDLength = 128
 
-type requestIDKey struct{}
-
 // RequestID assigns every request an ID. A well-formed incoming X-Request-ID is reused so that IDs can be traced
 // across services; otherwise a UUIDv7 is generated. The ID is returned in the response header, stored in the
-// request context, and attached to every log record written with that context.
+// request context (read it with requestid.FromContext), and attached to every log record written with that context.
 func RequestID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id := r.Header.Get(RequestIDHeader)
@@ -27,17 +25,11 @@ func RequestID(next http.Handler) http.Handler {
 		}
 
 		w.Header().Set(RequestIDHeader, id)
-		ctx := context.WithValue(r.Context(), requestIDKey{}, id)
+		ctx := requestid.NewContext(r.Context(), id)
 		ctx = logging.WithAttrs(ctx, slog.String("request_id", id))
 
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
-}
-
-// RequestIDFromContext returns the request ID stored by RequestID, or "" if there is none.
-func RequestIDFromContext(ctx context.Context) string {
-	id, _ := ctx.Value(requestIDKey{}).(string)
-	return id
 }
 
 // validRequestID accepts short IDs made of URL-safe characters only, so a client cannot inject arbitrary

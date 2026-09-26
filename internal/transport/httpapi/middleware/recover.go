@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"runtime/debug"
 
-	"github.com/onetodone/cinema-api/internal/transport/httpapi/render"
+	"github.com/onetodone/cinema-api/internal/transport/httpapi/problem"
 )
 
 // Recover turns a panic in a handler into a 500 response and logs the panic with its stack trace.
@@ -34,5 +34,5 @@ func recoverPanic(logger *slog.Logger, w http.ResponseWriter, r *http.Request) {
 		slog.Any("panic", rec),
 		slog.String("stack", string(debug.Stack())),
 	)
-	render.JSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
+	problem.Write(w, r, problem.Internal())
 }

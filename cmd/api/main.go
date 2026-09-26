@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	_ "time/tzdata" // embed the time zone database, so CINEMA_TIMEZONE works on hosts without tzdata
 
 	"github.com/onetodone/cinema-api/internal/app"
 	"github.com/onetodone/cinema-api/internal/config"

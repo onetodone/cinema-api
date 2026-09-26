@@ -21,5 +21,5 @@ WORKDIR /app
 COPY --from=build /out/ /app/
 USER nonroot:nonroot
 EXPOSE 8080
-# Other binaries (the worker from Sprint 4) run from the same image with a different entrypoint.
+# The same image also ships /app/migrate and /app/seed (and the worker from Sprint 4); select one with --entrypoint.
 ENTRYPOINT ["/app/api"]

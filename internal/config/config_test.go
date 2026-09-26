@@ -46,6 +46,25 @@ func TestLoadAppliesDefaults(t *testing.T) {
 	if cfg.Log.Level != slog.LevelInfo || cfg.Log.Format != "json" {
 		t.Errorf("Log = %v/%q, want INFO/json", cfg.Log.Level, cfg.Log.Format)
 	}
+	if cfg.Cinema.Location.String() != "UTC" || cfg.Cinema.Currency != "USD" {
+		t.Errorf("Cinema = %v/%q, want UTC/USD", cfg.Cinema.Location, cfg.Cinema.Currency)
+	}
+}
+
+func TestLoadReadsCinemaTimeZone(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := loadFrom(t, map[string]string{
+		"DATABASE_URL":    testDSN,
+		"CINEMA_TIMEZONE": "Asia/Dubai",
+		"CINEMA_CURRENCY": "AED",
+	})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Cinema.Location.String() != "Asia/Dubai" || cfg.Cinema.Currency != "AED" {
+		t.Errorf("Cinema = %v/%q, want Asia/Dubai/AED", cfg.Cinema.Location, cfg.Cinema.Currency)
+	}
 }
 
 func TestLoadReadsOverrides(t *testing.T) {
@@ -136,6 +155,16 @@ func TestLoadRejectsInvalidInput(t *testing.T) {
 			name:    "unknown log format",
 			vars:    map[string]string{"DATABASE_URL": testDSN, "LOG_FORMAT": "xml"},
 			wantErr: "LOG_FORMAT",
+		},
+		{
+			name:    "unknown time zone",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "CINEMA_TIMEZONE": "Mars/Olympus_Mons"},
+			wantErr: "CINEMA_TIMEZONE",
+		},
+		{
+			name:    "lowercase currency",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "CINEMA_CURRENCY": "usd"},
+			wantErr: "CINEMA_CURRENCY",
 		},
 		{
 			name:    "unknown log level",

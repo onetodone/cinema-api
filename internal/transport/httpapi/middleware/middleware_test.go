@@ -11,6 +11,7 @@ import (
 	"uuid"
 
 	"github.com/onetodone/cinema-api/internal/platform/logging"
+	"github.com/onetodone/cinema-api/internal/transport/httpapi/requestid"
 )
 
 func newJSONLogger(t *testing.T, buf *bytes.Buffer) *slog.Logger {
@@ -74,7 +75,7 @@ func TestRequestID(t *testing.T) {
 
 			var seen string
 			h := RequestID(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
-				seen = RequestIDFromContext(r.Context())
+				seen = requestid.FromContext(r.Context())
 			}))
 
 			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil)
@@ -101,12 +102,12 @@ func TestRequestID(t *testing.T) {
 	}
 }
 
-func TestRequestIDFromContextWithoutMiddleware(t *testing.T) {
+func TestRequestIDAbsentWithoutMiddleware(t *testing.T) {
 	t.Parallel()
 
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil)
-	if got := RequestIDFromContext(req.Context()); got != "" {
-		t.Errorf("RequestIDFromContext = %q, want empty", got)
+	if got := requestid.FromContext(req.Context()); got != "" {
+		t.Errorf("requestid.FromContext = %q, want empty", got)
 	}
 }
 
@@ -230,6 +231,12 @@ func TestRecoverTurnsPanicInto500(t *testing.T) {
 	}
 	if logged["request_id"] == nil {
 		t.Errorf("log has no request_id: %v", logged)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/problem+json" {
+		t.Errorf("Content-Type = %q, want application/problem+json", got)
+	}
+	if !strings.Contains(rec.Body.String(), `"code":"INTERNAL"`) {
+		t.Errorf("body = %q, want an INTERNAL problem", rec.Body.String())
 	}
 }
 

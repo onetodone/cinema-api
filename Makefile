@@ -27,10 +27,34 @@ build: ## Build every binary in ./cmd into ./bin
 run-api: ## Run the HTTP API with settings from .env
 	go run ./cmd/api
 
+.PHONY: migrate-up
+migrate-up: ## Apply all pending database migrations
+	go run ./cmd/migrate up
+
+.PHONY: migrate-down
+migrate-down: ## Roll back the most recent database migration
+	go run ./cmd/migrate down
+
+.PHONY: migrate-status
+migrate-status: ## Show which migrations are applied
+	go run ./cmd/migrate status
+
+.PHONY: seed
+seed: ## Seed demo movies, halls, and a week of showtimes (only into an empty catalog)
+	go run ./cmd/seed
+
+.PHONY: seed-reset
+seed-reset: ## Delete the catalog, bookings, and payments, then seed again
+	go run ./cmd/seed -reset
+
 .PHONY: test
 test: ## Run unit tests (with -race when gcc is available)
 	@[ -n "$(RACE)" ] || echo "warning: gcc not found, running tests WITHOUT the race detector" >&2
 	CGO_ENABLED=$(if $(RACE),1,0) go test $(RACE) -count=1 -shuffle=on ./...
+
+.PHONY: test-integration
+test-integration: ## Run integration tests against throwaway containers (needs Docker)
+	CGO_ENABLED=$(if $(RACE),1,0) go test $(RACE) -tags=integration -count=1 ./test/integration/...
 
 .PHONY: cover
 cover: ## Run unit tests and print total coverage

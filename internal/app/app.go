@@ -16,6 +16,8 @@ import (
 	"github.com/onetodone/cinema-api/internal/config"
 	"github.com/onetodone/cinema-api/internal/platform/pgpool"
 	"github.com/onetodone/cinema-api/internal/platform/redisclient"
+	"github.com/onetodone/cinema-api/internal/repository/postgres"
+	"github.com/onetodone/cinema-api/internal/service/catalog"
 	"github.com/onetodone/cinema-api/internal/transport/httpapi"
 	"github.com/onetodone/cinema-api/internal/transport/httpapi/handler"
 )
@@ -59,7 +61,13 @@ func NewAPI(ctx context.Context, cfg config.Config, logger *slog.Logger) (*API, 
 		}},
 	)
 
-	router := httpapi.NewRouter(httpapi.RouterDeps{Logger: logger, Health: health})
+	catalogSvc := catalog.New(postgres.NewCatalog(db), cfg.Cinema.Location)
+
+	router := httpapi.NewRouter(httpapi.RouterDeps{
+		Logger:  logger,
+		Health:  health,
+		Catalog: handler.NewCatalog(catalogSvc, cfg.Cinema.Currency, logger),
+	})
 
 	server := &http.Server{
 		Addr:              cfg.HTTP.Addr,
