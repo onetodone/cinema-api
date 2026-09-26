@@ -70,12 +70,20 @@ K6       ?= $(if $(shell command -v k6 2>/dev/null),k6,docker run --rm -i --netw
 load-test: ## Race 500 users for one seat with k6 (the API must run with AUTH_IP_RATE_LIMIT_PER_MIN=0)
 	$(K6) run -e BASE_URL=$(LOAD_BASE_URL) -e VUS=$(or $(VUS),500) - < test/load/booking_race.js
 
-# Redocly CLI lints the API contract; it runs in the Node image unless npx is on PATH.
-REDOCLY ?= $(if $(shell command -v npx 2>/dev/null),npx --yes,docker run --rm -v "$(CURDIR):/src" -w /src node:22 npx --yes) @redocly/cli@2.54.3
+# Redocly CLI lints the API contract and renders its reference; it runs in the Node image unless npx is on PATH.
+# The image runs as the caller, so the files it writes belong to them.
+REDOCLY ?= $(if $(shell command -v npx 2>/dev/null),npx --yes,docker run --rm --user "$$(id -u):$$(id -g)" -e HOME=/tmp \
+	-v "$(CURDIR):/src" -w /src node:22 npx --yes) @redocly/cli@2.54.3
 
 .PHONY: lint-api
 lint-api: ## Lint the OpenAPI contract in api/openapi.yaml
 	$(REDOCLY) lint --config api/redocly.yaml api/openapi.yaml
+
+# The output is byte-for-byte reproducible; the Docs workflow rebuilds and commits it on every contract change on main.
+.PHONY: docs
+docs: ## Render the API reference docs/index.html from api/openapi.yaml
+	@mkdir -p docs
+	$(REDOCLY) build-docs --config api/redocly.yaml -o docs/index.html api/openapi.yaml
 
 .PHONY: cover
 cover: ## Run unit tests and print total coverage

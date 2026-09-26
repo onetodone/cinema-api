@@ -1,0 +1,43 @@
+name: Docs
+
+# Keeps the API reference docs/index.html in step with api/openapi.yaml: on every change to the contract on main,
+# it renders the reference again and commits it when it changed. The commit is pushed with GITHUB_TOKEN, which
+# starts no other workflow run, so it cannot loop.
+on:
+  push:
+    branches: [main]
+    paths:
+      - api/**
+      - Makefile
+      - .github/workflows/docs.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Runs queue instead of canceling each other, and each one renders the branch tip, so the last one wins.
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  docs:
+    name: Render the API reference
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref_name }}
+      - name: Render docs/index.html
+        run: make docs
+      - name: Commit the reference if it changed
+        run: |
+          if [ -z "$(git status --porcelain -- docs)" ]; then
+            echo "docs/index.html is up to date"
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add docs
+          git commit -m 'docs: regenerate the API reference'
+          git push
