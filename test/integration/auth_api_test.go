@@ -10,12 +10,16 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/crypto/bcrypt"
 
+	"github.com/onetodone/cinema-api/internal/platform/metrics"
 	"github.com/onetodone/cinema-api/internal/repository/postgres"
 	"github.com/onetodone/cinema-api/internal/service/admin"
 	"github.com/onetodone/cinema-api/internal/service/auth"
@@ -32,9 +36,10 @@ type apiClient struct {
 }
 
 type apiResponse struct {
-	status int
-	header http.Header
-	body   map[string]any
+	status  int
+	header  http.Header
+	body    map[string]any
+	cookies []*http.Cookie
 }
 
 func (c apiClient) do(method, path, token string, body any) apiResponse {
@@ -72,7 +77,7 @@ func (c apiClient) doWith(method, path, token string, body any, header http.Head
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	out := apiResponse{status: resp.StatusCode, header: resp.Header}
+	out := apiResponse{status: resp.StatusCode, header: resp.Header, cookies: resp.Cookies()}
 	if err := json.NewDecoder(resp.Body).Decode(&out.body); err != nil && err != io.EOF {
 		c.t.Fatalf("%s %s: decode body: %v", method, path, err)
 	}
@@ -84,16 +89,43 @@ func (r apiResponse) code() string {
 	return s
 }
 
+// testJWTSecret signs the access tokens of every test server, so that servers over one database act as replicas.
+var testJWTSecret = strings.Repeat("k", auth.MinSecretBytes)
+
+// testSessionConfig holds the session rules of the test servers: the defaults of the configuration.
+var testSessionConfig = auth.SessionConfig{
+	IdleTTL:    7 * 24 * time.Hour,
+	MaxAge:     30 * 24 * time.Hour,
+	Grace:      30 * time.Second,
+	MaxPerUser: 20,
+}
+
+// testCookie is the refresh token cookie of the test servers: the defaults of the configuration.
+var testCookie = handler.RefreshCookie{Path: "/v1/auth", Secure: true}
+
+func newTestTokens(t *testing.T) *auth.Tokens {
+	t.Helper()
+	return must(auth.NewTokens(testJWTSecret, time.Hour))(t)
+}
+
+// newAuthHandler returns the account and session handlers over pool, wired as internal/app wires them.
+func newAuthHandler(t *testing.T, pool *pgxpool.Pool, tokens *auth.Tokens, cfg auth.SessionConfig,
+	cookie handler.RefreshCookie, trusted []netip.Prefix, m *metrics.Metrics,
+) *handler.Auth {
+	t.Helper()
+	logger := slog.New(slog.DiscardHandler)
+	accounts := must(auth.New(postgres.NewUsers(pool), bcrypt.MinCost))(t)
+	sessions := must(auth.NewSessions(accounts, postgres.NewSessions(pool), tokens, cfg, logger))(t)
+	return handler.NewAuth(accounts, sessions, handler.AuthConfig{Cookie: cookie, TrustedProxies: trusted}, m, logger)
+}
+
 // TestAuthAPI drives registration, login, and role checks through the real router, services, and database.
 func TestAuthAPI(t *testing.T) {
 	t.Parallel()
 	pool := newDB(t)
 	logger := slog.New(slog.DiscardHandler)
 
-	tokens, err := auth.NewTokens(strings.Repeat("k", auth.MinSecretBytes), time.Hour)
-	if err != nil {
-		t.Fatal(err)
-	}
+	tokens := newTestTokens(t)
 	authSvc, err := auth.New(postgres.NewUsers(pool), bcrypt.MinCost)
 	if err != nil {
 		t.Fatal(err)
@@ -104,7 +136,7 @@ func TestAuthAPI(t *testing.T) {
 		Tokens:  tokens,
 		Health:  handler.NewHealth(logger, time.Second),
 		Catalog: handler.NewCatalog(catalog.New(catalogRepo, time.UTC), "USD", logger),
-		Auth:    handler.NewAuth(authSvc, tokens, logger),
+		Auth:    newAuthHandler(t, pool, tokens, testSessionConfig, testCookie, nil, metrics.New(prometheus.NewRegistry())),
 		Admin:   handler.NewAdmin(admin.New(catalogRepo, time.UTC), "USD", logger),
 	})
 	srv := httptest.NewServer(router)
@@ -137,6 +169,9 @@ func TestAuthAPI(t *testing.T) {
 	token, _ := login.body["access_token"].(string)
 	if login.status != http.StatusOK || token == "" || login.body["expires_in"] != 3600.0 {
 		t.Fatalf("login = %d %v", login.status, login.body)
+	}
+	if user, _ := login.body["user"].(map[string]any); user["id"] != reg.body["id"] || user["email"] != "Ann@Example.com" {
+		t.Errorf("login user = %v, want the account", login.body["user"])
 	}
 	if login.header.Get("Cache-Control") != "no-store" {
 		t.Error("the token response may be cached")

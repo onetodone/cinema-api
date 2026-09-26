@@ -228,3 +228,32 @@ func TestByUser(t *testing.T) {
 		t.Errorf("ByUser = %q, %t; want %s", k, ok, id)
 	}
 }
+
+func TestByRefreshSession(t *testing.T) {
+	t.Parallel()
+
+	key := ByRefreshSession("cinema_refresh", nil)
+	keyOf := func(cookie string) string {
+		r := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/auth/refresh", nil)
+		r.RemoteAddr = "198.51.100.7:1"
+		if cookie != "" {
+			r.AddCookie(&http.Cookie{Name: "cinema_refresh", Value: cookie})
+		}
+		k, ok := key(r)
+		if !ok {
+			t.Fatalf("no key for cookie %q", cookie)
+		}
+		return k
+	}
+
+	sessionID := uuid.NewV7()
+	a, b := domain.NewRefreshToken(sessionID), domain.NewRefreshToken(sessionID)
+	if ka, kb := keyOf(a.String()), keyOf(b.String()); ka != sessionID.String() || kb != ka {
+		t.Errorf("keys of two tokens of one session = %q and %q, want both the session id %s", ka, kb, sessionID)
+	}
+	for _, cookie := range []string{"", "garbage", sessionID.String() + ".short"} {
+		if k := keyOf(cookie); k != "ip:198.51.100.7" {
+			t.Errorf("cookie %q: key %q, want the client address", cookie, k)
+		}
+	}
+}

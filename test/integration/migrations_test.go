@@ -35,7 +35,7 @@ WHERE table_schema = 'public' AND table_name <> 'goose_db_version'`).Scan(&n)
 	if _, err := m.Up(ctx); err != nil {
 		t.Fatalf("up: %v", err)
 	}
-	const wantTables = 9
+	const wantTables = 10
 	if got := tables(); got != wantTables {
 		t.Fatalf("after up: %d tables, want %d", got, wantTables)
 	}

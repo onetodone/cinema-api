@@ -27,6 +27,7 @@ type Config struct {
 	Expirer    ExpirerConfig
 	Payment    PaymentConfig
 	Reconciler ReconcilerConfig
+	Sweeper    SweeperConfig
 	Cache      CacheConfig
 	RateLimit  RateLimitConfig
 }
@@ -38,6 +39,17 @@ const (
 	maxJWTTTL         = 24 * time.Hour
 	minBcryptCost     = 10 // OWASP minimum
 	maxBcryptCost     = 14 // about 0.7 s per hash on the development machine; more would make logins a DoS vector
+)
+
+// Limits for sessions.
+const (
+	maxSessionMaxAge    = 365 * 24 * time.Hour
+	minRefreshGrace     = time.Second
+	maxRefreshGrace     = 2 * time.Minute
+	maxSessionsPerUser  = 1000
+	minSweepInterval    = time.Minute
+	maxSweepInterval    = 24 * time.Hour
+	maxCookiePathLength = 256
 )
 
 // Limits for booking settings.
@@ -96,6 +108,9 @@ type RateLimitConfig struct {
 	AuthIPPerMin int `env:"AUTH_IP_RATE_LIMIT_PER_MIN" envDefault:"30"`
 	// LoginEmailPerMin caps login attempts per account email, whichever address they come from.
 	LoginEmailPerMin int `env:"LOGIN_EMAIL_RATE_LIMIT_PER_MIN" envDefault:"10"`
+	// RefreshPerMin caps refreshes per session (per client address for a malformed refresh token). A limit per
+	// address would make everybody behind one NAT share it.
+	RefreshPerMin int `env:"AUTH_REFRESH_RATE_LIMIT_PER_MIN" envDefault:"60"`
 }
 
 // PaymentConfig configures payments and the payment providers. Each provider has its own block of settings; a
@@ -124,6 +139,13 @@ type ReconcilerConfig struct {
 	Interval time.Duration `env:"RECONCILER_INTERVAL" envDefault:"30s"`
 }
 
+// SweeperConfig configures the worker job that deletes expired sessions.
+type SweeperConfig struct {
+	// Interval is the average pause between two sweeps, varied by up to 20% like the expirer's. Expired sessions
+	// cannot refresh whether or not they have been swept, so this only bounds how long they take up space.
+	Interval time.Duration `env:"SESSION_SWEEP_INTERVAL" envDefault:"1h"`
+}
+
 // ExpirerConfig configures the worker that expires unpaid bookings.
 type ExpirerConfig struct {
 	// Interval is the average pause between two sweeps. Each pause varies at random by up to 20%, so worker
@@ -145,12 +167,30 @@ type BookingConfig struct {
 	HoldClaimTTL time.Duration `env:"HOLD_CLAIM_TTL" envDefault:"15s"`
 }
 
-// AuthConfig configures accounts and access tokens.
+// AuthConfig configures accounts, sessions, and access tokens.
 type AuthConfig struct {
-	// JWTSecret signs access tokens (HS256). Only the API needs it, so it is checked where tokens are built;
-	// here it is only rejected when it is set but too short.
-	JWTSecret string        `env:"JWT_SECRET"`
-	JWTTTL    time.Duration `env:"JWT_TTL"     envDefault:"1h"`
+	// JWTSecret signs access tokens (HS256), and the keys that seal refresh secrets for the grace window are
+	// derived from it. Only the API needs it, so it is checked where tokens are built; here it is only rejected
+	// when it is set but too short.
+	JWTSecret string `env:"JWT_SECRET"`
+	// JWTTTL is the lifetime of an access token. Clients refresh before it ends; a token of a session that was
+	// ended stays valid until then.
+	JWTTTL time.Duration `env:"JWT_TTL" envDefault:"15m"`
+	// RefreshTTL is how long a session lasts after its last rotation: it ends when its client stays away longer.
+	RefreshTTL time.Duration `env:"REFRESH_TOKEN_TTL" envDefault:"168h"`
+	// SessionMaxAge is how long a session lasts after its login at most, however often it is refreshed.
+	SessionMaxAge time.Duration `env:"SESSION_MAX_AGE" envDefault:"720h"`
+	// RefreshGrace is how long after a rotation the previous refresh token still gets the current one, for
+	// concurrent refreshes from several tabs and for answers lost on the way. After it, the previous token
+	// revokes the session.
+	RefreshGrace time.Duration `env:"REFRESH_GRACE" envDefault:"30s"`
+	// MaxSessionsPerUser is how many sessions a user may have; a login beyond it ends the least recently used.
+	MaxSessionsPerUser int `env:"AUTH_MAX_SESSIONS_PER_USER" envDefault:"20"`
+	// CookiePath is the Path of the refresh token cookie. The browser sends the cookie only to the auth routes.
+	CookiePath string `env:"AUTH_COOKIE_PATH" envDefault:"/v1/auth"`
+	// CookieSecure marks the refresh token cookie Secure, so browsers send it over HTTPS only. Turn it off only
+	// for development over plain HTTP.
+	CookieSecure bool `env:"AUTH_COOKIE_SECURE" envDefault:"true"`
 	// BcryptCost is the work factor of password hashes. Each step doubles the time of a login.
 	BcryptCost int `env:"BCRYPT_COST" envDefault:"12"`
 	// AdminEmail and AdminPassword describe the admin account that cmd/seed creates or updates.
@@ -339,6 +379,11 @@ func (c Config) Validate() error {
 		errs = append(errs, fmt.Errorf("BCRYPT_COST must be between %d and %d, got %d",
 			minBcryptCost, maxBcryptCost, c.Auth.BcryptCost))
 	}
+	errs = append(errs, c.Auth.validateSessions()...)
+	if c.Sweeper.Interval < minSweepInterval || c.Sweeper.Interval > maxSweepInterval {
+		errs = append(errs, fmt.Errorf("SESSION_SWEEP_INTERVAL must be between %s and %s, got %s",
+			minSweepInterval, maxSweepInterval, c.Sweeper.Interval))
+	}
 	if c.DB.LockTimeout < time.Millisecond || c.DB.LockTimeout >= c.HTTP.WriteTimeout {
 		errs = append(errs, fmt.Errorf("DB_LOCK_TIMEOUT must be at least 1ms and shorter than HTTP_WRITE_TIMEOUT (%s), got %s",
 			c.HTTP.WriteTimeout, c.DB.LockTimeout))
@@ -390,9 +435,10 @@ func (c Config) Validate() error {
 		}
 	}
 	rateLimits := map[string]int{
-		"BOOKING_RATE_LIMIT_PER_MIN":     c.RateLimit.BookingPerMin,
-		"AUTH_IP_RATE_LIMIT_PER_MIN":     c.RateLimit.AuthIPPerMin,
-		"LOGIN_EMAIL_RATE_LIMIT_PER_MIN": c.RateLimit.LoginEmailPerMin,
+		"BOOKING_RATE_LIMIT_PER_MIN":      c.RateLimit.BookingPerMin,
+		"AUTH_IP_RATE_LIMIT_PER_MIN":      c.RateLimit.AuthIPPerMin,
+		"LOGIN_EMAIL_RATE_LIMIT_PER_MIN":  c.RateLimit.LoginEmailPerMin,
+		"AUTH_REFRESH_RATE_LIMIT_PER_MIN": c.RateLimit.RefreshPerMin,
 	}
 	for name, n := range rateLimits {
 		if n < 0 || n > maxRateLimit {
@@ -418,6 +464,45 @@ func (c Config) Validate() error {
 	}
 
 	return errors.Join(errs...)
+}
+
+// validateSessions checks the session settings.
+func (a AuthConfig) validateSessions() []error {
+	var errs []error
+	if a.SessionMaxAge <= 0 || a.SessionMaxAge > maxSessionMaxAge {
+		errs = append(errs, fmt.Errorf("SESSION_MAX_AGE must be positive and at most %s, got %s",
+			maxSessionMaxAge, a.SessionMaxAge))
+	}
+	if a.RefreshTTL <= a.JWTTTL || a.RefreshTTL > a.SessionMaxAge {
+		errs = append(errs, fmt.Errorf("REFRESH_TOKEN_TTL must be longer than JWT_TTL (%s) and at most SESSION_MAX_AGE (%s), got %s",
+			a.JWTTTL, a.SessionMaxAge, a.RefreshTTL))
+	}
+	if a.RefreshGrace < minRefreshGrace || a.RefreshGrace > maxRefreshGrace {
+		errs = append(errs, fmt.Errorf("REFRESH_GRACE must be between %s and %s, got %s",
+			minRefreshGrace, maxRefreshGrace, a.RefreshGrace))
+	}
+	if a.MaxSessionsPerUser < 1 || a.MaxSessionsPerUser > maxSessionsPerUser {
+		errs = append(errs, fmt.Errorf("AUTH_MAX_SESSIONS_PER_USER must be between 1 and %d, got %d",
+			maxSessionsPerUser, a.MaxSessionsPerUser))
+	}
+	if !isCookiePath(a.CookiePath) {
+		errs = append(errs, fmt.Errorf("AUTH_COOKIE_PATH must start with / and have at most %d visible ASCII characters other than ;, got %q",
+			maxCookiePathLength, a.CookiePath))
+	}
+	return errs
+}
+
+// isCookiePath accepts the paths a Set-Cookie header can carry unchanged (RFC 6265 §4.1.1), without spaces.
+func isCookiePath(s string) bool {
+	if !strings.HasPrefix(s, "/") || len(s) > maxCookiePathLength {
+		return false
+	}
+	for i := range len(s) {
+		if s[i] <= ' ' || s[i] >= 0x7f || s[i] == ';' {
+			return false
+		}
+	}
+	return true
 }
 
 // isKeyPrefix accepts Redis key prefixes without braces, which would change the hash slots of keys that rely on

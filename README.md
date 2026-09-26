@@ -16,12 +16,15 @@ The project is small on purpose. It shows how to solve a handful of hard backend
 - **Caching.** Redis as a fail-open accelerator: a hold gate that turns losers away in about 0.1 ms, cached seat
   maps that are cleared on every change, idempotency records, and rate limits. With Redis down, everything
   still works and stays correct, only slower.
-- **Background processing.** A worker expires unpaid bookings and settles stuck payments. Any number of them can
-  run next to each other, thanks to `FOR NO KEY UPDATE SKIP LOCKED`.
+- **Background processing.** A worker expires unpaid bookings, settles stuck payments, and sweeps expired
+  sessions. Any number of them can run next to each other, thanks to `SKIP LOCKED`.
+- **Sessions.** Browser-grade login: a short-lived access token, and a refresh token in an `HttpOnly` cookie that
+  rotates on every use. Twenty tabs refreshing at once through two API replicas all keep their session, and a
+  stolen token that is used after its owner has moved on revokes the session.
 
 Contents: [Quick start](#quick-start) · [How double-selling is prevented](#how-double-selling-is-prevented) ·
 [Flows](#flows) · [Redis](#redis-an-accelerator-never-the-source-of-truth) ·
-[Background worker](#background-worker) · [API](#api) · [Configuration](#configuration) ·
+[Background worker](#background-worker) · [Sessions](#sessions-and-refresh-tokens) · [API](#api) · [Configuration](#configuration) ·
 [Observability](#observability) · [Testing](#testing) · [Project layout](#project-layout) ·
 [Trade-offs](#trade-offs-and-limitations)
 
@@ -35,8 +38,11 @@ Docker image.
 docker run -d --name local-postgres -e POSTGRES_PASSWORD=root -p 5432:5432 postgres:18.4-alpine
 docker run -d --name local-redis -p 6379:6379 redis:8.8-alpine
 
-# 2. Configuration. The Makefile reads .env and exports it to every target.
+# 2. Configuration. The Makefile reads .env and exports it to every target. .env.example holds the production
+#    defaults; the walk-through below also needs the test payment provider and a refresh cookie that plain HTTP
+#    may carry.
 cp .env.example .env            # its JWT_SECRET is a local placeholder; anywhere shared: openssl rand -base64 48
+sed -i 's/^PAYMENT_LOCAL_ENABLED=.*/PAYMENT_LOCAL_ENABLED=true/; s/^AUTH_COOKIE_SECURE=.*/AUTH_COOKIE_SECURE=false/' .env
 
 # 3. Database: create it, apply the migrations, and seed demo data (6 movies, 3 halls, a week of showtimes,
 #    and the admin account from ADMIN_EMAIL / ADMIN_PASSWORD).
@@ -51,14 +57,15 @@ make run-worker
 
 ### Try it
 
-The walk-through uses `jq`. The local test payment provider is on in `.env.example`; its tokens are listed under
-[Payments](#payments).
+The walk-through uses `jq`, and the `.env` of step 2: the local test payment provider is on (its tokens are
+listed under [Payments](#payments)), and the refresh cookie is not `Secure`, so that curl sends it over plain HTTP.
 
 ```sh
 API=localhost:8080
 curl -s -X POST $API/v1/auth/register -H 'Content-Type: application/json' \
   -d '{"email":"ann@example.com","password":"correct horse"}'
-TOKEN=$(curl -s -X POST $API/v1/auth/login -H 'Content-Type: application/json' \
+# Log in: the access token is in the body, the refresh token in the cookie jar
+TOKEN=$(curl -s -c jar -X POST $API/v1/auth/login -H 'Content-Type: application/json' \
   -d '{"email":"ann@example.com","password":"correct horse"}' | jq -r .access_token)
 
 # Tomorrow's schedule, and the seat map of its first showtime
@@ -76,6 +83,22 @@ curl -s -X POST $API/v1/bookings/$BOOKING/payments -H "Authorization: Bearer $TO
 
 Book again without paying: after `BOOKING_HOLD_TTL` (`make run-api BOOKING_HOLD_TTL=30s` for a demo) the worker
 expires the booking, and the seats show `available` again.
+
+The access token lasts 15 minutes. Refresh it with the cookie, which rotates on every refresh, and log out:
+
+```sh
+cp jar jar.old
+TOKEN=$(curl -s -b jar -c jar -X POST $API/v1/auth/refresh -H 'Content-Type: application/json' -d '{}' \
+  | jq -r .access_token)
+# The previous cookie still gets the current token for 30 seconds (tabs that refreshed at once)...
+curl -s -b jar.old -X POST $API/v1/auth/refresh -H 'Content-Type: application/json' -d '{}' | jq .user.email
+# ...after that it revokes the session: 401 REFRESH_INVALID, and the current cookie stops working too
+sleep 31; curl -s -b jar.old -X POST $API/v1/auth/refresh -H 'Content-Type: application/json' -d '{}' | jq .code
+# Log in again, and out: 204, the session is gone and the cookie deleted
+curl -s -c jar -o /dev/null -X POST $API/v1/auth/login -H 'Content-Type: application/json' \
+  -d '{"email":"ann@example.com","password":"correct horse"}'
+curl -s -b jar -c jar -o /dev/null -w '%{http_code}\n' -X POST $API/v1/auth/logout -H 'Content-Type: application/json' -d '{}'
+```
 
 ### Run the Docker image
 
@@ -278,7 +301,7 @@ timeouts), so an outage costs about 20 ms per request, not seconds, and every fa
 
 ## Background worker
 
-`cmd/worker` runs two jobs side by side:
+`cmd/worker` runs three jobs side by side:
 
 - **Expirer.** Every `EXPIRER_INTERVAL` (5 s ± 20%) it expires due bookings in batches of up to 500, one
   transaction per batch, as in the diagram above. `SKIP LOCKED` splits the work between replicas without a
@@ -286,6 +309,9 @@ timeouts), so an outage costs about 20 ms per request, not seconds, and every fa
   that moment is skipped and picked up later.
 - **Reconciler.** Every `RECONCILER_INTERVAL` (30 s) it asks the provider about payments still pending after
   `PAYMENT_GRACE` (2 min), and settles them.
+- **Session sweeper.** Every `SESSION_SWEEP_INTERVAL` (1 h) it deletes expired sessions in batches of 1 000
+  (`FOR UPDATE SKIP LOCKED` again). An expired session cannot refresh whether or not it was swept, so the sweeper
+  only keeps the table small.
 
 Why poll the database instead of in-memory timers or Redis keyspace notifications? Timers die with the process
 and only know their own replica's bookings. Keyspace notifications are at-most-once Pub/Sub: an event sent during
@@ -294,6 +320,47 @@ out with `SKIP LOCKED`, and costs one index range scan every 5 s. Correctness ne
 payment checks the deadline itself, so a late worker only delays when seats return to sale.
 
 On `SIGTERM` the batch in flight finishes and no new one starts.
+
+## Sessions and refresh tokens
+
+A login starts a server-side session, a row in `sessions`. The client gets two tokens:
+
+- an **access token** (JWT, HS256, 15 minutes) for `Authorization: Bearer`. It names its session in a `sid` claim;
+  a token without one is refused. A browser keeps it in memory only.
+- a **refresh token** `<session id>.<secret>` (256 random bits) in the `cinema_refresh` cookie: `HttpOnly` (no
+  script can read it), `SameSite=Strict`, `Path=/v1/auth` (no other request carries it), `Secure` unless
+  `AUTH_COOKIE_SECURE=false`. Only the SHA-256 of the secret is stored.
+
+`POST /v1/auth/refresh` trades the cookie for a new access token and **rotates** the refresh token. What happens
+depends on which token the cookie holds, judged by the database clock:
+
+| The presented token is | Within `REFRESH_GRACE` (30 s) of the last rotation | Later |
+|---|---|---|
+| the current one | the same token again, no second rotation | **rotate**: a new token, by compare-and-set on the old hash |
+| the previous one | **the current token**: a tab that lost the race, or a client whose answer got lost | **reuse detected**: the session is revoked |
+| older, unknown, malformed, or the session has expired | 401 `REFRESH_INVALID`, and the cookie is deleted | same |
+
+Twenty tabs that refresh with one token at once therefore make exactly one rotation, and all of them end up with
+the same current token; the integration test runs them through two API instances. The losers of the race need
+the current token, but it exists only as a hash in the database. Keeping it in process memory would work with one
+replica only, and Redis must never decide correctness. So each rotation also stores the new secret **sealed with
+AES-256-GCM** under a per-session key derived by HKDF from `JWT_SECRET`, and only opens it within the grace window.
+
+The trade: within those 30 seconds, whoever holds the previous token also gets the current one, the price of
+tolerating concurrent tabs and lost answers. After them, presenting a used token can only mean a copy, and ends the
+session for everybody who holds it.
+
+Also:
+
+- `POST /v1/auth/logout` ends the session of the cookie (current or previous token) and deletes the cookie. It
+  needs no access token and always answers 204. `POST /v1/auth/logout-all` (bearer) ends every session of the user.
+- Refresh and logout accept only a JSON body (`{}`), so a cross-site form cannot trigger them; `SameSite=Strict`
+  and the absence of CORS close the rest.
+- A session ends 7 days after its last refresh (`REFRESH_TOKEN_TTL`), and 30 days after its login at the latest
+  (`SESSION_MAX_AGE`). A user has at most 20 sessions (`AUTH_MAX_SESSIONS_PER_USER`): a login locks the user's row
+  and ends the least recently used ones, so even concurrent logins cannot overshoot the cap.
+- Refreshes are limited per session (60 per minute), not per address, so users behind one NAT do not share a budget.
+- `register` starts no session; clients log in after registering.
 
 ## API
 
@@ -305,7 +372,9 @@ to the contract on `main`, so it never has to be updated by hand.
 
 | Route | Access | Purpose |
 |---|---|---|
-| `POST /v1/auth/register`, `POST /v1/auth/login` | public | Account, access token (JWT, 1 h) |
+| `POST /v1/auth/register`, `POST /v1/auth/login` | public | Account; a session: access token (JWT, 15 min) and refresh cookie |
+| `POST /v1/auth/refresh`, `POST /v1/auth/logout` | refresh cookie | New tokens, rotating the refresh token; end the session |
+| `POST /v1/auth/logout-all` | user | End every session of the caller |
 | `GET /v1/me` | user | The caller's account |
 | `GET /v1/movies`, `GET /v1/movies/{movieID}` | public | Movies, a movie with its showtimes of the next 14 days |
 | `GET /v1/showtimes?date=&movie_id=` | public | The schedule of a day in the cinema's time zone |
@@ -336,8 +405,8 @@ and body replays the first answer (`Idempotent-Replayed: true`) for 24 hours; th
 `422 IDEMPOTENCY_KEY_REUSED`; a retry while the first request runs is `409 IDEMPOTENCY_IN_PROGRESS`. Answers that
 invite a retry (5xx, anything with `Retry-After`) are not stored.
 
-**Rate limits.** Per minute: 20 booking attempts per user, 30 logins and registrations per client address, and
-10 logins per account. Behind a proxy, set `HTTP_TRUSTED_PROXIES` so the client address comes from
+**Rate limits.** Per minute: 20 booking attempts per user, 30 logins and registrations per client address,
+10 logins per account, and 60 refreshes per session. Behind a proxy, set `HTTP_TRUSTED_PROXIES` so the client address comes from
 `X-Forwarded-For`.
 
 ### Payments
@@ -365,15 +434,20 @@ All settings are environment variables, validated at startup (every problem is r
 |---|---|---|
 | `DATABASE_URL` | (required) | PostgreSQL 18 |
 | `REDIS_ADDR` | `localhost:6379` | Redis 8; may be down |
-| `JWT_SECRET` | (API only) | HS256 key, at least 32 bytes |
+| `JWT_SECRET` | (API only) | HS256 key, at least 32 bytes; also the root of the keys that seal refresh secrets |
+| `JWT_TTL` | `15m` | Access token lifetime |
+| `REFRESH_TOKEN_TTL` · `SESSION_MAX_AGE` | `168h` · `720h` | A session ends 7 days after its last refresh, 30 days after its login at the latest |
+| `REFRESH_GRACE` | `30s` | How long the previous refresh token still gets the current one |
+| `AUTH_COOKIE_SECURE` · `AUTH_COOKIE_PATH` | `true` · `/v1/auth` | The refresh cookie; `false` only for development over plain HTTP |
+| `AUTH_MAX_SESSIONS_PER_USER` | `20` | A login beyond it ends the least recently used session |
 | `HTTP_ADDR` · `METRICS_ADDR` · `WORKER_METRICS_ADDR` | `:8080` · `:9090` · `:9091` | Public API; internal metrics of the API; worker metrics and probes |
 | `CINEMA_TIMEZONE` · `CINEMA_CURRENCY` | `UTC` · `USD` | Schedule days and response offsets; currency of all prices |
 | `BOOKING_HOLD_TTL` · `BOOKING_MAX_SEATS` | `15m` · `10` | Hold length; seats per booking |
 | `DB_LOCK_TIMEOUT` | `3s` | Longest wait for a row lock before `SEAT_BUSY` |
-| `EXPIRER_INTERVAL` · `RECONCILER_INTERVAL` | `5s` · `30s` | Worker cadence |
+| `EXPIRER_INTERVAL` · `RECONCILER_INTERVAL` · `SESSION_SWEEP_INTERVAL` | `5s` · `30s` · `1h` | Worker cadence |
 | `PAYMENT_TIMEOUT` · `PAYMENT_GRACE` | `10s` · `2m` | Provider call limit; age at which the worker settles a payment |
 | `SEATMAP_CACHE_TTL` · `SCHEDULE_CACHE_TTL` | `5s` · `10s` | Cache lifetimes; `0` turns a cache off |
-| `*_RATE_LIMIT_PER_MIN` | `20` / `30` / `10` | Booking, auth per address, login per account; `0` turns a limit off |
+| `*_RATE_LIMIT_PER_MIN` | `20` / `30` / `10` / `60` | Booking, auth per address, login per account, refresh per session; `0` turns a limit off |
 | `PAYMENT_LOCAL_ENABLED` | `false` | The local test provider |
 | `ADMIN_EMAIL` · `ADMIN_PASSWORD` | `admin@cinema.local` · none | Admin account that `make seed` creates or resets |
 
@@ -393,6 +467,8 @@ All settings are environment variables, validated at startup (every problem is r
 | `cinema_bookings_expired_total` | Holds released by the worker |
 | `cinema_payments_total{provider,result}` | succeeded, declined, provider_unavailable, pending, refunded |
 | `cinema_payments_reconciled_total{result}` | Stuck payments the worker settled as paid or failed, or could not settle |
+| `cinema_auth_refresh_total{result}` | rotated, reissued, grace, reuse_detected, expired, invalid |
+| `cinema_sessions_swept_total` | Expired sessions deleted by the worker |
 | `cinema_cache_requests_total{cache,result}` | Hits, misses, and errors of the seat map and schedule caches |
 | `cinema_redis_fail_open_total{op}` | Redis failures the system carried on without |
 | `cinema_rate_limit_rejections_total{limit}`, `cinema_idempotency_requests_total{result}` | Request guards |
@@ -414,7 +490,8 @@ make load-test          # k6: 500 users race for one seat against a running API
   prefix, so they run in parallel. PostgreSQL runs with `deadlock_timeout=100ms`, so a broken lock order fails
   within seconds.
 - **Mutation checks** were run by hand on the key guards (random lock order, no `SKIP LOCKED`, expiring
-  `processing` bookings, ignoring the payment deadline, no cache invalidation): each made a test fail.
+  `processing` bookings, ignoring the payment deadline, no cache invalidation, a rotation without its
+  compare-and-set, a login without the user lock, no grace window): each made a test fail.
 - **Load test.** Start the API without the per-address auth limit, since setup logs 500 accounts in from one
   address, and with a cheaper password hash:
 
@@ -446,7 +523,7 @@ internal/
   repository/redis/     hold gate, caches, idempotency, rate limits (Lua scripts embedded)
   payment/              provider contract and registry; local/ test provider; paymenttest/ contract tests
   transport/httpapi/    net/http router, middleware, handlers, problem details
-  worker/               expirer and reconciler loops
+  worker/               expirer, reconciler, and session sweeper loops
   platform/             infrastructure helpers: pgx pool, Redis client, logging, metrics, migrations
   config/               environment variables to a validated Config
   app/                  composition root
@@ -469,7 +546,10 @@ the services declare, so services never import pgx, go-redis, or Prometheus, and
   every change. Bookings always check PostgreSQL.
 - **Expiry lags by up to one worker pause** (5 s ± 20%). Payment rejects an expired hold by itself, so the lag
   only delays when seats return to sale.
-- **No refresh tokens or token revocation.** Access tokens are stateless JWTs that live for `JWT_TTL`.
+- **Ending a session does not stop its access tokens at once.** Logout, logout-all, and a detected reuse stop
+  refreshes immediately, but access tokens are stateless JWTs and stay valid until they expire (`JWT_TTL`, 15 min).
+- **The grace window is a window for thieves too.** Within 30 s of a rotation, the previous refresh token gets the
+  current one; only one previous generation is remembered, so an older token is refused but revokes nothing.
 - **Registration reveals whether an address exists** (`409 EMAIL_TAKEN`); the per-address limit slows enumeration.
 - **A failed compensation refund needs manual work.** It is logged at error level with every id; a refund outbox
   would be the production answer.

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/onetodone/cinema-api/internal/domain"
 	"github.com/onetodone/cinema-api/internal/platform/metrics"
 	"github.com/onetodone/cinema-api/internal/transport/httpapi/principal"
 	"github.com/onetodone/cinema-api/internal/transport/httpapi/problem"
@@ -75,6 +76,23 @@ func ByClientIP(trusted []netip.Prefix) RateKey {
 			return netip.PrefixFrom(addr, 64).Masked().String(), true
 		}
 		return addr.String(), true
+	}
+}
+
+// ByRefreshSession counts requests per session, as named by the refresh token in the cookie. A request whose cookie
+// holds no well-formed token counts per client address instead, as ByClientIP does, so that it cannot dodge the
+// limit by sending garbage. Counting well-formed tokens per session keeps the users behind one NAT from sharing a
+// budget; a refresh with a made-up session id costs one lookup by primary key and no password hash.
+func ByRefreshSession(cookie string, trusted []netip.Prefix) RateKey {
+	byIP := ByClientIP(trusted)
+	return func(r *http.Request) (string, bool) {
+		if c, err := r.Cookie(cookie); err == nil {
+			if token, ok := domain.ParseRefreshToken(c.Value); ok {
+				return token.SessionID.String(), true
+			}
+		}
+		key, ok := byIP(r)
+		return "ip:" + key, ok
 	}
 }
 

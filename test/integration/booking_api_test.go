@@ -8,15 +8,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
-	"strings"
 	"testing"
 	"time"
 	"uuid"
 
-	"golang.org/x/crypto/bcrypt"
-
 	"github.com/onetodone/cinema-api/internal/config"
-	"github.com/onetodone/cinema-api/internal/repository/postgres"
 	"github.com/onetodone/cinema-api/internal/service/admin"
 	"github.com/onetodone/cinema-api/internal/service/auth"
 	"github.com/onetodone/cinema-api/internal/service/catalog"
@@ -33,9 +29,11 @@ const (
 
 // apiOptions configure newAPIServerWith.
 type apiOptions struct {
-	redis   *redisEnv              // nil: the test Redis, with a key prefix of its own
-	limits  config.RateLimitConfig // zero: no rate limits
-	trusted []netip.Prefix
+	redis    *redisEnv              // nil: the test Redis, with a key prefix of its own
+	limits   config.RateLimitConfig // zero: no rate limits
+	trusted  []netip.Prefix
+	sessions auth.SessionConfig     // zero: testSessionConfig
+	cookie   *handler.RefreshCookie // nil: testCookie
 }
 
 // newAPIServer serves the complete router over the fixture's database and the test Redis, wired as internal/app
@@ -53,13 +51,13 @@ func newAPIServerWith(t *testing.T, f *fixture, opts apiOptions) apiClient {
 		env = newRedisEnv(t)
 	}
 
-	tokens, err := auth.NewTokens(strings.Repeat("k", auth.MinSecretBytes), time.Hour)
-	if err != nil {
-		t.Fatal(err)
+	tokens := newTestTokens(t)
+	sessions, cookie := opts.sessions, testCookie
+	if sessions == (auth.SessionConfig{}) {
+		sessions = testSessionConfig
 	}
-	authSvc, err := auth.New(postgres.NewUsers(f.pool), bcrypt.MinCost)
-	if err != nil {
-		t.Fatal(err)
+	if opts.cookie != nil {
+		cookie = *opts.cookie
 	}
 	providers, _ := testProviders(t)
 	cache := env.store.CatalogCache(testSeatMapTTL, testScheduleTTL)
@@ -76,7 +74,7 @@ func newAPIServerWith(t *testing.T, f *fixture, opts apiOptions) apiClient {
 		Tokens:   tokens,
 		Health:   handler.NewHealth(logger, time.Second),
 		Catalog:  handler.NewCatalog(catalog.New(f.catalog, time.UTC, catalog.WithCache(cache)), "USD", logger),
-		Auth:     handler.NewAuth(authSvc, tokens, logger),
+		Auth:     newAuthHandler(t, f.pool, tokens, sessions, cookie, opts.trusted, env.metrics),
 		Bookings: handler.NewBookings(bookingSvc, "USD", env.metrics, logger),
 		Payments: handler.NewPayments(bookingSvc, providers, "USD", env.metrics, logger),
 		Admin:    handler.NewAdmin(admin.New(f.catalog, time.UTC, admin.WithScheduleCache(cache)), "USD", logger),
@@ -86,6 +84,7 @@ func newAPIServerWith(t *testing.T, f *fixture, opts apiOptions) apiClient {
 		BookingLimiter:    limiter("book", opts.limits.BookingPerMin),
 		AuthIPLimiter:     limiter("auth-ip", opts.limits.AuthIPPerMin),
 		LoginEmailLimiter: limiter("login-email", opts.limits.LoginEmailPerMin),
+		RefreshLimiter:    limiter("refresh", opts.limits.RefreshPerMin),
 		TrustedProxies:    opts.trusted,
 	})
 	srv := httptest.NewServer(router)

@@ -41,6 +41,10 @@ const (
 	CodeInvalidToken       = "INVALID_TOKEN"
 	CodeTokenExpired       = "TOKEN_EXPIRED"
 	CodeForbidden          = "FORBIDDEN"
+	// CodeRefreshInvalid answers every refresh that fails, without saying why: an unknown, expired, revoked, or
+	// reused refresh token all look the same to the client.
+	CodeRefreshInvalid  = "REFRESH_INVALID"
+	CodeSessionNotFound = "SESSION_NOT_FOUND"
 
 	CodeBookingNotFound      = "BOOKING_NOT_FOUND"
 	CodeShowtimeNotBookable  = "SHOWTIME_NOT_BOOKABLE"

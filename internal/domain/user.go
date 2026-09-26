@@ -51,6 +51,8 @@ type User struct {
 type Principal struct {
 	UserID uuid.UUID
 	Role   Role
+	// SessionID is the session that issued the access token.
+	SessionID uuid.UUID
 }
 
 // CheckEmail reports why email is not an acceptable account address, or nil if it is. It accepts a bare

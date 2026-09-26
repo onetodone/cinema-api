@@ -11,6 +11,7 @@ import (
 
 	"github.com/onetodone/cinema-api/internal/config"
 	"github.com/onetodone/cinema-api/internal/platform/pgpool"
+	"github.com/onetodone/cinema-api/internal/repository/postgres"
 	redisrepo "github.com/onetodone/cinema-api/internal/repository/redis"
 	"github.com/onetodone/cinema-api/internal/service/booking"
 	"github.com/onetodone/cinema-api/internal/transport/httpapi/handler"
@@ -19,8 +20,9 @@ import (
 
 const workerName = "cinema-worker"
 
-// Worker is the background process: it expires unpaid bookings whose hold has run out, and settles payments
-// that the API left in flight. Any number of replicas may run next to each other and next to the API.
+// Worker is the background process: it expires unpaid bookings whose hold has run out, settles payments that the
+// API left in flight, and deletes expired sessions. Any number of replicas may run next to each other and next to
+// the API.
 type Worker struct {
 	cfg        config.Config
 	logger     *slog.Logger
@@ -28,6 +30,7 @@ type Worker struct {
 	redis      *redis.Client
 	expirer    *worker.Expirer
 	reconciler *worker.Reconciler
+	sweeper    *worker.SessionSweeper
 	server     *server // GET /metrics, /healthz, and /readyz
 }
 
@@ -55,6 +58,8 @@ func NewWorker(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Wo
 		worker.ExpirerConfig{Interval: cfg.Expirer.Interval, BatchSize: cfg.Expirer.BatchSize}, m, logger)
 	reconciler := worker.NewReconciler(bookingSvc,
 		worker.ReconcilerConfig{Interval: cfg.Reconciler.Interval, BatchSize: worker.DefaultReconcileBatchSize}, m, logger)
+	sweeper := worker.NewSessionSweeper(postgres.NewSessions(db),
+		worker.SweeperConfig{Interval: cfg.Sweeper.Interval, BatchSize: worker.DefaultSweepBatchSize}, m, logger)
 
 	health := handler.NewHealth(logger, readinessTimeout, healthChecks(db, rdb)...)
 	mux := metricsMux(metricsHandler, map[string]http.HandlerFunc{
@@ -69,6 +74,7 @@ func NewWorker(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Wo
 		redis:      rdb,
 		expirer:    expirer,
 		reconciler: reconciler,
+		sweeper:    sweeper,
 		server:     newServer("metrics server", cfg.Metrics.WorkerAddr, mux, cfg.HTTP, logger),
 	}, nil
 }
@@ -84,11 +90,13 @@ func (w *Worker) Run(ctx context.Context) error {
 		slog.String("expirer_interval", w.cfg.Expirer.Interval.String()),
 		slog.Int("expirer_batch_size", w.cfg.Expirer.BatchSize),
 		slog.String("reconciler_interval", w.cfg.Reconciler.Interval.String()),
-		slog.String("payment_grace", w.cfg.Payment.Grace.String()))
+		slog.String("payment_grace", w.cfg.Payment.Grace.String()),
+		slog.String("session_sweep_interval", w.cfg.Sweeper.Interval.String()))
 
 	g, ctx := errgroup.WithContext(ctx)
 	g.Go(func() error { w.expirer.Run(ctx); return nil })
 	g.Go(func() error { w.reconciler.Run(ctx); return nil })
+	g.Go(func() error { w.sweeper.Run(ctx); return nil })
 	g.Go(func() error { return w.server.serve(ctx, w.logger, w.cfg.HTTP.ShutdownTimeout) })
 	err := g.Wait()
 

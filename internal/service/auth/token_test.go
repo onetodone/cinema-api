@@ -18,6 +18,9 @@ const testSecret = "0123456789abcdef0123456789abcdef" // 32 bytes
 
 var t0 = time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
 
+// testSessionID is the session of the tokens the tests sign by hand.
+var testSessionID = uuid.MustParse("0199a1f0-7c1e-7d2a-9b3e-5f0c2d1e4a77")
+
 // clock is a settable time source.
 type clock struct{ now time.Time }
 
@@ -35,7 +38,8 @@ func newTokens(t *testing.T, c *clock) *Tokens {
 // validClaims are the claims Issue would produce at t0 for a customer.
 func validClaims(userID uuid.UUID) claims {
 	return claims{
-		Role: domain.RoleCustomer,
+		Role:      domain.RoleCustomer,
+		SessionID: testSessionID.String(),
 		RegisteredClaims: jwt.RegisteredClaims{
 			Issuer:    tokenIssuer,
 			Subject:   userID.String(),
@@ -77,7 +81,7 @@ func TestIssueAndVerifyRoundTrip(t *testing.T) {
 	t.Parallel()
 
 	tokens := newTokens(t, &clock{now: t0})
-	want := domain.Principal{UserID: uuid.NewV7(), Role: domain.RoleAdmin}
+	want := domain.Principal{UserID: uuid.NewV7(), Role: domain.RoleAdmin, SessionID: uuid.NewV7()}
 
 	tok, err := tokens.Issue(want)
 	if err != nil {
@@ -101,7 +105,7 @@ func TestIssuedTokenContents(t *testing.T) {
 
 	tokens := newTokens(t, &clock{now: t0})
 	userID := uuid.NewV7()
-	tok, err := tokens.Issue(domain.Principal{UserID: userID, Role: domain.RoleCustomer})
+	tok, err := tokens.Issue(domain.Principal{UserID: userID, Role: domain.RoleCustomer, SessionID: testSessionID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,6 +134,7 @@ func TestIssuedTokenContents(t *testing.T) {
 		"iss":  "cinema-api",
 		"sub":  userID.String(),
 		"role": "customer",
+		"sid":  testSessionID.String(),
 		"iat":  float64(t0.Unix()),
 		"exp":  float64(t0.Add(time.Hour).Unix()),
 	}
@@ -153,7 +158,7 @@ func TestEveryTokenIsUnique(t *testing.T) {
 	t.Parallel()
 
 	tokens := newTokens(t, &clock{now: t0})
-	p := domain.Principal{UserID: uuid.NewV7(), Role: domain.RoleCustomer}
+	p := domain.Principal{UserID: uuid.NewV7(), Role: domain.RoleCustomer, SessionID: uuid.NewV7()}
 	a, _ := tokens.Issue(p)
 	b, _ := tokens.Issue(p)
 	if a.Token == b.Token {
@@ -166,7 +171,7 @@ func TestVerifyExpiry(t *testing.T) {
 
 	c := &clock{now: t0}
 	tokens := newTokens(t, c)
-	tok, err := tokens.Issue(domain.Principal{UserID: uuid.NewV7(), Role: domain.RoleCustomer})
+	tok, err := tokens.Issue(domain.Principal{UserID: uuid.NewV7(), Role: domain.RoleCustomer, SessionID: uuid.NewV7()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,6 +231,9 @@ func TestVerifyRejectsForgedAndMalformedTokens(t *testing.T) {
 		"issued in the future":    withClaims(func(c *claims) { c.IssuedAt = jwt.NewNumericDate(t0.Add(time.Hour)) }),
 		"subject is not a uuid":   withClaims(func(c *claims) { c.Subject = "42" }),
 		"unknown role":            withClaims(func(c *claims) { c.Role = "root" }),
+		"no session":              withClaims(func(c *claims) { c.SessionID = "" }),
+		"session is not a uuid":   withClaims(func(c *claims) { c.SessionID = "session-1" }),
+		"nil session":             withClaims(func(c *claims) { c.SessionID = uuid.Nil().String() }),
 		"signature padded base64": valid + "=",
 	}
 	for name, raw := range tests {
@@ -237,5 +245,25 @@ func TestVerifyRejectsForgedAndMalformedTokens(t *testing.T) {
 				t.Errorf("Verify = %+v, %v; want INVALID_TOKEN", p, err)
 			}
 		})
+	}
+}
+
+func TestTokensBelongToASession(t *testing.T) {
+	t.Parallel()
+
+	tokens := newTokens(t, &clock{now: t0})
+	if _, err := tokens.Issue(domain.Principal{UserID: uuid.NewV7(), Role: domain.RoleCustomer}); err == nil {
+		t.Error("Issue signed a token without a session")
+	}
+
+	// A token as the API issued it before sessions existed: every claim but sid.
+	userID := uuid.NewV7()
+	legacy := struct {
+		Role domain.Role `json:"role"`
+		jwt.RegisteredClaims
+	}{Role: domain.RoleCustomer, RegisteredClaims: validClaims(userID).RegisteredClaims}
+	_, err := tokens.Verify(sign(t, jwt.SigningMethodHS256, []byte(testSecret), legacy))
+	if code(err) != domain.CodeInvalidToken {
+		t.Errorf("Verify of a token without sid = %v, want INVALID_TOKEN", err)
 	}
 }

@@ -63,6 +63,20 @@ func NewAPI(ctx context.Context, cfg config.Config, logger *slog.Logger) (*API, 
 		db.Close()
 		return nil, fmt.Errorf("BCRYPT_COST: %w", err)
 	}
+	sessions, err := auth.NewSessions(authSvc, postgres.NewSessions(db), tokens, auth.SessionConfig{
+		IdleTTL:    cfg.Auth.RefreshTTL,
+		MaxAge:     cfg.Auth.SessionMaxAge,
+		Grace:      cfg.Auth.RefreshGrace,
+		MaxPerUser: cfg.Auth.MaxSessionsPerUser,
+	}, logger)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("session settings: %w", err)
+	}
+	if !cfg.Auth.CookieSecure {
+		logger.WarnContext(ctx, "the refresh token cookie is not Secure (AUTH_COOKIE_SECURE=false); "+
+			"browsers send it over plain HTTP, which is only acceptable in development")
+	}
 
 	rdb := newRedis(ctx, cfg.Redis, appName, logger)
 
@@ -89,11 +103,14 @@ func NewAPI(ctx context.Context, cfg config.Config, logger *slog.Logger) (*API, 
 		booking.WithHoldGate(store.HoldGate()), booking.WithSeatMapCache(catalogCache))
 
 	router := httpapi.NewRouter(httpapi.RouterDeps{
-		Logger:   logger,
-		Tokens:   tokens,
-		Health:   health,
-		Catalog:  handler.NewCatalog(catalogSvc, cfg.Cinema.Currency, logger),
-		Auth:     handler.NewAuth(authSvc, tokens, logger),
+		Logger:  logger,
+		Tokens:  tokens,
+		Health:  health,
+		Catalog: handler.NewCatalog(catalogSvc, cfg.Cinema.Currency, logger),
+		Auth: handler.NewAuth(authSvc, sessions, handler.AuthConfig{
+			Cookie:         handler.RefreshCookie{Path: cfg.Auth.CookiePath, Secure: cfg.Auth.CookieSecure},
+			TrustedProxies: cfg.HTTP.TrustedProxies,
+		}, m, logger),
 		Bookings: handler.NewBookings(bookingSvc, cfg.Cinema.Currency, m, logger),
 		Payments: handler.NewPayments(bookingSvc, providers, cfg.Cinema.Currency, m, logger),
 		Admin:    handler.NewAdmin(adminSvc, cfg.Cinema.Currency, logger),
@@ -103,6 +120,7 @@ func NewAPI(ctx context.Context, cfg config.Config, logger *slog.Logger) (*API, 
 		BookingLimiter:    rateLimiter(store, "book", cfg.RateLimit.BookingPerMin),
 		AuthIPLimiter:     rateLimiter(store, "auth-ip", cfg.RateLimit.AuthIPPerMin),
 		LoginEmailLimiter: rateLimiter(store, "login-email", cfg.RateLimit.LoginEmailPerMin),
+		RefreshLimiter:    rateLimiter(store, "refresh", cfg.RateLimit.RefreshPerMin),
 		TrustedProxies:    cfg.HTTP.TrustedProxies,
 	})
 

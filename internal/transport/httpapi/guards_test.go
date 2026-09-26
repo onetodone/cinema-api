@@ -6,11 +6,13 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"uuid"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/onetodone/cinema-api/internal/domain"
 	"github.com/onetodone/cinema-api/internal/platform/metrics"
+	"github.com/onetodone/cinema-api/internal/transport/httpapi/handler"
 	"github.com/onetodone/cinema-api/internal/transport/httpapi/middleware"
 )
 
@@ -68,8 +70,8 @@ func TestRouterRateLimitsAuthAndBookings(t *testing.T) {
 	t.Parallel()
 
 	deps := testRouterDeps()
-	book, authIP, loginEmail := &recordingLimiter{}, &recordingLimiter{}, &recordingLimiter{}
-	deps.BookingLimiter, deps.AuthIPLimiter, deps.LoginEmailLimiter = book, authIP, loginEmail
+	book, authIP, loginEmail, refresh := &recordingLimiter{}, &recordingLimiter{}, &recordingLimiter{}, &recordingLimiter{}
+	deps.BookingLimiter, deps.AuthIPLimiter, deps.LoginEmailLimiter, deps.RefreshLimiter = book, authIP, loginEmail, refresh
 	router := NewRouter(deps)
 	customer := tokenFor(t, domain.RoleCustomer)
 
@@ -78,6 +80,10 @@ func TestRouterRateLimitsAuthAndBookings(t *testing.T) {
 	serveAs(t, router, http.MethodPost, "/v1/auth/login", "", `{"email":"ann@example.com","password":"y"}`)
 	serveAs(t, router, http.MethodPost, "/v1/bookings", customer, `{"showtime_id":1,"seat_ids":[1]}`)
 	serve(t, router, http.MethodGet, "/v1/movies")
+	session := domain.NewRefreshToken(uuid.NewV7())
+	serveAs(t, router, http.MethodPost, "/v1/auth/refresh", "", `{}`, "Cookie", handler.RefreshCookieName+"="+session.String())
+	serveAs(t, router, http.MethodPost, "/v1/auth/refresh", "", `{}`)
+	serveAs(t, router, http.MethodPost, "/v1/auth/logout", "", `{}`)
 
 	// httptest requests come from 192.0.2.1.
 	if got := authIP.seen(); len(got) != 3 || got[0] != "192.0.2.1" {
@@ -89,9 +95,21 @@ func TestRouterRateLimitsAuthAndBookings(t *testing.T) {
 	if got := book.seen(); len(got) != 1 || len(got[0]) != 36 {
 		t.Errorf("booking limit keys = %v, want the caller's user id", got)
 	}
+	if got := refresh.seen(); len(got) != 2 || got[0] != session.SessionID.String() || got[1] != "ip:192.0.2.1" {
+		t.Errorf("refresh limit keys = %v, want the session, then the address of the request without a cookie", got)
+	}
+
+	refresh.deny = true
+	rec := serveAs(t, router, http.MethodPost, "/v1/auth/refresh", "", `{}`, "Cookie", handler.RefreshCookieName+"="+session.String())
+	if rec.Code != http.StatusTooManyRequests {
+		t.Errorf("refresh over the limit = %d, want 429", rec.Code)
+	}
+	if n := testutil.ToFloat64(deps.Metrics.RateLimitRejections.WithLabelValues(metrics.LimitRefresh)); n != 1 {
+		t.Errorf("refresh rejections = %v, want 1", n)
+	}
 
 	book.deny = true
-	rec := serveAs(t, router, http.MethodPost, "/v1/bookings", customer, `{"showtime_id":1,"seat_ids":[1]}`)
+	rec = serveAs(t, router, http.MethodPost, "/v1/bookings", customer, `{"showtime_id":1,"seat_ids":[1]}`)
 	if rec.Code != http.StatusTooManyRequests || rec.Header().Get("Retry-After") != "30" {
 		t.Errorf("booking over the limit = %d, Retry-After %q; want 429 and 30", rec.Code, rec.Header().Get("Retry-After"))
 	}

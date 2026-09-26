@@ -55,12 +55,38 @@ func (o oneUser) Register(context.Context, string, string) (domain.User, error) 
 	return o.user, nil
 }
 
-func (o oneUser) Authenticate(context.Context, string, string) (domain.User, error) {
+func (o oneUser) User(context.Context, uuid.UUID) (domain.User, error) {
 	return o.user, nil
 }
 
-func (o oneUser) User(context.Context, uuid.UUID) (domain.User, error) {
-	return o.user, nil
+// issuingSessions starts a new session for every login and every well-formed refresh token, and signs real access
+// tokens for them.
+type issuingSessions struct{ user domain.User }
+
+func (s issuingSessions) Login(context.Context, string, string, auth.Client) (auth.Grant, error) {
+	return s.grant()
+}
+
+func (s issuingSessions) Refresh(_ context.Context, token string, _ auth.Client) (auth.Grant, auth.RefreshResult, error) {
+	if _, ok := domain.ParseRefreshToken(token); !ok {
+		return auth.Grant{}, auth.RefreshInvalid, domain.Unauthenticated(domain.CodeRefreshInvalid, "log in again")
+	}
+	g, err := s.grant()
+	return g, auth.RefreshRotated, err
+}
+
+func (issuingSessions) Logout(context.Context, string) error       { return nil }
+func (issuingSessions) LogoutAll(context.Context, uuid.UUID) error { return nil }
+
+func (s issuingSessions) grant() (auth.Grant, error) {
+	id := uuid.NewV7()
+	access, err := testTokens.Issue(domain.Principal{UserID: s.user.ID, Role: s.user.Role, SessionID: id})
+	return auth.Grant{
+		User:    s.user,
+		Session: domain.Session{ID: id, UserID: s.user.ID, ExpiresAt: time.Now().Add(time.Hour)},
+		Access:  access,
+		Refresh: domain.NewRefreshToken(id),
+	}, err
 }
 
 // noBookings holds every seat it is asked for and knows no booking.
@@ -135,8 +161,9 @@ func testRouterDeps() RouterDeps {
 		Health: handler.NewHealth(logger, time.Second,
 			handler.Check{Name: "postgres", Critical: true, Probe: func(context.Context) error { return nil }},
 		),
-		Catalog:  handler.NewCatalog(emptyCatalog{}, "USD", logger),
-		Auth:     handler.NewAuth(oneUser{user: user}, testTokens, logger),
+		Catalog: handler.NewCatalog(emptyCatalog{}, "USD", logger),
+		Auth: handler.NewAuth(oneUser{user: user}, issuingSessions{user: user},
+			handler.AuthConfig{Cookie: handler.RefreshCookie{Path: "/v1/auth", Secure: true}}, m, logger),
 		Bookings: handler.NewBookings(noBookings{}, "USD", m, logger),
 		Payments: handler.NewPayments(paysAll{}, localMethod{}, "USD", m, logger),
 		Admin:    handler.NewAdmin(echoAdmin{}, "USD", logger),
@@ -170,7 +197,7 @@ func serveAs(t *testing.T, router http.Handler, method, target, token, body stri
 
 func tokenFor(t *testing.T, role domain.Role) string {
 	t.Helper()
-	tok, err := testTokens.Issue(domain.Principal{UserID: uuid.NewV7(), Role: role})
+	tok, err := testTokens.Issue(domain.Principal{UserID: uuid.NewV7(), Role: role, SessionID: uuid.NewV7()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -272,6 +299,7 @@ func TestRouterEnforcesAccessLevels(t *testing.T) {
 	seats := `{"showtime_id":1,"seat_ids":[1,2]}`
 	bookingPath := "/v1/bookings/" + uuid.NewV7().String()
 	pay := `{"payment_method":"local","payment_token":"tok_success"}`
+	refreshCookie := handler.RefreshCookieName + "=" + domain.NewRefreshToken(uuid.NewV7()).String()
 
 	tests := []struct {
 		name   string
@@ -280,10 +308,17 @@ func TestRouterEnforcesAccessLevels(t *testing.T) {
 		token  string
 		body   string
 		key    string // Idempotency-Key
+		cookie string
 		status int
 	}{
 		{name: "register is public", method: http.MethodPost, path: "/v1/auth/register", body: credentials, status: http.StatusCreated},
 		{name: "login is public", method: http.MethodPost, path: "/v1/auth/login", body: credentials, status: http.StatusOK},
+		{name: "refresh needs the cookie", method: http.MethodPost, path: "/v1/auth/refresh", body: `{}`, status: http.StatusUnauthorized},
+		{name: "refresh ignores bearer tokens", method: http.MethodPost, path: "/v1/auth/refresh", token: customer, body: `{}`, status: http.StatusUnauthorized},
+		{name: "refresh with the cookie", method: http.MethodPost, path: "/v1/auth/refresh", body: `{}`, cookie: refreshCookie, status: http.StatusOK},
+		{name: "logout is public", method: http.MethodPost, path: "/v1/auth/logout", body: `{}`, status: http.StatusNoContent},
+		{name: "logout-all needs a token", method: http.MethodPost, path: "/v1/auth/logout-all", status: http.StatusUnauthorized},
+		{name: "logout-all for a customer", method: http.MethodPost, path: "/v1/auth/logout-all", token: customer, status: http.StatusNoContent},
 		{name: "catalog is public", method: http.MethodGet, path: "/v1/movies", status: http.StatusOK},
 		{name: "me needs a token", method: http.MethodGet, path: "/v1/me", status: http.StatusUnauthorized},
 		{name: "me rejects a forged token", method: http.MethodGet, path: "/v1/me", token: "forged", status: http.StatusUnauthorized},
@@ -319,7 +354,10 @@ func TestRouterEnforcesAccessLevels(t *testing.T) {
 
 			var header []string
 			if tt.key != "" {
-				header = []string{"Idempotency-Key", tt.key}
+				header = append(header, "Idempotency-Key", tt.key)
+			}
+			if tt.cookie != "" {
+				header = append(header, "Cookie", tt.cookie)
 			}
 			rec := serveAs(t, router, tt.method, tt.path, tt.token, tt.body, header...)
 			if rec.Code != tt.status {

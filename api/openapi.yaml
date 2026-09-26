@@ -27,12 +27,27 @@ info:
     - `Retry-After` (seconds) marks answers that are worth retrying unchanged: 409 `SEAT_BUSY`,
       `BOOKING_BUSY`, and `IDEMPOTENCY_IN_PROGRESS`, 429, and 503.
     - Prometheus metrics are not part of this API: they are served on a separate internal port.
+
+    **Sessions**
+
+    - `POST /v1/auth/login` starts a server-side session. The answer carries a short-lived access token (15 minutes
+      by default) for the `Authorization: Bearer` header, and sets the session's refresh token in the
+      `cinema_refresh` cookie: `HttpOnly`, `SameSite=Strict`, `Path=/v1/auth`, and `Secure` unless the API is
+      configured for plain-HTTP development. Scripts never see the refresh token.
+    - `POST /v1/auth/refresh` trades the cookie for a new access token and rotates the refresh token. Several
+      tabs may refresh at once: within 30 seconds of a rotation, the previous token gets the current one. After
+      that, presenting the previous token again revokes the session, because only a copy of a used token can do
+      that. Every failed refresh is `401 REFRESH_INVALID` and deletes the cookie; the client logs in again.
+    - A session lasts 7 days after its last refresh, and 30 days after its login at most. A user has at most 20
+      sessions; a login beyond that ends the least recently used one.
+    - The routes that the cookie authenticates accept only a JSON body (`{}`), so cross-site forms cannot reach
+      them. Every access token names its session (`sid`); a token without one is `401 INVALID_TOKEN`.
 servers:
   - url: http://localhost:8080
     description: Local development (`make run-api`)
 tags:
   - name: Auth
-    description: Accounts and access tokens.
+    description: Accounts, sessions, and access tokens.
   - name: Catalog
     description: Movies, the schedule, and seat maps. Public.
   - name: Bookings
@@ -115,11 +130,12 @@ paths:
     post:
       tags: [Auth]
       operationId: login
-      summary: Get an access token
+      summary: Log in
       security: []
       description: |
-        Answers in the shape of an OAuth 2.0 token response. There are no refresh tokens: log in again when the
-        token expires. Limited per client address and per account address.
+        Starts a session. Answers with an access token in the shape of an OAuth 2.0 token response, and sets the
+        session's refresh token in the `cinema_refresh` cookie. If the user then has more sessions than allowed,
+        the least recently used ones end. Limited per client address and per account address.
       requestBody:
         required: true
         content:
@@ -127,11 +143,10 @@ paths:
             schema: { $ref: '#/components/schemas/Credentials' }
       responses:
         '200':
-          description: The access token.
+          description: The access token and the account; the refresh token is in the cookie.
           headers:
-            Cache-Control:
-              description: Always `no-store` (RFC 6749 §5.1).
-              schema: { type: string, const: no-store }
+            Cache-Control: { $ref: '#/components/headers/Cache-Control-No-Store' }
+            Set-Cookie: { $ref: '#/components/headers/Set-Refresh-Cookie' }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/AccessToken' }
@@ -146,6 +161,90 @@ paths:
         '413': { $ref: '#/components/responses/PayloadTooLarge' }
         '415': { $ref: '#/components/responses/UnsupportedMediaType' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /v1/auth/refresh:
+    post:
+      tags: [Auth]
+      operationId: refresh
+      summary: Refresh the access token
+      security: [{ cookieAuth: [] }]
+      description: |
+        Trades the refresh token cookie for a new access token, and rotates the refresh token: the answer sets the
+        new one in the cookie. Within 30 seconds of a rotation, the previous refresh token gets the current one
+        and the current one is handed out again unchanged, so that tabs refreshing at once, and a client whose
+        answer got lost, keep their session. Presenting the previous token after that revokes the session.
+
+        The body must be the JSON object `{}`. Limited per session.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EmptyObject' }
+      responses:
+        '200':
+          description: A new access token and the account; the session's current refresh token is in the cookie.
+          headers:
+            Cache-Control: { $ref: '#/components/headers/Cache-Control-No-Store' }
+            Set-Cookie: { $ref: '#/components/headers/Set-Refresh-Cookie' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AccessToken' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401':
+          description: |
+            `REFRESH_INVALID`: no cookie, or its token is malformed, unknown, expired, revoked, or was already
+            used. The answer does not say which, and deletes the cookie. Log in again.
+          headers:
+            Set-Cookie: { $ref: '#/components/headers/Clear-Refresh-Cookie' }
+            WWW-Authenticate: { $ref: '#/components/headers/WWW-Authenticate' }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /v1/auth/logout:
+    post:
+      tags: [Auth]
+      operationId: logout
+      summary: Log out of this session
+      security: [{ cookieAuth: [] }, {}]
+      description: |
+        Ends the session of the refresh token cookie and deletes the cookie. It needs no access token, so it works
+        after the access token has expired, and it answers 204 whatever the cookie holds, or without one, so it can
+        be repeated. The body must be the JSON object `{}`.
+
+        Access tokens of the session stay valid until they expire.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EmptyObject' }
+      responses:
+        '204':
+          description: The session is over, if there was one.
+          headers:
+            Set-Cookie: { $ref: '#/components/headers/Clear-Refresh-Cookie' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /v1/auth/logout-all:
+    post:
+      tags: [Auth]
+      operationId: logoutAll
+      summary: Log out of every session
+      security: [{ bearerAuth: [] }]
+      description: |
+        Ends every session of the caller, on every device, and deletes this client's cookie. Access tokens of the
+        sessions stay valid until they expire.
+      responses:
+        '204':
+          description: Every session of the caller is over.
+          headers:
+            Set-Cookie: { $ref: '#/components/headers/Clear-Refresh-Cookie' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
         '500': { $ref: '#/components/responses/InternalError' }
   /v1/me:
     get:
@@ -616,7 +715,15 @@ components:
       type: http
       scheme: bearer
       bearerFormat: JWT
-      description: The `access_token` from `POST /v1/auth/login`, valid for an hour by default.
+      description: |
+        The `access_token` from `POST /v1/auth/login` or `POST /v1/auth/refresh`, valid for 15 minutes by default.
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: cinema_refresh
+      description: |
+        The session's refresh token, `<session id>.<secret>`, set by login and refresh. The browser keeps it as an
+        `HttpOnly`, `SameSite=Strict` cookie on `/v1/auth` and sends it by itself.
 
   parameters:
     MovieID:
@@ -673,6 +780,21 @@ components:
     WWW-Authenticate:
       description: The bearer challenge (RFC 6750), with `error="invalid_token"` for a rejected token.
       schema: { type: string, example: 'Bearer realm="cinema-api", error="invalid_token"' }
+    Cache-Control-No-Store:
+      description: Always `no-store` (RFC 6749 §5.1).
+      schema: { type: string, const: no-store }
+    Set-Refresh-Cookie:
+      description: |
+        The session's current refresh token. `Max-Age` runs until the session expires; `Secure` is left out only
+        when the API is configured for plain-HTTP development.
+      schema:
+        type: string
+        example: 'cinema_refresh=0199a1f0-7c1e-7d2a-9b3e-5f0c2d1e4a77.9EKpsX6MOYrWBUtLGDl0juw2oetm5lfaf7Om6X6_FM8; Path=/v1/auth; Max-Age=604800; HttpOnly; Secure; SameSite=Strict'
+    Clear-Refresh-Cookie:
+      description: Deletes the refresh token cookie.
+      schema:
+        type: string
+        example: 'cinema_refresh=; Path=/v1/auth; Max-Age=0; HttpOnly; Secure; SameSite=Strict'
 
   responses:
     BadRequest:
@@ -807,11 +929,18 @@ components:
         created_at: { type: string, format: date-time }
     AccessToken:
       type: object
-      required: [access_token, token_type, expires_in]
+      required: [access_token, token_type, expires_in, user]
       properties:
         access_token: { type: string }
         token_type: { type: string, const: Bearer }
-        expires_in: { type: integer, description: Seconds until the token expires., example: 3600 }
+        expires_in: { type: integer, description: Seconds until the token expires., example: 900 }
+        user: { $ref: '#/components/schemas/User' }
+    EmptyObject:
+      type: object
+      description: The JSON object `{}`.
+      additionalProperties: false
+      maxProperties: 0
+      example: {}
 
     Movie:
       type: object

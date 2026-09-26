@@ -51,9 +51,20 @@ func TestLoadAppliesDefaults(t *testing.T) {
 	if cfg.Cinema.Location.String() != "UTC" || cfg.Cinema.Currency != "USD" {
 		t.Errorf("Cinema = %v/%q, want UTC/USD", cfg.Cinema.Location, cfg.Cinema.Currency)
 	}
-	if cfg.Auth.JWTSecret != "" || cfg.Auth.JWTTTL != time.Hour || cfg.Auth.BcryptCost != 12 {
-		t.Errorf("Auth secret/ttl/cost = %q/%s/%d, want empty/1h/12",
+	if cfg.Auth.JWTSecret != "" || cfg.Auth.JWTTTL != 15*time.Minute || cfg.Auth.BcryptCost != 12 {
+		t.Errorf("Auth secret/ttl/cost = %q/%s/%d, want empty/15m/12",
 			cfg.Auth.JWTSecret, cfg.Auth.JWTTTL, cfg.Auth.BcryptCost)
+	}
+	if cfg.Auth.RefreshTTL != 7*24*time.Hour || cfg.Auth.SessionMaxAge != 30*24*time.Hour ||
+		cfg.Auth.RefreshGrace != 30*time.Second || cfg.Auth.MaxSessionsPerUser != 20 {
+		t.Errorf("Auth refresh ttl/max age/grace/sessions = %s/%s/%s/%d, want 168h/720h/30s/20",
+			cfg.Auth.RefreshTTL, cfg.Auth.SessionMaxAge, cfg.Auth.RefreshGrace, cfg.Auth.MaxSessionsPerUser)
+	}
+	if cfg.Auth.CookiePath != "/v1/auth" || !cfg.Auth.CookieSecure {
+		t.Errorf("Auth cookie path/secure = %q/%t, want /v1/auth and Secure", cfg.Auth.CookiePath, cfg.Auth.CookieSecure)
+	}
+	if cfg.Sweeper.Interval != time.Hour {
+		t.Errorf("Sweeper interval = %s, want 1h", cfg.Sweeper.Interval)
 	}
 	if cfg.Auth.AdminEmail != "admin@cinema.local" || cfg.Auth.AdminPassword != "" {
 		t.Errorf("Auth admin = %q/%q, want admin@cinema.local and no password",
@@ -78,7 +89,7 @@ func TestLoadAppliesDefaults(t *testing.T) {
 	if cfg.Cache.SeatMapTTL != 5*time.Second || cfg.Cache.ScheduleTTL != 10*time.Second {
 		t.Errorf("Cache = %+v, want 5s/10s", cfg.Cache)
 	}
-	if want := (RateLimitConfig{BookingPerMin: 20, AuthIPPerMin: 30, LoginEmailPerMin: 10}); cfg.RateLimit != want {
+	if want := (RateLimitConfig{BookingPerMin: 20, AuthIPPerMin: 30, LoginEmailPerMin: 10, RefreshPerMin: 60}); cfg.RateLimit != want {
 		t.Errorf("RateLimit = %+v, want %+v", cfg.RateLimit, want)
 	}
 	if len(cfg.HTTP.TrustedProxies) != 0 {
@@ -109,15 +120,16 @@ func TestLoadReadsRedisLayerSettings(t *testing.T) {
 	t.Parallel()
 
 	cfg, err := loadFrom(t, map[string]string{
-		"DATABASE_URL":                   testDSN,
-		"REDIS_KEY_PREFIX":               "staging:cinema",
-		"HOLD_CLAIM_TTL":                 "4s",
-		"SEATMAP_CACHE_TTL":              "0s",
-		"SCHEDULE_CACHE_TTL":             "1m",
-		"BOOKING_RATE_LIMIT_PER_MIN":     "0",
-		"AUTH_IP_RATE_LIMIT_PER_MIN":     "100",
-		"LOGIN_EMAIL_RATE_LIMIT_PER_MIN": "5",
-		"HTTP_TRUSTED_PROXIES":           "10.0.0.0/8,2001:db8::/32",
+		"DATABASE_URL":                    testDSN,
+		"REDIS_KEY_PREFIX":                "staging:cinema",
+		"HOLD_CLAIM_TTL":                  "4s",
+		"SEATMAP_CACHE_TTL":               "0s",
+		"SCHEDULE_CACHE_TTL":              "1m",
+		"BOOKING_RATE_LIMIT_PER_MIN":      "0",
+		"AUTH_IP_RATE_LIMIT_PER_MIN":      "100",
+		"LOGIN_EMAIL_RATE_LIMIT_PER_MIN":  "5",
+		"AUTH_REFRESH_RATE_LIMIT_PER_MIN": "0",
+		"HTTP_TRUSTED_PROXIES":            "10.0.0.0/8,2001:db8::/32",
 	})
 	if err != nil {
 		t.Fatalf("load: %v", err)
@@ -185,18 +197,32 @@ func TestLoadReadsAuthSettings(t *testing.T) {
 
 	secret := strings.Repeat("s", 32)
 	cfg, err := loadFrom(t, map[string]string{
-		"DATABASE_URL":   testDSN,
-		"JWT_SECRET":     secret,
-		"JWT_TTL":        "15m",
-		"BCRYPT_COST":    "10",
-		"ADMIN_EMAIL":    "root@example.com",
-		"ADMIN_PASSWORD": "long enough",
+		"DATABASE_URL":               testDSN,
+		"JWT_SECRET":                 secret,
+		"JWT_TTL":                    "30s",
+		"BCRYPT_COST":                "10",
+		"ADMIN_EMAIL":                "root@example.com",
+		"ADMIN_PASSWORD":             "long enough",
+		"REFRESH_TOKEN_TTL":          "1h",
+		"SESSION_MAX_AGE":            "1h",
+		"REFRESH_GRACE":              "2m",
+		"AUTH_MAX_SESSIONS_PER_USER": "1",
+		"AUTH_COOKIE_PATH":           "/api/v1/auth",
+		"AUTH_COOKIE_SECURE":         "false",
+		"SESSION_SWEEP_INTERVAL":     "1m",
 	})
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if cfg.Auth.JWTSecret != secret || cfg.Auth.JWTTTL != 15*time.Minute || cfg.Auth.BcryptCost != 10 {
+	if cfg.Auth.JWTSecret != secret || cfg.Auth.JWTTTL != 30*time.Second || cfg.Auth.BcryptCost != 10 {
 		t.Errorf("Auth = %+v", cfg.Auth)
+	}
+	if cfg.Auth.RefreshTTL != time.Hour || cfg.Auth.SessionMaxAge != time.Hour || cfg.Auth.RefreshGrace != 2*time.Minute ||
+		cfg.Auth.MaxSessionsPerUser != 1 || cfg.Auth.CookiePath != "/api/v1/auth" || cfg.Auth.CookieSecure {
+		t.Errorf("Auth sessions = %+v", cfg.Auth)
+	}
+	if cfg.Sweeper.Interval != time.Minute {
+		t.Errorf("Sweeper = %+v", cfg.Sweeper)
 	}
 	if cfg.Auth.AdminEmail != "root@example.com" || cfg.Auth.AdminPassword != "long enough" {
 		t.Errorf("Auth admin = %q/%q", cfg.Auth.AdminEmail, cfg.Auth.AdminPassword)
@@ -477,6 +503,71 @@ func TestLoadRejectsInvalidInput(t *testing.T) {
 			name:    "negative login rate limit",
 			vars:    map[string]string{"DATABASE_URL": testDSN, "LOGIN_EMAIL_RATE_LIMIT_PER_MIN": "-5"},
 			wantErr: "LOGIN_EMAIL_RATE_LIMIT_PER_MIN",
+		},
+		{
+			name:    "negative refresh rate limit",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "AUTH_REFRESH_RATE_LIMIT_PER_MIN": "-1"},
+			wantErr: "AUTH_REFRESH_RATE_LIMIT_PER_MIN",
+		},
+		{
+			name:    "refresh ttl not above the access token ttl",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "JWT_TTL": "1h", "REFRESH_TOKEN_TTL": "1h"},
+			wantErr: "REFRESH_TOKEN_TTL must be longer than JWT_TTL (1h0m0s) and at most SESSION_MAX_AGE (720h0m0s), got 1h0m0s",
+		},
+		{
+			name:    "refresh ttl above the session max age",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "REFRESH_TOKEN_TTL": "200h", "SESSION_MAX_AGE": "100h"},
+			wantErr: "REFRESH_TOKEN_TTL",
+		},
+		{
+			name:    "session max age above a year",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "SESSION_MAX_AGE": "8761h"},
+			wantErr: "SESSION_MAX_AGE must be positive and at most 8760h0m0s, got 8761h0m0s",
+		},
+		{
+			name:    "sub-second refresh grace",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "REFRESH_GRACE": "500ms"},
+			wantErr: "REFRESH_GRACE must be between 1s and 2m0s, got 500ms",
+		},
+		{
+			name:    "refresh grace above two minutes",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "REFRESH_GRACE": "3m"},
+			wantErr: "REFRESH_GRACE",
+		},
+		{
+			name:    "zero sessions per user",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "AUTH_MAX_SESSIONS_PER_USER": "0"},
+			wantErr: "AUTH_MAX_SESSIONS_PER_USER must be between 1 and 1000, got 0",
+		},
+		{
+			name:    "relative cookie path",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "AUTH_COOKIE_PATH": "v1/auth"},
+			wantErr: `AUTH_COOKIE_PATH must start with /`,
+		},
+		{
+			name:    "cookie path with a semicolon",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "AUTH_COOKIE_PATH": "/v1;Domain=evil.example"},
+			wantErr: "AUTH_COOKIE_PATH",
+		},
+		{
+			name:    "cookie path with a space",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "AUTH_COOKIE_PATH": "/v1/ auth"},
+			wantErr: "AUTH_COOKIE_PATH",
+		},
+		{
+			name:    "malformed cookie secure switch",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "AUTH_COOKIE_SECURE": "maybe"},
+			wantErr: "AUTH_COOKIE_SECURE",
+		},
+		{
+			name:    "sweep interval below a minute",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "SESSION_SWEEP_INTERVAL": "30s"},
+			wantErr: "SESSION_SWEEP_INTERVAL must be between 1m0s and 24h0m0s, got 30s",
+		},
+		{
+			name:    "sweep interval above a day",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "SESSION_SWEEP_INTERVAL": "25h"},
+			wantErr: "SESSION_SWEEP_INTERVAL",
 		},
 		{
 			name:    "trusted proxy without a prefix length",

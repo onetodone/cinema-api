@@ -49,6 +49,7 @@ const (
 	LimitBooking    = "booking"
 	LimitAuthIP     = "auth_ip"
 	LimitLoginEmail = "login_email"
+	LimitRefresh    = "refresh"
 )
 
 // Outcomes of requests that carry an Idempotency-Key, the result label of IdempotencyRequests.
@@ -93,6 +94,17 @@ const (
 	ReconciledUnsettled = "unsettled" // the provider or the database failed; the next pass retries it
 )
 
+// Outcomes of refreshes, the result label of AuthRefreshes. The first three answer with tokens, the others with
+// 401 REFRESH_INVALID.
+const (
+	RefreshRotated       = "rotated"        // a new refresh token
+	RefreshReissued      = "reissued"       // the current token again, within the grace window
+	RefreshGrace         = "grace"          // the previous token within the grace window got the current one
+	RefreshReuseDetected = "reuse_detected" // the previous token after the grace window: the session was revoked
+	RefreshExpired       = "expired"        // the session had expired
+	RefreshInvalid       = "invalid"        // no, a malformed, an unknown, or an older token
+)
+
 // RouteUnmatched is the route label of requests that matched no route.
 const RouteUnmatched = "unmatched"
 
@@ -118,6 +130,10 @@ type Metrics struct {
 	Payments *prometheus.CounterVec
 	// PaymentsReconciled counts stuck payments the worker settled or failed to settle, by result.
 	PaymentsReconciled *prometheus.CounterVec
+	// AuthRefreshes counts refresh requests that reached the refresh handler, by result.
+	AuthRefreshes *prometheus.CounterVec
+	// SessionsSwept counts expired sessions the worker deleted.
+	SessionsSwept prometheus.Counter
 
 	// HoldGateRejections counts booking requests that the Redis hold gate turned away because another booking
 	// holds or claims one of their seats. They never reached PostgreSQL.
@@ -162,6 +178,14 @@ func New(reg prometheus.Registerer) *Metrics {
 			Namespace: namespace, Name: "payments_reconciled_total",
 			Help: "Stuck payments looked at by the worker, by result.",
 		}, []string{"result"}),
+		AuthRefreshes: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Name: "auth_refresh_total",
+			Help: "Refresh requests by result.",
+		}, []string{"result"}),
+		SessionsSwept: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace, Name: "sessions_swept_total",
+			Help: "Expired sessions deleted by the worker.",
+		}),
 		HoldGateRejections: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace, Name: "hold_gate_rejections_total",
 			Help: "Booking requests rejected by the Redis hold gate before reaching PostgreSQL.",
@@ -185,7 +209,7 @@ func New(reg prometheus.Registerer) *Metrics {
 	}
 	reg.MustRegister(
 		m.HTTPRequestDuration, m.BookingAttempts, m.TxRetries, m.BookingsExpired, m.Payments, m.PaymentsReconciled,
-		m.HoldGateRejections, m.RedisFailOpen, m.CacheRequests, m.RateLimitRejections, m.IdempotencyRequests,
+		m.AuthRefreshes, m.SessionsSwept, m.HoldGateRejections, m.RedisFailOpen, m.CacheRequests, m.RateLimitRejections, m.IdempotencyRequests,
 	)
 
 	for _, result := range []string{
@@ -199,6 +223,11 @@ func New(reg prometheus.Registerer) *Metrics {
 	for _, result := range []string{ReconciledPaid, ReconciledFailed, ReconciledUnsettled} {
 		m.PaymentsReconciled.WithLabelValues(result)
 	}
+	for _, result := range []string{
+		RefreshRotated, RefreshReissued, RefreshGrace, RefreshReuseDetected, RefreshExpired, RefreshInvalid,
+	} {
+		m.AuthRefreshes.WithLabelValues(result)
+	}
 
 	for _, op := range []string{
 		OpHoldAcquire, OpHoldExtend, OpHoldRelease, OpCacheGet, OpCacheSet, OpCacheInvalidate, OpIdempotency, OpRateLimit,
@@ -210,7 +239,7 @@ func New(reg prometheus.Registerer) *Metrics {
 			m.CacheRequests.WithLabelValues(cache, result)
 		}
 	}
-	for _, limit := range []string{LimitBooking, LimitAuthIP, LimitLoginEmail} {
+	for _, limit := range []string{LimitBooking, LimitAuthIP, LimitLoginEmail, LimitRefresh} {
 		m.RateLimitRejections.WithLabelValues(limit)
 	}
 	for _, result := range []string{IdempotencyNew, IdempotencyReplayed, IdempotencyInProgress, IdempotencyKeyReused} {

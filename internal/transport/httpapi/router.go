@@ -37,6 +37,7 @@ type RouterDeps struct {
 	BookingLimiter    middleware.RateLimiter // booking attempts per user
 	AuthIPLimiter     middleware.RateLimiter // login and registration attempts per client address
 	LoginEmailLimiter middleware.RateLimiter // login attempts per account email
+	RefreshLimiter    middleware.RateLimiter // refreshes per session
 	// TrustedProxies are the networks whose X-Forwarded-For names the client address.
 	TrustedProxies []netip.Prefix
 }
@@ -86,6 +87,8 @@ func newMux(d RouterDeps) (*http.ServeMux, []string) {
 	}
 	limitAuthByIP := limit(metrics.LimitAuthIP, d.AuthIPLimiter, middleware.ByClientIP(d.TrustedProxies))
 	limitLoginByEmail := limit(metrics.LimitLoginEmail, d.LoginEmailLimiter, middleware.ByEmail)
+	limitRefreshBySession := limit(metrics.LimitRefresh, d.RefreshLimiter,
+		middleware.ByRefreshSession(handler.RefreshCookieName, d.TrustedProxies))
 	limitBookings := limit(metrics.LimitBooking, d.BookingLimiter, middleware.ByUser)
 	idempotent := func(required bool) middleware.Middleware {
 		return middleware.Idempotency(d.Idempotency, required, d.Metrics, d.Logger)
@@ -96,6 +99,10 @@ func newMux(d RouterDeps) (*http.ServeMux, []string) {
 
 	handle("POST /v1/auth/register", public(d.Auth.Register, limitAuthByIP))
 	handle("POST /v1/auth/login", public(d.Auth.Login, limitAuthByIP, limitLoginByEmail))
+	// The refresh token cookie authenticates these two; the handlers check it.
+	handle("POST /v1/auth/refresh", public(d.Auth.Refresh, limitRefreshBySession))
+	handle("POST /v1/auth/logout", public(d.Auth.Logout))
+	handle("POST /v1/auth/logout-all", user(d.Auth.LogoutAll))
 	handle("GET /v1/me", user(d.Auth.Me))
 
 	handle("GET /v1/movies", public(d.Catalog.ListMovies))

@@ -28,6 +28,8 @@ var signingMethod = jwt.SigningMethodHS256
 // claims is the payload of an access token.
 type claims struct {
 	Role domain.Role `json:"role"`
+	// SessionID is the session that issued the token. Every token has one; a token without it is rejected.
+	SessionID string `json:"sid"`
 	jwt.RegisteredClaims
 }
 
@@ -37,9 +39,10 @@ type AccessToken struct {
 	ExpiresIn time.Duration
 }
 
-// Tokens issues and verifies stateless access tokens (JWT, HS256). A token carries the user id and role, so
-// verifying it needs no database access. The price is that a role change applies to new tokens only; old
-// ones keep the old role until they expire (JWT_TTL).
+// Tokens issues and verifies stateless access tokens (JWT, HS256). A token carries the user id, the role, and the
+// session that issued it, so verifying it needs no database access. The price is that a role change applies to
+// new tokens only; old ones keep the old role until they expire (JWT_TTL), and so do the tokens of a session that
+// was deleted.
 type Tokens struct {
 	key    []byte
 	ttl    time.Duration
@@ -83,11 +86,15 @@ func NewTokens(secret string, ttl time.Duration, opts ...TokenOption) (*Tokens, 
 	return t, nil
 }
 
-// Issue signs a token for p.
+// Issue signs a token for p, which must name the session that the token belongs to.
 func (t *Tokens) Issue(p domain.Principal) (AccessToken, error) {
+	if p.SessionID == uuid.Nil() {
+		return AccessToken{}, errors.New("sign access token: the principal has no session")
+	}
 	now := t.now()
 	c := claims{
-		Role: p.Role,
+		Role:      p.Role,
+		SessionID: p.SessionID.String(),
 		RegisteredClaims: jwt.RegisteredClaims{
 			Issuer:    tokenIssuer,
 			Subject:   p.UserID.String(),
@@ -124,7 +131,13 @@ func (t *Tokens) Verify(raw string) (domain.Principal, error) {
 	if !c.Role.Valid() {
 		return domain.Principal{}, invalidToken(fmt.Errorf("unknown role %q", c.Role))
 	}
-	return domain.Principal{UserID: id, Role: c.Role}, nil
+	sid, err := uuid.Parse(c.SessionID)
+	if err != nil || sid == uuid.Nil() {
+		// Tokens issued before sessions existed have no sid. They are refused rather than grandfathered: they
+		// cannot be revoked, and they expire within JWT_TTL anyway.
+		return domain.Principal{}, invalidToken(fmt.Errorf("sid %q is not a session id", c.SessionID))
+	}
+	return domain.Principal{UserID: id, Role: c.Role, SessionID: sid}, nil
 }
 
 // signingKey is the jwt.Keyfunc. The parser has already pinned the algorithm, so the HMAC key is always right.
