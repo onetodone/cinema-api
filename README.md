@@ -1,6 +1,7 @@
 # Cinema Booking API
 
 [![CI](https://github.com/onetodone/cinema-api/actions/workflows/ci.yml/badge.svg)](https://github.com/onetodone/cinema-api/actions/workflows/ci.yml)
+[![API reference](https://img.shields.io/badge/API-reference-blue)](https://onetodone.github.io/cinema-api/)
 
 A REST API for cinema tickets, written in Go with PostgreSQL and Redis. Customers browse the schedule, hold seats
 for 15 minutes, and pay for them. Unpaid holds expire on their own. **No seat is ever sold twice**, however many
@@ -297,9 +298,10 @@ On `SIGTERM` the batch in flight finishes and no new one starts.
 ## API
 
 The contract is [`api/openapi.yaml`](api/openapi.yaml) (OpenAPI 3.1, linted by `make lint-api`); a test checks that
-it documents exactly the routes the router serves. Its rendered reference is [`docs/index.html`](docs/index.html), a
-static Redoc page to open in a browser. `make docs` renders it locally, and the Docs workflow renders and commits it
-on every change to the contract on `main`, so it never has to be updated by hand.
+it documents exactly the routes the router serves. Its rendered reference is published at
+**<https://onetodone.github.io/cinema-api/>**: GitHub Pages serves [`docs/index.html`](docs/index.html), a static
+Redoc page, from `main`. `make docs` renders it locally, and the Docs workflow renders and commits it on every change
+to the contract on `main`, so it never has to be updated by hand.
 
 | Route | Access | Purpose |
 |---|---|---|
