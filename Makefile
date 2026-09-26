@@ -27,6 +27,10 @@ build: ## Build every binary in ./cmd into ./bin
 run-api: ## Run the HTTP API with settings from .env
 	go run ./cmd/api
 
+.PHONY: run-worker
+run-worker: ## Run the booking expiry worker with settings from .env
+	go run ./cmd/worker
+
 .PHONY: migrate-up
 migrate-up: ## Apply all pending database migrations
 	go run ./cmd/migrate up

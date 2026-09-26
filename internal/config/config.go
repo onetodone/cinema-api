@@ -21,6 +21,7 @@ type Config struct {
 	Cinema  CinemaConfig
 	Auth    AuthConfig
 	Booking BookingConfig
+	Expirer ExpirerConfig
 }
 
 // Limits for authentication settings.
@@ -38,6 +39,24 @@ const (
 	maxHoldTTL      = 24 * time.Hour
 	maxSeatsCeiling = 50
 )
+
+// Limits for the expiry worker.
+const (
+	minExpirerInterval = time.Second
+	// maxExpirerInterval bounds how long seats stay held after their hold has run out.
+	maxExpirerInterval = 10 * time.Minute
+	// maxExpirerBatchSize bounds the rows one transaction locks: up to BOOKING_MAX_SEATS seats per booking.
+	maxExpirerBatchSize = 5000
+)
+
+// ExpirerConfig configures the worker that expires unpaid bookings.
+type ExpirerConfig struct {
+	// Interval is the average pause between two sweeps. Each pause varies at random by up to 20%, so worker
+	// replicas that started together do not query the database in lockstep.
+	Interval time.Duration `env:"EXPIRER_INTERVAL"   envDefault:"5s"`
+	// BatchSize is the most bookings one transaction expires. A sweep runs batches until one comes back short.
+	BatchSize int `env:"EXPIRER_BATCH_SIZE" envDefault:"500"`
+}
 
 // BookingConfig configures seat holds.
 type BookingConfig struct {
@@ -236,6 +255,14 @@ func (c Config) Validate() error {
 	if c.Booking.MaxSeats < 1 || c.Booking.MaxSeats > maxSeatsCeiling {
 		errs = append(errs, fmt.Errorf("BOOKING_MAX_SEATS must be between 1 and %d, got %d",
 			maxSeatsCeiling, c.Booking.MaxSeats))
+	}
+	if c.Expirer.Interval < minExpirerInterval || c.Expirer.Interval > maxExpirerInterval {
+		errs = append(errs, fmt.Errorf("EXPIRER_INTERVAL must be between %s and %s, got %s",
+			minExpirerInterval, maxExpirerInterval, c.Expirer.Interval))
+	}
+	if c.Expirer.BatchSize < 1 || c.Expirer.BatchSize > maxExpirerBatchSize {
+		errs = append(errs, fmt.Errorf("EXPIRER_BATCH_SIZE must be between 1 and %d, got %d",
+			maxExpirerBatchSize, c.Expirer.BatchSize))
 	}
 	if !isCurrencyCode(c.Cinema.Currency) {
 		errs = append(errs, fmt.Errorf("CINEMA_CURRENCY must be a 3-letter uppercase ISO 4217 code, got %q",

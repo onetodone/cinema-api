@@ -42,10 +42,10 @@ func (s seatStore) LockOrdered(ctx context.Context, showtimeID int64, seatIDs []
 	return seats, nil
 }
 
-func (s seatStore) LockByBooking(ctx context.Context, bookingID uuid.UUID) ([]domain.ShowtimeSeat, error) {
-	seats, err := s.lock(ctx, lockSeatsSelect+`WHERE ss.booking_id = $1`+lockSeatsOrder, bookingID)
+func (s seatStore) LockByBookings(ctx context.Context, bookingIDs ...uuid.UUID) ([]domain.ShowtimeSeat, error) {
+	seats, err := s.lock(ctx, lockSeatsSelect+`WHERE ss.booking_id = ANY($1::uuid[])`+lockSeatsOrder, bookingIDs)
 	if err != nil {
-		return nil, fmt.Errorf("lock seats of booking %s: %w", bookingID, err)
+		return nil, fmt.Errorf("lock seats of %d bookings: %w", len(bookingIDs), err)
 	}
 	return seats, nil
 }
@@ -77,13 +77,13 @@ WHERE showtime_id = $1 AND seat_id = ANY($2::bigint[]) AND status = 'available'`
 	return tag.RowsAffected(), nil
 }
 
-func (s seatStore) Release(ctx context.Context, bookingID uuid.UUID) (int64, error) {
+func (s seatStore) Release(ctx context.Context, bookingIDs ...uuid.UUID) (int64, error) {
 	tag, err := s.q.Exec(ctx, `
 UPDATE showtime_seats
 SET status = 'available', booking_id = NULL, updated_at = now()
-WHERE booking_id = $1 AND status = 'held'`, bookingID)
+WHERE booking_id = ANY($1::uuid[]) AND status = 'held'`, bookingIDs)
 	if err != nil {
-		return 0, fmt.Errorf("release seats of booking %s: %w", bookingID, err)
+		return 0, fmt.Errorf("release seats of %d bookings: %w", len(bookingIDs), err)
 	}
 	return tag.RowsAffected(), nil
 }

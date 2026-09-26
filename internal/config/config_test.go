@@ -61,22 +61,30 @@ func TestLoadAppliesDefaults(t *testing.T) {
 		t.Errorf("Booking hold/max seats/lock timeout = %s/%d/%s, want 15m/10/3s",
 			cfg.Booking.HoldTTL, cfg.Booking.MaxSeats, cfg.DB.LockTimeout)
 	}
+	if cfg.Expirer.Interval != 5*time.Second || cfg.Expirer.BatchSize != 500 {
+		t.Errorf("Expirer interval/batch size = %s/%d, want 5s/500", cfg.Expirer.Interval, cfg.Expirer.BatchSize)
+	}
 }
 
 func TestLoadReadsBookingSettings(t *testing.T) {
 	t.Parallel()
 
 	cfg, err := loadFrom(t, map[string]string{
-		"DATABASE_URL":      testDSN,
-		"BOOKING_HOLD_TTL":  "30s",
-		"BOOKING_MAX_SEATS": "4",
-		"DB_LOCK_TIMEOUT":   "250ms",
+		"DATABASE_URL":       testDSN,
+		"BOOKING_HOLD_TTL":   "30s",
+		"BOOKING_MAX_SEATS":  "4",
+		"DB_LOCK_TIMEOUT":    "250ms",
+		"EXPIRER_INTERVAL":   "1s",
+		"EXPIRER_BATCH_SIZE": "5000",
 	})
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
 	if cfg.Booking.HoldTTL != 30*time.Second || cfg.Booking.MaxSeats != 4 || cfg.DB.LockTimeout != 250*time.Millisecond {
 		t.Errorf("Booking = %+v, lock timeout %s", cfg.Booking, cfg.DB.LockTimeout)
+	}
+	if cfg.Expirer.Interval != time.Second || cfg.Expirer.BatchSize != 5000 {
+		t.Errorf("Expirer = %+v, want 1s/5000", cfg.Expirer)
 	}
 }
 
@@ -267,6 +275,26 @@ func TestLoadRejectsInvalidInput(t *testing.T) {
 			name:    "zero max seats",
 			vars:    map[string]string{"DATABASE_URL": testDSN, "BOOKING_MAX_SEATS": "0"},
 			wantErr: "BOOKING_MAX_SEATS must be between 1 and 50, got 0",
+		},
+		{
+			name:    "sub-second expirer interval",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "EXPIRER_INTERVAL": "500ms"},
+			wantErr: "EXPIRER_INTERVAL must be between 1s and 10m0s, got 500ms",
+		},
+		{
+			name:    "expirer interval above ten minutes",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "EXPIRER_INTERVAL": "11m"},
+			wantErr: "EXPIRER_INTERVAL",
+		},
+		{
+			name:    "zero expirer batch size",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "EXPIRER_BATCH_SIZE": "0"},
+			wantErr: "EXPIRER_BATCH_SIZE must be between 1 and 5000, got 0",
+		},
+		{
+			name:    "huge expirer batch size",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "EXPIRER_BATCH_SIZE": "5001"},
+			wantErr: "EXPIRER_BATCH_SIZE",
 		},
 		{
 			name:    "unknown log level",

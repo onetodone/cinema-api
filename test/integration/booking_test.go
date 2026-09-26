@@ -136,10 +136,12 @@ func countRows(t *testing.T, pool *pgxpool.Pool, sql string, args ...any) int {
 	return n
 }
 
-// logRecorder is a slog.Handler that keeps the SQLSTATE of every transaction retry it sees.
+// logRecorder is a slog.Handler that keeps the SQLSTATE of every transaction retry and every record logged at
+// warn level or above.
 type logRecorder struct {
-	mu      sync.Mutex
-	retries []string
+	mu       sync.Mutex
+	retries  []string
+	warnings []string
 }
 
 func (l *logRecorder) Enabled(context.Context, slog.Level) bool { return true }
@@ -147,15 +149,19 @@ func (l *logRecorder) WithAttrs([]slog.Attr) slog.Handler       { return l }
 func (l *logRecorder) WithGroup(string) slog.Handler            { return l }
 
 func (l *logRecorder) Handle(_ context.Context, r slog.Record) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	line := r.Message
 	r.Attrs(func(a slog.Attr) bool {
 		if a.Key == "sqlstate" {
-			l.mu.Lock()
 			l.retries = append(l.retries, a.Value.String())
-			l.mu.Unlock()
-			return false
 		}
+		line += " " + a.String()
 		return true
 	})
+	if r.Level >= slog.LevelWarn {
+		l.warnings = append(l.warnings, line)
+	}
 	return nil
 }
 
@@ -163,6 +169,12 @@ func (l *logRecorder) retried() []string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return slices.Clone(l.retries)
+}
+
+func (l *logRecorder) warned() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.Clone(l.warnings)
 }
 
 func TestBookingLifecycle(t *testing.T) {

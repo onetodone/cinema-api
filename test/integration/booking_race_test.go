@@ -33,14 +33,20 @@ const stressDeadline = 30 * time.Second
 
 func newRacePool(t *testing.T, pool *pgxpool.Pool) *pgxpool.Pool {
 	t.Helper()
+	return newPoolOf(t, pool, racePoolSize)
+}
+
+// newPoolOf opens another pool of maxConns connections to the database of pool.
+func newPoolOf(t *testing.T, pool *pgxpool.Pool, maxConns int32) *pgxpool.Pool {
+	t.Helper()
 	cfg := pool.Config().Copy()
-	cfg.MaxConns = racePoolSize
-	racePool, err := pgxpool.NewWithConfig(t.Context(), cfg)
+	cfg.MaxConns = maxConns
+	p, err := pgxpool.NewWithConfig(t.Context(), cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(racePool.Close) // runs before the database is dropped
-	return racePool
+	t.Cleanup(p.Close) // runs before the database is dropped
+	return p
 }
 
 // TestBookingRaceOneSeat is the core guarantee: 200 users try to book the same seat at the same moment, and

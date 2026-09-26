@@ -97,6 +97,13 @@ func (db *memDB) booking(id uuid.UUID) (domain.Booking, bool) {
 	return b, ok
 }
 
+// advance moves the fake database clock forward.
+func (db *memDB) advance(d time.Duration) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	db.now = db.now.Add(d)
+}
+
 func (db *memDB) setBookingStatus(id uuid.UUID, status domain.BookingStatus) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -178,11 +185,11 @@ func (tx *memTx) LockOrdered(_ context.Context, showtimeID int64, seatIDs []int6
 	return out, nil
 }
 
-func (tx *memTx) LockByBooking(_ context.Context, bookingID uuid.UUID) ([]domain.ShowtimeSeat, error) {
-	tx.record("lock seats of booking")
+func (tx *memTx) LockByBookings(_ context.Context, bookingIDs ...uuid.UUID) ([]domain.ShowtimeSeat, error) {
+	tx.record("lock seats of %d bookings", len(bookingIDs))
 	var out []domain.ShowtimeSeat
 	for _, s := range tx.state.seats {
-		if s.bookingID == bookingID {
+		if slices.Contains(bookingIDs, s.bookingID) {
 			out = append(out, s.seat)
 		}
 	}
@@ -203,11 +210,11 @@ func (tx *memTx) Hold(_ context.Context, showtimeID int64, seatIDs []int64, book
 	return n - tx.db.holdShortfall, nil
 }
 
-func (tx *memTx) Release(_ context.Context, bookingID uuid.UUID) (int64, error) {
+func (tx *memTx) Release(_ context.Context, bookingIDs ...uuid.UUID) (int64, error) {
 	tx.record("release seats")
 	var n int64
 	for k, s := range tx.state.seats {
-		if s.bookingID == bookingID && s.seat.Status == domain.SeatHeld {
+		if slices.Contains(bookingIDs, s.bookingID) && s.seat.Status == domain.SeatHeld {
 			s.seat.Status, s.bookingID = domain.SeatAvailable, uuid.UUID{}
 			tx.state.seats[k] = s
 			n++
@@ -239,13 +246,33 @@ func (tx *memTx) LockForUser(_ context.Context, id, userID uuid.UUID) (domain.Bo
 	return domain.Booking{ID: b.ID, UserID: b.UserID, Showtime: domain.ShowtimeRef{ID: b.Showtime.ID}, Status: b.Status}, nil
 }
 
-func (tx *memTx) SetStatus(_ context.Context, id uuid.UUID, from, to domain.BookingStatus) error {
-	tx.record("set status %s", to)
-	b := tx.state.bookings[id]
-	if b.Status != from {
-		return fmt.Errorf("booking %s is no longer %s", id, from)
+// LockExpired returns the pending bookings whose hold ended at or before the fake clock. The fake runs one
+// transaction at a time, so there is nothing to skip.
+func (tx *memTx) LockExpired(_ context.Context, limit int) ([]uuid.UUID, error) {
+	tx.record("lock expired bookings")
+	var due []domain.Booking
+	for _, b := range tx.state.bookings {
+		if b.Status == domain.BookingPending && !b.ExpiresAt.After(tx.db.now) {
+			due = append(due, b)
+		}
 	}
-	b.Status = to
-	tx.state.bookings[id] = b
+	slices.SortFunc(due, func(a, b domain.Booking) int { return a.ExpiresAt.Compare(b.ExpiresAt) })
+	ids := make([]uuid.UUID, 0, min(limit, len(due)))
+	for _, b := range due[:min(limit, len(due))] {
+		ids = append(ids, b.ID)
+	}
+	return ids, nil
+}
+
+func (tx *memTx) SetStatus(_ context.Context, from, to domain.BookingStatus, ids ...uuid.UUID) error {
+	tx.record("set status %s", to)
+	for _, id := range ids {
+		b := tx.state.bookings[id]
+		if b.Status != from {
+			return fmt.Errorf("booking %s is no longer %s", id, from)
+		}
+		b.Status = to
+		tx.state.bookings[id] = b
+	}
 	return nil
 }

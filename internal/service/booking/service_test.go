@@ -272,7 +272,7 @@ func TestCancelReleasesSeats(t *testing.T) {
 			t.Errorf("seat %d = %+v, want available", id, s)
 		}
 	}
-	want := []string{"lock booking", "lock seats of booking", "release seats", "set status canceled"}
+	want := []string{"lock booking", "lock seats of 1 bookings", "release seats", "set status canceled"}
 	if !slices.Equal(db.calls, want) {
 		t.Errorf("calls = %q, want %q (booking locked before its seats)", db.calls, want)
 	}
@@ -333,5 +333,106 @@ func TestCancelRejectsOtherUsersAndInconsistentReleases(t *testing.T) {
 	}
 	if got, _ := db.booking(b.ID); got.Status != domain.BookingPending || db.seat(1, 1).seat.Status != domain.SeatHeld {
 		t.Error("the failed cancel was not rolled back")
+	}
+}
+
+func TestExpireBatchExpiresDueBookingsEarliestFirst(t *testing.T) {
+	t.Parallel()
+	svc, db := newTestService(t)
+	ctx := t.Context()
+	cat := uuid.NewV7()
+
+	create := func(user uuid.UUID, seats ...int64) domain.Booking {
+		t.Helper()
+		b, err := svc.Create(ctx, user, domain.NewBooking{ShowtimeID: 1, SeatIDs: seats})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	first := create(ann, 1, 2) // due at +15m
+	db.advance(time.Minute)
+	second := create(bob, 3) // due at +16m
+	db.advance(time.Minute)
+	notDue := create(cat, 4) // due at +17m
+	db.advance(holdTTL - time.Minute)
+
+	// The clock is at +16m: the first two are due, the second exactly at its deadline. A batch of one takes the
+	// earliest deadline.
+	batch, err := svc.ExpireBatch(ctx, 1)
+	if err != nil {
+		t.Fatalf("ExpireBatch: %v", err)
+	}
+	if !slices.Equal(batch.BookingIDs, []uuid.UUID{first.ID}) || batch.Seats != 2 {
+		t.Errorf("first batch = %+v, want ann's booking with 2 seats", batch)
+	}
+	want := []string{"lock expired bookings", "lock seats of 1 bookings", "release seats", "set status expired"}
+	if !slices.Equal(db.calls, want) {
+		t.Errorf("calls = %q, want %q (bookings locked before their seats)", db.calls, want)
+	}
+
+	batch, err = svc.ExpireBatch(ctx, 10)
+	if err != nil || !slices.Equal(batch.BookingIDs, []uuid.UUID{second.ID}) || batch.Seats != 1 {
+		t.Errorf("second batch = %+v, %v; want bob's booking with 1 seat", batch, err)
+	}
+	batch, err = svc.ExpireBatch(ctx, 10)
+	if err != nil || len(batch.BookingIDs) != 0 || batch.Seats != 0 {
+		t.Errorf("third batch = %+v, %v; want nothing left to expire", batch, err)
+	}
+	if !slices.Equal(db.calls, []string{"lock expired bookings"}) {
+		t.Errorf("empty batch calls = %q, want only the claim", db.calls)
+	}
+
+	for id, status := range map[uuid.UUID]domain.BookingStatus{
+		first.ID: domain.BookingExpired, second.ID: domain.BookingExpired, notDue.ID: domain.BookingPending,
+	} {
+		if got, _ := db.booking(id); got.Status != status {
+			t.Errorf("booking %s is %s, want %s", id, got.Status, status)
+		}
+	}
+	for _, id := range []int64{1, 2, 3} {
+		if s := db.seat(1, id); s.seat.Status != domain.SeatAvailable || s.bookingID != (uuid.UUID{}) {
+			t.Errorf("seat %d = %+v, want available", id, s)
+		}
+	}
+	if s := db.seat(1, 4); s.seat.Status != domain.SeatHeld || s.bookingID != notDue.ID {
+		t.Errorf("seat 4 = %+v, want still held by cat", s)
+	}
+
+	// The expired booking no longer counts as ann's active booking, and its seats can be booked again.
+	if _, err := svc.Create(ctx, ann, domain.NewBooking{ShowtimeID: 1, SeatIDs: []int64{1, 2}}); err != nil {
+		t.Errorf("booking again after expiry: %v", err)
+	}
+}
+
+func TestExpireBatchRollsBackAnInconsistentRelease(t *testing.T) {
+	t.Parallel()
+	svc, db := newTestService(t)
+	b, err := svc.Create(t.Context(), ann, domain.NewBooking{ShowtimeID: 1, SeatIDs: []int64{1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.advance(holdTTL)
+
+	db.releaseExtra = 1
+	if batch, err := svc.ExpireBatch(t.Context(), 10); err == nil || code(err) != "" || len(batch.BookingIDs) != 0 {
+		t.Errorf("ExpireBatch with a release count mismatch = %+v, %v; want an internal error", batch, err)
+	}
+	if got, _ := db.booking(b.ID); got.Status != domain.BookingPending || db.seat(1, 1).seat.Status != domain.SeatHeld {
+		t.Error("the failed batch was not rolled back")
+	}
+}
+
+func TestExpireBatchRejectsANonPositiveLimit(t *testing.T) {
+	t.Parallel()
+	svc, db := newTestService(t)
+
+	for _, limit := range []int{0, -1} {
+		if _, err := svc.ExpireBatch(t.Context(), limit); err == nil {
+			t.Errorf("ExpireBatch(%d) succeeded", limit)
+		}
+	}
+	if len(db.calls) != 0 {
+		t.Errorf("calls = %q, want none", db.calls)
 	}
 }

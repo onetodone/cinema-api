@@ -244,16 +244,43 @@ FOR NO KEY UPDATE`, id, userID).Scan(
 	return b, nil
 }
 
-func (s bookingStore) SetStatus(ctx context.Context, id uuid.UUID, from, to domain.BookingStatus) error {
+// LockExpired claims due bookings for the expiry worker. Two details let several workers run side by side:
+//   - SKIP LOCKED leaves out bookings that another transaction has locked, whether another worker or a user
+//     canceling the booking, instead of waiting for them. Concurrent workers therefore take disjoint batches,
+//     and the claim never waits for a lock, so it cannot take part in a deadlock.
+//   - Under READ COMMITTED, a row that changed after the scan found it is checked against the WHERE clause
+//     again once it is locked. A booking that was canceled in the meantime drops out of the batch.
+//
+// The status filter and the ORDER BY match the partial index bookings_expiry_idx, so a sweep reads only
+// live bookings, earliest deadline first.
+func (s bookingStore) LockExpired(ctx context.Context, limit int) ([]uuid.UUID, error) {
+	rows, err := s.q.Query(ctx, `
+SELECT id
+FROM bookings
+WHERE status = 'pending' AND expires_at <= now()
+ORDER BY expires_at
+LIMIT $1
+FOR NO KEY UPDATE SKIP LOCKED`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("lock expired bookings: %w", err)
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[uuid.UUID])
+	if err != nil {
+		return nil, fmt.Errorf("lock expired bookings: %w", err)
+	}
+	return ids, nil
+}
+
+func (s bookingStore) SetStatus(ctx context.Context, from, to domain.BookingStatus, ids ...uuid.UUID) error {
 	tag, err := s.q.Exec(ctx, `
 UPDATE bookings
 SET status = $3::booking_status, updated_at = now()
-WHERE id = $1 AND status = $2::booking_status`, id, string(from), string(to))
+WHERE id = ANY($1::uuid[]) AND status = $2::booking_status`, ids, string(from), string(to))
 	if err != nil {
-		return fmt.Errorf("set status of booking %s to %s: %w", id, to, err)
+		return fmt.Errorf("set status of %d bookings to %s: %w", len(ids), to, err)
 	}
-	if tag.RowsAffected() != 1 {
-		return fmt.Errorf("set status of booking %s to %s: the booking is no longer %s", id, to, from)
+	if n := tag.RowsAffected(); n != int64(len(ids)) {
+		return fmt.Errorf("set status of %d bookings to %s: only %d were still %s", len(ids), to, n, from)
 	}
 	return nil
 }

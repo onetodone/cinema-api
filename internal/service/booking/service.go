@@ -1,4 +1,4 @@
-// Package booking implements seat holds: creating, reading, listing, and canceling bookings.
+// Package booking implements seat holds: creating, reading, listing, canceling, and expiring bookings.
 package booking
 
 import (
@@ -207,19 +207,74 @@ func (s *Service) Cancel(ctx context.Context, userID, id uuid.UUID) error {
 				"booking %s is %s and can no longer be canceled", id, b.Status)
 		}
 
-		seats, err := r.Seats().LockByBooking(ctx, id)
-		if err != nil {
+		if _, err := releaseSeats(ctx, r, id); err != nil {
 			return err
 		}
-		released, err := r.Seats().Release(ctx, id)
-		if err != nil {
-			return err
-		}
-		if released != int64(len(seats)) {
-			return fmt.Errorf("release seats of booking %s: %d of %d seats changed", id, released, len(seats))
-		}
-		return r.Bookings().SetStatus(ctx, id, b.Status, domain.BookingCanceled)
+		return r.Bookings().SetStatus(ctx, b.Status, domain.BookingCanceled, id)
 	})
+}
+
+// ExpiredBatch reports what one ExpireBatch call changed.
+type ExpiredBatch struct {
+	BookingIDs []uuid.UUID // the expired bookings, earliest deadline first
+	Seats      int64       // seats made available again
+}
+
+// ExpireBatch expires up to limit pending bookings whose hold has run out, judged by the database clock, and
+// makes their seats available again, all in one transaction. A batch with fewer than limit bookings means
+// that no more were due when it ran.
+//
+// Any number of callers may run at once, in one process or in several. Each locks the bookings it takes and
+// skips those locked by someone else, so every booking is expired exactly once and callers never wait for
+// each other. A booking that its owner is canceling at that moment is skipped as well; if it is still pending
+// afterwards, a later batch takes it.
+//
+// Bookings with a payment in progress are left alone.
+func (s *Service) ExpireBatch(ctx context.Context, limit int) (ExpiredBatch, error) {
+	if limit < 1 {
+		return ExpiredBatch{}, fmt.Errorf("expire bookings: limit must be positive, got %d", limit)
+	}
+
+	var batch ExpiredBatch
+	err := s.uow.Do(ctx, func(ctx context.Context, r TxRepos) error {
+		batch = ExpiredBatch{} // a retried attempt starts from scratch
+		// Lock order: the bookings first, then their seats.
+		ids, err := r.Bookings().LockExpired(ctx, limit)
+		if err != nil || len(ids) == 0 {
+			return err
+		}
+		released, err := releaseSeats(ctx, r, ids...)
+		if err != nil {
+			return err
+		}
+		if err := r.Bookings().SetStatus(ctx, domain.BookingPending, domain.BookingExpired, ids...); err != nil {
+			return err
+		}
+		batch = ExpiredBatch{BookingIDs: ids, Seats: released}
+		return nil
+	})
+	if err != nil {
+		return ExpiredBatch{}, err
+	}
+	return batch, nil
+}
+
+// releaseSeats locks the seats of bookings whose rows the caller has locked, makes them available, and returns
+// how many were released. Every seat of an unpaid booking is held, so a count that differs from the locked
+// seats means the inventory is inconsistent, and the transaction must not commit.
+func releaseSeats(ctx context.Context, r TxRepos, bookingIDs ...uuid.UUID) (int64, error) {
+	seats, err := r.Seats().LockByBookings(ctx, bookingIDs...)
+	if err != nil {
+		return 0, err
+	}
+	released, err := r.Seats().Release(ctx, bookingIDs...)
+	if err != nil {
+		return 0, err
+	}
+	if released != int64(len(seats)) {
+		return 0, fmt.Errorf("release seats: %d of %d locked seats changed", released, len(seats))
+	}
+	return released, nil
 }
 
 func (s *Service) localize(b domain.Booking) domain.Booking {

@@ -40,14 +40,15 @@ type SeatRepo interface {
 	// status, in that order. Seats that are not part of the showtime are missing from the result. A lock that
 	// is not granted within the lock timeout fails with SEAT_BUSY.
 	LockOrdered(ctx context.Context, showtimeID int64, seatIDs []int64) ([]domain.ShowtimeSeat, error)
-	// LockByBooking locks the seats a booking holds or bought, in (showtime_id, seat_id) order.
-	LockByBooking(ctx context.Context, bookingID uuid.UUID) ([]domain.ShowtimeSeat, error)
+	// LockByBookings locks the seats the given bookings hold or bought, in (showtime_id, seat_id) order across
+	// all of them.
+	LockByBookings(ctx context.Context, bookingIDs ...uuid.UUID) ([]domain.ShowtimeSeat, error)
 	// Hold marks available seats as held by a booking and returns how many changed. Seats that are not
 	// available are left alone.
 	Hold(ctx context.Context, showtimeID int64, seatIDs []int64, bookingID uuid.UUID) (int64, error)
-	// Release makes the seats a booking holds available again and returns how many changed. Sold seats are
-	// left alone.
-	Release(ctx context.Context, bookingID uuid.UUID) (int64, error)
+	// Release makes the seats the given bookings hold available again and returns how many changed. Sold seats
+	// are left alone.
+	Release(ctx context.Context, bookingIDs ...uuid.UUID) (int64, error)
 }
 
 // Repo reads and changes bookings inside a transaction.
@@ -61,8 +62,13 @@ type Repo interface {
 	// otherwise, and with BOOKING_BUSY when the lock is not granted within the lock timeout. Only the
 	// booking's own columns are loaded: Showtime has just its ID, and Seats is empty.
 	LockForUser(ctx context.Context, id, userID uuid.UUID) (domain.Booking, error)
-	// SetStatus changes a booking's status from `from` to `to`. It fails if the booking is not in status `from`.
-	SetStatus(ctx context.Context, id uuid.UUID, from, to domain.BookingStatus) error
+	// LockExpired locks up to limit pending bookings whose hold has run out by the database clock, earliest
+	// deadline first, and returns their ids. Bookings that another transaction has locked are skipped instead
+	// of waited for, so concurrent callers take disjoint sets and never block each other.
+	LockExpired(ctx context.Context, limit int) ([]uuid.UUID, error)
+	// SetStatus changes the status of the given bookings from `from` to `to`. It fails unless every one of
+	// them was in status `from`.
+	SetStatus(ctx context.Context, from, to domain.BookingStatus, ids ...uuid.UUID) error
 }
 
 // Reader reads bookings without a transaction. It is implemented by repository/postgres.Bookings.
