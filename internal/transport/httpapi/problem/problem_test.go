@@ -44,6 +44,20 @@ func TestFromErrorMapsDomainKinds(t *testing.T) {
 			detail: "at most 10 seats",
 		},
 		{
+			name:   "unauthenticated",
+			err:    domain.Unauthenticated(domain.CodeInvalidCredentials, "wrong email or password"),
+			status: http.StatusUnauthorized,
+			code:   domain.CodeInvalidCredentials,
+			detail: "wrong email or password",
+		},
+		{
+			name:   "forbidden",
+			err:    domain.Forbidden(domain.CodeForbidden, "admins only"),
+			status: http.StatusForbidden,
+			code:   domain.CodeForbidden,
+			detail: "admins only",
+		},
+		{
 			name:   "unknown error is hidden",
 			err:    errors.New("pq: password authentication failed for user postgres"),
 			status: http.StatusInternalServerError,
@@ -130,5 +144,50 @@ func TestWriteKeepsExplicitInstance(t *testing.T) {
 	}
 	if body.RequestID != "" {
 		t.Errorf("request_id = %q, want it omitted without the middleware", body.RequestID)
+	}
+}
+
+func TestFromErrorListsValidationFields(t *testing.T) {
+	t.Parallel()
+
+	var v domain.Violations
+	v.Add("email", "is required")
+	v.Add("password", "must be at least %d characters", 8)
+
+	p := FromError(fmt.Errorf("register: %w", v.Err()))
+	if p.Status != http.StatusBadRequest || p.Code != CodeValidationFailed {
+		t.Fatalf("got %d %s, want 400 %s", p.Status, p.Code, CodeValidationFailed)
+	}
+	want := []FieldError{
+		{Field: "email", Message: "is required"},
+		{Field: "password", Message: "must be at least 8 characters"},
+	}
+	if fmt.Sprint(p.Errors) != fmt.Sprint(want) {
+		t.Errorf("errors = %v, want %v", p.Errors, want)
+	}
+}
+
+func TestWriteAddsBearerChallengeTo401(t *testing.T) {
+	t.Parallel()
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/auth/login", nil)
+
+	rec := httptest.NewRecorder()
+	Write(rec, req, New(http.StatusUnauthorized, domain.CodeInvalidCredentials, ""))
+	if got := rec.Header().Get("WWW-Authenticate"); got != BearerChallenge {
+		t.Errorf("WWW-Authenticate = %q, want %q", got, BearerChallenge)
+	}
+
+	rec = httptest.NewRecorder()
+	rec.Header().Set("WWW-Authenticate", BearerChallenge+`, error="invalid_token"`)
+	Write(rec, req, New(http.StatusUnauthorized, domain.CodeInvalidToken, ""))
+	if got := rec.Header().Get("WWW-Authenticate"); got != BearerChallenge+`, error="invalid_token"` {
+		t.Errorf("a specific challenge was replaced: WWW-Authenticate = %q", got)
+	}
+
+	rec = httptest.NewRecorder()
+	Write(rec, req, New(http.StatusForbidden, domain.CodeForbidden, ""))
+	if got := rec.Header().Get("WWW-Authenticate"); got != "" {
+		t.Errorf("a 403 got WWW-Authenticate %q", got)
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/onetodone/cinema-api/internal/domain"
 	"github.com/onetodone/cinema-api/internal/transport/httpapi/handler"
 	"github.com/onetodone/cinema-api/internal/transport/httpapi/middleware"
 	"github.com/onetodone/cinema-api/internal/transport/httpapi/problem"
@@ -15,22 +16,40 @@ import (
 // RouterDeps holds everything the router needs to build its handlers.
 type RouterDeps struct {
 	Logger  *slog.Logger
+	Tokens  middleware.TokenVerifier
 	Health  *handler.Health
 	Catalog *handler.Catalog
+	Auth    *handler.Auth
+	Admin   *handler.Admin
 }
 
 // NewRouter registers all routes and wraps them in the shared middleware stack.
 func NewRouter(d RouterDeps) http.Handler {
 	mux := http.NewServeMux()
 
+	// Access levels. Routes registered with mux.HandleFunc directly are public.
+	authenticate := middleware.Authenticate(d.Tokens, d.Logger)
+	user := func(h http.HandlerFunc) http.Handler {
+		return middleware.Chain(h, authenticate)
+	}
+	admin := func(h http.HandlerFunc) http.Handler {
+		return middleware.Chain(h, authenticate, middleware.RequireRole(domain.RoleAdmin))
+	}
+
 	mux.HandleFunc("GET /healthz", d.Health.Live)
 	mux.HandleFunc("GET /readyz", d.Health.Ready)
+
+	mux.HandleFunc("POST /v1/auth/register", d.Auth.Register)
+	mux.HandleFunc("POST /v1/auth/login", d.Auth.Login)
+	mux.Handle("GET /v1/me", user(d.Auth.Me))
 
 	mux.HandleFunc("GET /v1/movies", d.Catalog.ListMovies)
 	mux.HandleFunc("GET /v1/movies/{movieID}", d.Catalog.GetMovie)
 	mux.HandleFunc("GET /v1/showtimes", d.Catalog.Schedule)
 	mux.HandleFunc("GET /v1/showtimes/{showtimeID}", d.Catalog.GetShowtime)
 	mux.HandleFunc("GET /v1/showtimes/{showtimeID}/seats", d.Catalog.SeatMap)
+
+	mux.Handle("POST /v1/admin/movies", admin(d.Admin.CreateMovie))
 
 	// Order matters: RequestID is outermost so every log line carries the ID, and Recover is innermost so that a
 	// recovered panic is still logged by AccessLog with its 500 status.

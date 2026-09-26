@@ -49,6 +49,37 @@ func TestLoadAppliesDefaults(t *testing.T) {
 	if cfg.Cinema.Location.String() != "UTC" || cfg.Cinema.Currency != "USD" {
 		t.Errorf("Cinema = %v/%q, want UTC/USD", cfg.Cinema.Location, cfg.Cinema.Currency)
 	}
+	if cfg.Auth.JWTSecret != "" || cfg.Auth.JWTTTL != time.Hour || cfg.Auth.BcryptCost != 12 {
+		t.Errorf("Auth secret/ttl/cost = %q/%s/%d, want empty/1h/12",
+			cfg.Auth.JWTSecret, cfg.Auth.JWTTTL, cfg.Auth.BcryptCost)
+	}
+	if cfg.Auth.AdminEmail != "admin@cinema.local" || cfg.Auth.AdminPassword != "" {
+		t.Errorf("Auth admin = %q/%q, want admin@cinema.local and no password",
+			cfg.Auth.AdminEmail, cfg.Auth.AdminPassword)
+	}
+}
+
+func TestLoadReadsAuthSettings(t *testing.T) {
+	t.Parallel()
+
+	secret := strings.Repeat("s", 32)
+	cfg, err := loadFrom(t, map[string]string{
+		"DATABASE_URL":   testDSN,
+		"JWT_SECRET":     secret,
+		"JWT_TTL":        "15m",
+		"BCRYPT_COST":    "10",
+		"ADMIN_EMAIL":    "root@example.com",
+		"ADMIN_PASSWORD": "long enough",
+	})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Auth.JWTSecret != secret || cfg.Auth.JWTTTL != 15*time.Minute || cfg.Auth.BcryptCost != 10 {
+		t.Errorf("Auth = %+v", cfg.Auth)
+	}
+	if cfg.Auth.AdminEmail != "root@example.com" || cfg.Auth.AdminPassword != "long enough" {
+		t.Errorf("Auth admin = %q/%q", cfg.Auth.AdminEmail, cfg.Auth.AdminPassword)
+	}
 }
 
 func TestLoadReadsCinemaTimeZone(t *testing.T) {
@@ -165,6 +196,31 @@ func TestLoadRejectsInvalidInput(t *testing.T) {
 			name:    "lowercase currency",
 			vars:    map[string]string{"DATABASE_URL": testDSN, "CINEMA_CURRENCY": "usd"},
 			wantErr: "CINEMA_CURRENCY",
+		},
+		{
+			name:    "short jwt secret",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "JWT_SECRET": "change-me"},
+			wantErr: "JWT_SECRET must be at least 32 bytes, got 9",
+		},
+		{
+			name:    "zero jwt ttl",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "JWT_TTL": "0s"},
+			wantErr: "JWT_TTL",
+		},
+		{
+			name:    "jwt ttl above a day",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "JWT_TTL": "25h"},
+			wantErr: "JWT_TTL",
+		},
+		{
+			name:    "weak bcrypt cost",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "BCRYPT_COST": "4"},
+			wantErr: "BCRYPT_COST must be between 10 and 14, got 4",
+		},
+		{
+			name:    "slow bcrypt cost",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "BCRYPT_COST": "15"},
+			wantErr: "BCRYPT_COST",
 		},
 		{
 			name:    "unknown log level",

@@ -6,10 +6,13 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
+	"uuid"
 
 	"github.com/onetodone/cinema-api/internal/domain"
+	"github.com/onetodone/cinema-api/internal/service/auth"
 	"github.com/onetodone/cinema-api/internal/service/catalog"
 	"github.com/onetodone/cinema-api/internal/transport/httpapi/handler"
 	"github.com/onetodone/cinema-api/internal/transport/httpapi/middleware"
@@ -39,22 +42,78 @@ func (emptyCatalog) SeatMap(context.Context, int64) (catalog.SeatMap, error) {
 	return catalog.SeatMap{}, nil
 }
 
+// oneUser knows a single account and accepts any password for it.
+type oneUser struct{ user domain.User }
+
+func (o oneUser) Register(context.Context, string, string) (domain.User, error) {
+	return o.user, nil
+}
+
+func (o oneUser) Authenticate(context.Context, string, string) (domain.User, error) {
+	return o.user, nil
+}
+
+func (o oneUser) User(context.Context, uuid.UUID) (domain.User, error) {
+	return o.user, nil
+}
+
+// echoAdmin creates every movie with id 1.
+type echoAdmin struct{}
+
+func (echoAdmin) CreateMovie(_ context.Context, m domain.NewMovie) (domain.Movie, error) {
+	return domain.Movie{ID: 1, Title: m.Title, DurationMin: m.DurationMin}, nil
+}
+
+var testTokens = func() *auth.Tokens {
+	t, err := auth.NewTokens(strings.Repeat("k", auth.MinSecretBytes), time.Hour)
+	if err != nil {
+		panic(err)
+	}
+	return t
+}()
+
 func newTestRouter() http.Handler {
 	logger := slog.New(slog.DiscardHandler)
+	user := domain.User{ID: uuid.NewV7(), Email: "ann@example.com", Role: domain.RoleCustomer}
 	return NewRouter(RouterDeps{
 		Logger: logger,
+		Tokens: testTokens,
 		Health: handler.NewHealth(logger, time.Second,
 			handler.Check{Name: "postgres", Critical: true, Probe: func(context.Context) error { return nil }},
 		),
 		Catalog: handler.NewCatalog(emptyCatalog{}, "USD", logger),
+		Auth:    handler.NewAuth(oneUser{user: user}, testTokens, logger),
+		Admin:   handler.NewAdmin(echoAdmin{}, logger),
 	})
 }
 
 func serve(t *testing.T, router http.Handler, method, target string) *httptest.ResponseRecorder {
 	t.Helper()
+	return serveAs(t, router, method, target, "", "")
+}
+
+// serveAs sends a request with an optional bearer token and JSON body.
+func serveAs(t *testing.T, router http.Handler, method, target, token, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequestWithContext(t.Context(), method, target, strings.NewReader(body))
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), method, target, nil))
+	router.ServeHTTP(rec, req)
 	return rec
+}
+
+func tokenFor(t *testing.T, role domain.Role) string {
+	t.Helper()
+	tok, err := testTokens.Issue(domain.Principal{UserID: uuid.NewV7(), Role: role})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tok.Token
 }
 
 func TestRouterServesRegisteredRoutes(t *testing.T) {
@@ -136,5 +195,64 @@ func TestRouterPassesThroughCanonicalRedirects(t *testing.T) {
 	isRedirect := rec.Code >= http.StatusMultipleChoices && rec.Code < http.StatusBadRequest
 	if !isRedirect || rec.Header().Get("Location") != "/v1/movies" {
 		t.Errorf("got %d Location=%q, want a redirect to /v1/movies", rec.Code, rec.Header().Get("Location"))
+	}
+}
+
+func TestRouterEnforcesAccessLevels(t *testing.T) {
+	t.Parallel()
+
+	router := newTestRouter()
+	customer, admin := tokenFor(t, domain.RoleCustomer), tokenFor(t, domain.RoleAdmin)
+	credentials := `{"email":"ann@example.com","password":"correct horse"}`
+	movie := `{"title":"Dune","duration_min":155}`
+
+	tests := []struct {
+		name   string
+		method string
+		path   string
+		token  string
+		body   string
+		status int
+	}{
+		{name: "register is public", method: http.MethodPost, path: "/v1/auth/register", body: credentials, status: http.StatusCreated},
+		{name: "login is public", method: http.MethodPost, path: "/v1/auth/login", body: credentials, status: http.StatusOK},
+		{name: "catalog is public", method: http.MethodGet, path: "/v1/movies", status: http.StatusOK},
+		{name: "me needs a token", method: http.MethodGet, path: "/v1/me", status: http.StatusUnauthorized},
+		{name: "me rejects a forged token", method: http.MethodGet, path: "/v1/me", token: "forged", status: http.StatusUnauthorized},
+		{name: "me for a customer", method: http.MethodGet, path: "/v1/me", token: customer, status: http.StatusOK},
+		{name: "me for an admin", method: http.MethodGet, path: "/v1/me", token: admin, status: http.StatusOK},
+		{name: "admin route needs a token", method: http.MethodPost, path: "/v1/admin/movies", body: movie, status: http.StatusUnauthorized},
+		{name: "admin route refuses customers", method: http.MethodPost, path: "/v1/admin/movies", token: customer, body: movie, status: http.StatusForbidden},
+		{name: "admin route for an admin", method: http.MethodPost, path: "/v1/admin/movies", token: admin, body: movie, status: http.StatusCreated},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			rec := serveAs(t, router, tt.method, tt.path, tt.token, tt.body)
+			if rec.Code != tt.status {
+				t.Errorf("status = %d, want %d (body %s)", rec.Code, tt.status, rec.Body.String())
+			}
+			if rec.Code == http.StatusUnauthorized && rec.Header().Get("WWW-Authenticate") == "" {
+				t.Error("401 without a WWW-Authenticate challenge")
+			}
+		})
+	}
+}
+
+func TestRouterLoginTokenOpensProtectedRoutes(t *testing.T) {
+	t.Parallel()
+
+	router := newTestRouter()
+	rec := serveAs(t, router, http.MethodPost, "/v1/auth/login", "", `{"email":"ann@example.com","password":"x"}`)
+	var body struct {
+		AccessToken string `json:"access_token"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || body.AccessToken == "" {
+		t.Fatalf("login: %d %s", rec.Code, rec.Body.String())
+	}
+
+	if rec := serveAs(t, router, http.MethodGet, "/v1/me", body.AccessToken, ""); rec.Code != http.StatusOK {
+		t.Errorf("GET /v1/me with the login token: status = %d, body %s", rec.Code, rec.Body.String())
 	}
 }

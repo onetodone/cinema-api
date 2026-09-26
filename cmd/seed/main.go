@@ -1,7 +1,10 @@
-// Command seed fills the database with demo movies, halls, and showtimes.
+// Command seed fills the database with demo movies, halls, and showtimes, and sets up the admin account.
 //
-// It refuses to run on a database that already has movies, unless -reset is given. -reset truncates the catalog
-// and every booking and payment that depends on it; users are kept.
+// The admin account comes from ADMIN_EMAIL and ADMIN_PASSWORD. It is created, or promoted and given the
+// configured password, on every run; without ADMIN_PASSWORD it is skipped.
+//
+// The catalog is only seeded into a database without movies, unless -reset is given. -reset truncates the
+// catalog and every booking and payment that depends on it; users are kept.
 package main
 
 import (
@@ -20,6 +23,7 @@ import (
 	"github.com/onetodone/cinema-api/internal/platform/pgpool"
 	"github.com/onetodone/cinema-api/internal/repository/postgres"
 	"github.com/onetodone/cinema-api/internal/seed"
+	"github.com/onetodone/cinema-api/internal/service/auth"
 )
 
 func main() {
@@ -50,6 +54,10 @@ func run() error {
 	}
 	defer pool.Close()
 
+	if err := ensureAdmin(ctx, pool, cfg.Auth); err != nil {
+		return err
+	}
+
 	if *reset {
 		if err := resetCatalog(ctx, pool); err != nil {
 			return err
@@ -79,6 +87,30 @@ func run() error {
 	fmt.Printf("seeded %d movies, %d halls (%d seats), %d showtimes over %d days in %s (%s)\n",
 		stats.Movies, stats.Halls, stats.Seats, stats.Showtimes, *days, cfg.Cinema.Location,
 		time.Since(start).Round(time.Millisecond))
+	return nil
+}
+
+// ensureAdmin creates or updates the admin account from the configuration.
+func ensureAdmin(ctx context.Context, pool *pgxpool.Pool, cfg config.AuthConfig) error {
+	if cfg.AdminPassword == "" {
+		fmt.Println("ADMIN_PASSWORD is not set; skipping the admin account")
+		return nil
+	}
+
+	svc, err := auth.New(postgres.NewUsers(pool), cfg.BcryptCost)
+	if err != nil {
+		return err
+	}
+	user, created, err := svc.EnsureAdmin(ctx, cfg.AdminEmail, cfg.AdminPassword)
+	if err != nil {
+		return fmt.Errorf("admin account from ADMIN_EMAIL and ADMIN_PASSWORD: %w", err)
+	}
+
+	action := "updated (role admin, password reset)"
+	if created {
+		action = "created"
+	}
+	fmt.Printf("admin account %s %s\n", user.Email, action)
 	return nil
 }
 

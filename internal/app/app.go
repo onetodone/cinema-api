@@ -17,6 +17,8 @@ import (
 	"github.com/onetodone/cinema-api/internal/platform/pgpool"
 	"github.com/onetodone/cinema-api/internal/platform/redisclient"
 	"github.com/onetodone/cinema-api/internal/repository/postgres"
+	"github.com/onetodone/cinema-api/internal/service/admin"
+	"github.com/onetodone/cinema-api/internal/service/auth"
 	"github.com/onetodone/cinema-api/internal/service/catalog"
 	"github.com/onetodone/cinema-api/internal/transport/httpapi"
 	"github.com/onetodone/cinema-api/internal/transport/httpapi/handler"
@@ -41,9 +43,21 @@ type API struct {
 // PostgreSQL must be reachable, because it is the source of truth. Redis may be down: the API starts anyway
 // and keeps working correctly in fail-open mode.
 func NewAPI(ctx context.Context, cfg config.Config, logger *slog.Logger) (*API, error) {
+	// Checked before connecting, so a missing secret fails fast. Only the API needs it, which is why the
+	// shared config does not require it.
+	tokens, err := auth.NewTokens(cfg.Auth.JWTSecret, cfg.Auth.JWTTTL)
+	if err != nil {
+		return nil, fmt.Errorf("JWT_SECRET: %w", err)
+	}
+
 	db, err := pgpool.New(ctx, cfg.DB, appName)
 	if err != nil {
 		return nil, err
+	}
+	authSvc, err := auth.New(postgres.NewUsers(db), cfg.Auth.BcryptCost)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("BCRYPT_COST: %w", err)
 	}
 
 	rdb := redisclient.New(cfg.Redis, appName)
@@ -61,12 +75,16 @@ func NewAPI(ctx context.Context, cfg config.Config, logger *slog.Logger) (*API, 
 		}},
 	)
 
-	catalogSvc := catalog.New(postgres.NewCatalog(db), cfg.Cinema.Location)
+	catalogRepo := postgres.NewCatalog(db)
+	catalogSvc := catalog.New(catalogRepo, cfg.Cinema.Location)
 
 	router := httpapi.NewRouter(httpapi.RouterDeps{
 		Logger:  logger,
+		Tokens:  tokens,
 		Health:  health,
 		Catalog: handler.NewCatalog(catalogSvc, cfg.Cinema.Currency, logger),
+		Auth:    handler.NewAuth(authSvc, tokens, logger),
+		Admin:   handler.NewAdmin(admin.New(catalogRepo), logger),
 	})
 
 	server := &http.Server{

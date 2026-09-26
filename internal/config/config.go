@@ -19,6 +19,30 @@ type Config struct {
 	Redis  RedisConfig
 	Log    LogConfig
 	Cinema CinemaConfig
+	Auth   AuthConfig
+}
+
+// Limits for authentication settings.
+const (
+	// minJWTSecretBytes is the smallest HS256 key RFC 7518 §3.2 allows: as long as the hash output.
+	minJWTSecretBytes = 32
+	maxJWTTTL         = 24 * time.Hour
+	minBcryptCost     = 10 // OWASP minimum
+	maxBcryptCost     = 14 // about 0.7 s per hash on the development machine; more would make logins a DoS vector
+)
+
+// AuthConfig configures accounts and access tokens.
+type AuthConfig struct {
+	// JWTSecret signs access tokens (HS256). Only the API needs it, so it is checked where tokens are built;
+	// here it is only rejected when it is set but too short.
+	JWTSecret string        `env:"JWT_SECRET"`
+	JWTTTL    time.Duration `env:"JWT_TTL"     envDefault:"1h"`
+	// BcryptCost is the work factor of password hashes. Each step doubles the time of a login.
+	BcryptCost int `env:"BCRYPT_COST" envDefault:"12"`
+	// AdminEmail and AdminPassword describe the admin account that cmd/seed creates or updates.
+	// Without a password the seed skips the admin account.
+	AdminEmail    string `env:"ADMIN_EMAIL"    envDefault:"admin@cinema.local"`
+	AdminPassword string `env:"ADMIN_PASSWORD"`
 }
 
 // CinemaConfig describes the cinema itself.
@@ -170,6 +194,17 @@ func (c Config) Validate() error {
 	}
 	if c.Log.Format != "json" && c.Log.Format != "text" {
 		errs = append(errs, fmt.Errorf("LOG_FORMAT must be %q or %q, got %q", "json", "text", c.Log.Format))
+	}
+	if c.Auth.JWTSecret != "" && len(c.Auth.JWTSecret) < minJWTSecretBytes {
+		errs = append(errs, fmt.Errorf("JWT_SECRET must be at least %d bytes, got %d",
+			minJWTSecretBytes, len(c.Auth.JWTSecret)))
+	}
+	if c.Auth.JWTTTL <= 0 || c.Auth.JWTTTL > maxJWTTTL {
+		errs = append(errs, fmt.Errorf("JWT_TTL must be positive and at most %s, got %s", maxJWTTTL, c.Auth.JWTTTL))
+	}
+	if c.Auth.BcryptCost < minBcryptCost || c.Auth.BcryptCost > maxBcryptCost {
+		errs = append(errs, fmt.Errorf("BCRYPT_COST must be between %d and %d, got %d",
+			minBcryptCost, maxBcryptCost, c.Auth.BcryptCost))
 	}
 	if !isCurrencyCode(c.Cinema.Currency) {
 		errs = append(errs, fmt.Errorf("CINEMA_CURRENCY must be a 3-letter uppercase ISO 4217 code, got %q",
