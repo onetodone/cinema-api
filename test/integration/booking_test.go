@@ -23,7 +23,10 @@ import (
 	"github.com/onetodone/cinema-api/internal/service/booking"
 )
 
-const testHoldTTL = 15 * time.Minute
+const (
+	testHoldTTL      = 15 * time.Minute
+	testHoldClaimTTL = 15 * time.Second
+)
 
 // Payment settings of the tests. The local provider's tok_slow takes testSlowDelay, and a charge without an
 // answer is given up after testPaymentTimeout.
@@ -52,12 +55,22 @@ func testProviders(t *testing.T) (*payment.Registry, *scriptedProvider) {
 }
 
 // newBookingService builds the booking service on pool the way internal/app does, with the test settings.
-func newBookingService(pool *pgxpool.Pool, lockTimeout time.Duration, providers *payment.Registry, logger *slog.Logger) *booking.Service {
+func newBookingService(pool *pgxpool.Pool, lockTimeout time.Duration, providers *payment.Registry, logger *slog.Logger,
+	opts ...booking.Option,
+) *booking.Service {
 	return booking.New(postgres.NewUnitOfWork(pool, lockTimeout, logger), postgres.NewBookings(pool), providers,
 		booking.Config{
-			Location: time.UTC, Currency: "USD", HoldTTL: testHoldTTL, MaxSeats: 10,
+			Location: time.UTC, Currency: "USD", HoldTTL: testHoldTTL, MaxSeats: 10, HoldClaimTTL: testHoldClaimTTL,
 			PaymentTimeout: testPaymentTimeout, PaymentGrace: testPaymentGrace,
-		}, logger)
+		}, logger, opts...)
+}
+
+// withRedis wires the hold gate and the seat map cache of env into a booking service, as the API does.
+func withRedis(env *redisEnv) []booking.Option {
+	return []booking.Option{
+		booking.WithHoldGate(env.store.HoldGate()),
+		booking.WithSeatMapCache(env.store.CatalogCache(testSeatMapTTL, testScheduleTTL)),
+	}
 }
 
 // bookingEnv is the fixture catalog with the booking service on top of the real repositories.
@@ -71,14 +84,14 @@ type bookingEnv struct {
 	seats    map[string]int64  // seat ids of Hall 1 by label, such as "A1" and "AA1"
 }
 
-func newBookingEnv(t *testing.T, lockTimeout time.Duration) *bookingEnv {
+func newBookingEnv(t *testing.T, lockTimeout time.Duration, opts ...booking.Option) *bookingEnv {
 	t.Helper()
 	f := newFixture(t)
-	return newBookingEnvOn(t, f, f.pool, lockTimeout)
+	return newBookingEnvOn(t, f, f.pool, lockTimeout, opts...)
 }
 
 // newBookingEnvOn builds the booking service on pool, which must reach the fixture's database.
-func newBookingEnvOn(t *testing.T, f *fixture, pool *pgxpool.Pool, lockTimeout time.Duration) *bookingEnv {
+func newBookingEnvOn(t *testing.T, f *fixture, pool *pgxpool.Pool, lockTimeout time.Duration, opts ...booking.Option) *bookingEnv {
 	t.Helper()
 	logs := &logRecorder{}
 	providers, scripted := testProviders(t)
@@ -86,7 +99,7 @@ func newBookingEnvOn(t *testing.T, f *fixture, pool *pgxpool.Pool, lockTimeout t
 		fixture:  f,
 		uow:      postgres.NewUnitOfWork(pool, lockTimeout, slog.New(logs)),
 		logs:     logs,
-		svc:      newBookingService(pool, lockTimeout, providers, slog.New(logs)),
+		svc:      newBookingService(pool, lockTimeout, providers, slog.New(logs), opts...),
 		scripted: scripted,
 		st:       f.showtime(t, f.dune, f.hall, base),
 		seats:    seatIDsByLabel(t, f.pool, f.hall.ID),

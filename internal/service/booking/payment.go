@@ -91,6 +91,7 @@ func (s *Service) Pay(ctx context.Context, userID, bookingID uuid.UUID, np domai
 		if err != nil {
 			return PayResult{}, err
 		}
+		s.keepSoldSeatsClaimed(ctx, b)
 		return PayResult{Payment: settled, Booking: s.localize(b)}, nil
 	case charge.Status == payment.ChargeSucceeded:
 		// Charged, but the worker had settled the payment as not charged before this call could record the
@@ -102,6 +103,21 @@ func (s *Service) Pay(ctx context.Context, userID, bookingID uuid.UUID, np domai
 		return PayResult{}, fmt.Errorf("pay %s: provider %s answered the charge with status %q",
 			p.ID, p.Provider, charge.Status)
 	}
+}
+
+// keepSoldSeatsClaimed extends the hold gate's claim on the seats of a paid booking until the showtime starts, so
+// that the gate keeps turning requests for them away. Booking a started showtime fails before any seat is locked,
+// so the claim is not needed after that. A booking that was paid only after its deadline has no claim left, and
+// the database answers for its seats.
+func (s *Service) keepSoldSeatsClaimed(ctx context.Context, b domain.Booking) {
+	if s.gate == nil {
+		return
+	}
+	seatIDs := make([]int64, len(b.Seats))
+	for i, seat := range b.Seats {
+		seatIDs[i] = seat.SeatID
+	}
+	_ = s.gate.ExtendUntil(ctx, b.Showtime.ID, seatIDs, b.ID, b.Showtime.StartsAt) // on failure, the claim expires at the deadline
 }
 
 // startPayment is step 1 of Pay: it moves a payable booking to processing and records a pending payment.
@@ -210,11 +226,13 @@ func (s *Service) settle(ctx context.Context, p domain.Payment, out domain.Payme
 	defer cancel()
 
 	var (
-		settled domain.Payment
-		changed bool
+		settled  domain.Payment
+		changed  bool
+		affected domain.Booking        // the booking, if this call sold or released its seats
+		released []domain.ShowtimeSeat // the seats this call released
 	)
 	err := s.uow.Do(ctx, func(ctx context.Context, r TxRepos) error {
-		changed = false // a retried attempt starts from scratch
+		changed, affected, released = false, domain.Booking{}, nil // a retried attempt starts from scratch
 		// Lock order: the booking first, then its seats. The booking lock also guards its payments.
 		b, holdOver, err := r.Bookings().Lock(ctx, p.BookingID)
 		if err != nil {
@@ -234,7 +252,7 @@ func (s *Service) settle(ctx context.Context, p domain.Payment, out domain.Payme
 			err = sellSeats(ctx, r, b.ID)
 		case holdOver:
 			next = domain.BookingExpired
-			_, err = releaseSeats(ctx, r, b.ID)
+			released, err = releaseSeats(ctx, r, b.ID)
 		}
 		if err != nil {
 			return err
@@ -247,10 +265,17 @@ func (s *Service) settle(ctx context.Context, p domain.Payment, out domain.Payme
 			return err
 		}
 		changed = true
+		if next != domain.BookingPending {
+			affected = b
+		}
 		return nil
 	})
 	if err != nil {
 		return domain.Payment{}, false, err
+	}
+	if affected.ID != (uuid.UUID{}) {
+		s.releaseClaims(ctx, []domain.Booking{affected}, released)
+		s.seatsChanged(ctx, affected.Showtime.ID)
 	}
 	return settled, changed, nil
 }

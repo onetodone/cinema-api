@@ -230,7 +230,7 @@ func (tx *memTx) LockOrdered(_ context.Context, showtimeID int64, seatIDs []int6
 	var out []domain.ShowtimeSeat
 	for _, id := range seatIDs {
 		if s, ok := tx.state.seats[seatKey{showtimeID, id}]; ok {
-			out = append(out, s.seat)
+			out = append(out, s.locked())
 		}
 	}
 	slices.SortFunc(out, func(a, b domain.ShowtimeSeat) int { return cmp.Compare(a.SeatID, b.SeatID) })
@@ -242,10 +242,17 @@ func (tx *memTx) LockByBookings(_ context.Context, bookingIDs ...uuid.UUID) ([]d
 	var out []domain.ShowtimeSeat
 	for _, s := range tx.state.seats {
 		if slices.Contains(bookingIDs, s.bookingID) {
-			out = append(out, s.seat)
+			out = append(out, s.locked())
 		}
 	}
 	return out, nil
+}
+
+// locked returns the seat as the locking reads of the repository do: with its holder.
+func (s memSeat) locked() domain.ShowtimeSeat {
+	seat := s.seat
+	seat.BookingID = s.bookingID
+	return seat
 }
 
 func (tx *memTx) Hold(_ context.Context, showtimeID int64, seatIDs []int64, bookingID uuid.UUID) (int64, error) {
@@ -330,20 +337,16 @@ func (*memTx) ownColumns(b domain.Booking) domain.Booking {
 
 // LockExpired returns the pending bookings whose hold ended at or before the fake clock. The fake runs one
 // transaction at a time, so there is nothing to skip.
-func (tx *memTx) LockExpired(_ context.Context, limit int) ([]uuid.UUID, error) {
+func (tx *memTx) LockExpired(_ context.Context, limit int) ([]domain.Booking, error) {
 	tx.record("lock expired bookings")
 	var due []domain.Booking
 	for _, b := range tx.state.bookings {
 		if b.Status == domain.BookingPending && !b.ExpiresAt.After(tx.db.now) {
-			due = append(due, b)
+			due = append(due, tx.ownColumns(b))
 		}
 	}
 	slices.SortFunc(due, func(a, b domain.Booking) int { return a.ExpiresAt.Compare(b.ExpiresAt) })
-	ids := make([]uuid.UUID, 0, min(limit, len(due)))
-	for _, b := range due[:min(limit, len(due))] {
-		ids = append(ids, b.ID)
-	}
-	return ids, nil
+	return due[:min(limit, len(due))], nil
 }
 
 func (tx *memTx) SetStatus(_ context.Context, from, to domain.BookingStatus, ids ...uuid.UUID) error {

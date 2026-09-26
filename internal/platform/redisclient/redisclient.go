@@ -2,6 +2,10 @@
 package redisclient
 
 import (
+	"context"
+	"fmt"
+	"log/slog"
+
 	"github.com/redis/go-redis/v9"
 
 	"github.com/onetodone/cinema-api/internal/config"
@@ -21,4 +25,22 @@ func New(cfg config.RedisConfig, clientName string) *redis.Client {
 		MaxRetries:    cfg.MaxRetries,
 		ClientName:    clientName,
 	})
+}
+
+// UseLogger sends the internal log lines of go-redis to logger at debug level. Without it, go-redis writes an
+// unstructured line to stderr for every failed dial, which during an outage is one per request. The Redis
+// adapters report failures themselves, counted in a metric and logged at most once per interval.
+//
+// go-redis has one logger per process, so call UseLogger once at startup.
+func UseLogger(logger *slog.Logger) {
+	redis.SetLogger(slogPrinter{logger: logger.With(slog.String("component", "go-redis"))})
+}
+
+type slogPrinter struct {
+	logger *slog.Logger
+}
+
+// Printf logs at debug level. slog accepts the nil context that go-redis passes in some places.
+func (p slogPrinter) Printf(ctx context.Context, format string, v ...any) {
+	p.logger.DebugContext(ctx, fmt.Sprintf(format, v...))
 }

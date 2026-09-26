@@ -46,7 +46,9 @@ func logPaymentMethods(logger *slog.Logger, providers *payment.Registry) {
 }
 
 // newBookingService builds the booking use cases on db, the same way for the API and the worker.
-func newBookingService(db *pgxpool.Pool, cfg config.Config, providers *payment.Registry, logger *slog.Logger) *booking.Service {
+func newBookingService(db *pgxpool.Pool, cfg config.Config, providers *payment.Registry, logger *slog.Logger,
+	opts ...booking.Option,
+) *booking.Service {
 	return booking.New(
 		postgres.NewUnitOfWork(db, cfg.DB.LockTimeout, logger),
 		postgres.NewBookings(db),
@@ -56,9 +58,11 @@ func newBookingService(db *pgxpool.Pool, cfg config.Config, providers *payment.R
 			Currency:       cfg.Cinema.Currency,
 			HoldTTL:        cfg.Booking.HoldTTL,
 			MaxSeats:       cfg.Booking.MaxSeats,
+			HoldClaimTTL:   cfg.Booking.HoldClaimTTL,
 			PaymentTimeout: cfg.Payment.Timeout,
 			PaymentGrace:   cfg.Payment.Grace,
 		},
 		logger,
+		opts...,
 	)
 }

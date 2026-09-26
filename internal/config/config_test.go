@@ -2,6 +2,8 @@ package config
 
 import (
 	"log/slog"
+	"net/netip"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -69,6 +71,50 @@ func TestLoadAppliesDefaults(t *testing.T) {
 	}
 	if cfg.Reconciler.Interval != 30*time.Second {
 		t.Errorf("Reconciler interval = %s, want 30s", cfg.Reconciler.Interval)
+	}
+	if cfg.Redis.KeyPrefix != "cinema" || cfg.Booking.HoldClaimTTL != 15*time.Second {
+		t.Errorf("Redis key prefix/hold claim TTL = %q/%s, want cinema/15s", cfg.Redis.KeyPrefix, cfg.Booking.HoldClaimTTL)
+	}
+	if cfg.Cache.SeatMapTTL != 5*time.Second || cfg.Cache.ScheduleTTL != 10*time.Second {
+		t.Errorf("Cache = %+v, want 5s/10s", cfg.Cache)
+	}
+	if want := (RateLimitConfig{BookingPerMin: 20, AuthIPPerMin: 30, LoginEmailPerMin: 10}); cfg.RateLimit != want {
+		t.Errorf("RateLimit = %+v, want %+v", cfg.RateLimit, want)
+	}
+	if len(cfg.HTTP.TrustedProxies) != 0 {
+		t.Errorf("HTTP.TrustedProxies = %v, want none", cfg.HTTP.TrustedProxies)
+	}
+}
+
+func TestLoadReadsRedisLayerSettings(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := loadFrom(t, map[string]string{
+		"DATABASE_URL":                   testDSN,
+		"REDIS_KEY_PREFIX":               "staging:cinema",
+		"HOLD_CLAIM_TTL":                 "4s",
+		"SEATMAP_CACHE_TTL":              "0s",
+		"SCHEDULE_CACHE_TTL":             "1m",
+		"BOOKING_RATE_LIMIT_PER_MIN":     "0",
+		"AUTH_IP_RATE_LIMIT_PER_MIN":     "100",
+		"LOGIN_EMAIL_RATE_LIMIT_PER_MIN": "5",
+		"HTTP_TRUSTED_PROXIES":           "10.0.0.0/8,2001:db8::/32",
+	})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Redis.KeyPrefix != "staging:cinema" || cfg.Booking.HoldClaimTTL != 4*time.Second {
+		t.Errorf("Redis key prefix/hold claim TTL = %q/%s", cfg.Redis.KeyPrefix, cfg.Booking.HoldClaimTTL)
+	}
+	if cfg.Cache.SeatMapTTL != 0 || cfg.Cache.ScheduleTTL != time.Minute {
+		t.Errorf("Cache = %+v", cfg.Cache)
+	}
+	if want := (RateLimitConfig{BookingPerMin: 0, AuthIPPerMin: 100, LoginEmailPerMin: 5}); cfg.RateLimit != want {
+		t.Errorf("RateLimit = %+v, want %+v", cfg.RateLimit, want)
+	}
+	want := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8"), netip.MustParsePrefix("2001:db8::/32")}
+	if !slices.Equal(cfg.HTTP.TrustedProxies, want) {
+		t.Errorf("HTTP.TrustedProxies = %v, want %v", cfg.HTTP.TrustedProxies, want)
 	}
 }
 
@@ -362,6 +408,61 @@ func TestLoadRejectsInvalidInput(t *testing.T) {
 			name:    "unknown log level",
 			vars:    map[string]string{"DATABASE_URL": testDSN, "LOG_LEVEL": "loud"},
 			wantErr: "LOG_LEVEL",
+		},
+		{
+			name:    "redis key prefix with a space",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "REDIS_KEY_PREFIX": "my cinema"},
+			wantErr: "REDIS_KEY_PREFIX",
+		},
+		{
+			name:    "redis key prefix with a hash tag",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "REDIS_KEY_PREFIX": "cinema{1}"},
+			wantErr: `REDIS_KEY_PREFIX must be 1 to 64 letters, digits, or any of _ . - :, got "cinema{1}"`,
+		},
+		{
+			name:    "hold claim not longer than the lock timeout",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "HOLD_CLAIM_TTL": "3s"},
+			wantErr: "HOLD_CLAIM_TTL must be longer than DB_LOCK_TIMEOUT (3s) and at most 1m0s, got 3s",
+		},
+		{
+			name:    "hold claim above a minute",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "HOLD_CLAIM_TTL": "61s"},
+			wantErr: "HOLD_CLAIM_TTL",
+		},
+		{
+			name:    "negative seat map cache ttl",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "SEATMAP_CACHE_TTL": "-1s"},
+			wantErr: "SEATMAP_CACHE_TTL must be 0 (off) or between 1ms and 1m0s, got -1s",
+		},
+		{
+			name:    "sub-millisecond seat map cache ttl",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "SEATMAP_CACHE_TTL": "10us"},
+			wantErr: "SEATMAP_CACHE_TTL",
+		},
+		{
+			name:    "schedule cache ttl above a minute",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "SCHEDULE_CACHE_TTL": "2m"},
+			wantErr: "SCHEDULE_CACHE_TTL",
+		},
+		{
+			name:    "negative booking rate limit",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "BOOKING_RATE_LIMIT_PER_MIN": "-1"},
+			wantErr: "BOOKING_RATE_LIMIT_PER_MIN must be between 0 (off) and 10000, got -1",
+		},
+		{
+			name:    "huge auth rate limit",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "AUTH_IP_RATE_LIMIT_PER_MIN": "10001"},
+			wantErr: "AUTH_IP_RATE_LIMIT_PER_MIN",
+		},
+		{
+			name:    "negative login rate limit",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "LOGIN_EMAIL_RATE_LIMIT_PER_MIN": "-5"},
+			wantErr: "LOGIN_EMAIL_RATE_LIMIT_PER_MIN",
+		},
+		{
+			name:    "trusted proxy without a prefix length",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "HTTP_TRUSTED_PROXIES": "10.0.0.1"},
+			wantErr: "HTTP_TRUSTED_PROXIES",
 		},
 	}
 

@@ -14,20 +14,26 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/onetodone/cinema-api/internal/config"
+	"github.com/onetodone/cinema-api/internal/platform/metrics"
 	"github.com/onetodone/cinema-api/internal/platform/pgpool"
 	"github.com/onetodone/cinema-api/internal/platform/redisclient"
 	"github.com/onetodone/cinema-api/internal/repository/postgres"
+	redisrepo "github.com/onetodone/cinema-api/internal/repository/redis"
 	"github.com/onetodone/cinema-api/internal/service/admin"
 	"github.com/onetodone/cinema-api/internal/service/auth"
+	"github.com/onetodone/cinema-api/internal/service/booking"
 	"github.com/onetodone/cinema-api/internal/service/catalog"
 	"github.com/onetodone/cinema-api/internal/transport/httpapi"
 	"github.com/onetodone/cinema-api/internal/transport/httpapi/handler"
+	"github.com/onetodone/cinema-api/internal/transport/httpapi/middleware"
 )
 
 const (
 	appName          = "cinema-api"
 	readinessTimeout = 2 * time.Second
 	redisPingTimeout = 2 * time.Second
+	// rateLimitWindow is the window of every *_RATE_LIMIT_PER_MIN setting.
+	rateLimitWindow = time.Minute
 )
 
 // API is the HTTP API process with its external resources.
@@ -60,13 +66,7 @@ func NewAPI(ctx context.Context, cfg config.Config, logger *slog.Logger) (*API, 
 		return nil, fmt.Errorf("BCRYPT_COST: %w", err)
 	}
 
-	rdb := redisclient.New(cfg.Redis, appName)
-	pingCtx, cancel := context.WithTimeout(ctx, redisPingTimeout)
-	defer cancel()
-	if err := rdb.Ping(pingCtx).Err(); err != nil {
-		logger.WarnContext(ctx, "redis is unavailable at startup; continuing in fail-open mode",
-			slog.String("addr", cfg.Redis.Addr), slog.Any("error", err))
-	}
+	rdb := newRedis(ctx, cfg.Redis, appName, logger)
 
 	health := handler.NewHealth(logger, readinessTimeout,
 		handler.Check{Name: "postgres", Critical: true, Probe: db.Ping},
@@ -82,9 +82,15 @@ func NewAPI(ctx context.Context, cfg config.Config, logger *slog.Logger) (*API, 
 	}
 	logPaymentMethods(logger, providers)
 
+	registry := metrics.NewRegistry()
+	m := metrics.New(registry)
+	store := redisrepo.New(rdb, cfg.Redis.KeyPrefix, m, logger)
+	catalogCache := store.CatalogCache(cfg.Cache.SeatMapTTL, cfg.Cache.ScheduleTTL)
+
 	catalogRepo := postgres.NewCatalog(db)
-	catalogSvc := catalog.New(catalogRepo, cfg.Cinema.Location)
-	bookingSvc := newBookingService(db, cfg, providers, logger)
+	catalogSvc := catalog.New(catalogRepo, cfg.Cinema.Location, catalog.WithCache(catalogCache))
+	bookingSvc := newBookingService(db, cfg, providers, logger,
+		booking.WithHoldGate(store.HoldGate()), booking.WithSeatMapCache(catalogCache))
 
 	router := httpapi.NewRouter(httpapi.RouterDeps{
 		Logger:   logger,
@@ -95,6 +101,14 @@ func NewAPI(ctx context.Context, cfg config.Config, logger *slog.Logger) (*API, 
 		Bookings: handler.NewBookings(bookingSvc, cfg.Cinema.Currency, logger),
 		Payments: handler.NewPayments(bookingSvc, providers, cfg.Cinema.Currency, logger),
 		Admin:    handler.NewAdmin(admin.New(catalogRepo), logger),
+
+		Metrics:           m,
+		MetricsHandler:    metrics.Handler(registry),
+		Idempotency:       store.Idempotency(),
+		BookingLimiter:    rateLimiter(store, "book", cfg.RateLimit.BookingPerMin),
+		AuthIPLimiter:     rateLimiter(store, "auth-ip", cfg.RateLimit.AuthIPPerMin),
+		LoginEmailLimiter: rateLimiter(store, "login-email", cfg.RateLimit.LoginEmailPerMin),
+		TrustedProxies:    cfg.HTTP.TrustedProxies,
 	})
 
 	server := &http.Server{
@@ -108,6 +122,28 @@ func NewAPI(ctx context.Context, cfg config.Config, logger *slog.Logger) (*API, 
 	}
 
 	return &API{cfg: cfg, logger: logger, db: db, redis: rdb, server: server}, nil
+}
+
+// newRedis returns a Redis client. Redis may be down at startup: the process starts anyway and works without it
+// (fail open) until it is back.
+func newRedis(ctx context.Context, cfg config.RedisConfig, clientName string, logger *slog.Logger) *redis.Client {
+	redisclient.UseLogger(logger)
+	rdb := redisclient.New(cfg, clientName)
+	pingCtx, cancel := context.WithTimeout(ctx, redisPingTimeout)
+	defer cancel()
+	if err := rdb.Ping(pingCtx).Err(); err != nil {
+		logger.WarnContext(ctx, "redis is unavailable at startup; continuing in fail-open mode",
+			slog.String("addr", cfg.Addr), slog.Any("error", err))
+	}
+	return rdb
+}
+
+// rateLimiter returns a limiter of perMinute attempts per key, or nil, which turns the limit off, for 0.
+func rateLimiter(store *redisrepo.Store, name string, perMinute int) middleware.RateLimiter {
+	if perMinute == 0 {
+		return nil
+	}
+	return store.RateLimiter(name, perMinute, rateLimitWindow)
 }
 
 // Run serves HTTP until ctx is canceled, then stops accepting connections and waits for in-flight requests

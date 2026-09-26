@@ -71,9 +71,10 @@ type Repo interface {
 	// Lock is LockForUser for a booking of any user.
 	Lock(ctx context.Context, id uuid.UUID) (b domain.Booking, holdOver bool, err error)
 	// LockExpired locks up to limit pending bookings whose hold has run out by the database clock, earliest
-	// deadline first, and returns their ids. Bookings that another transaction has locked are skipped instead
-	// of waited for, so concurrent callers take disjoint sets and never block each other.
-	LockExpired(ctx context.Context, limit int) ([]uuid.UUID, error)
+	// deadline first, and returns them with their own columns only, like Lock. Bookings that another transaction
+	// has locked are skipped instead of waited for, so concurrent callers take disjoint sets and never block each
+	// other.
+	LockExpired(ctx context.Context, limit int) ([]domain.Booking, error)
 	// SetStatus changes the status of the given bookings from `from` to `to`, and stamps the time of payment by
 	// the database clock when `to` is paid. It fails unless every one of them was in status `from`.
 	SetStatus(ctx context.Context, from, to domain.BookingStatus, ids ...uuid.UUID) error
@@ -110,4 +111,28 @@ type PaymentProviders interface {
 	// Provider returns the provider with this id whether or not it takes new payments, so a payment that is
 	// already in flight settles through the provider it started with.
 	Provider(id string) (payment.Provider, bool)
+}
+
+// HoldGate is a fast pre-check in front of the seat row locks, implemented by repository/redis.HoldGate. Its
+// claims name the booking that made them, by the booking id as token. It never decides who gets a seat: a request
+// that passes it still has to win the row locks. It only turns away requests for seats that another booking holds
+// or claims before they take a database connection and queue on a lock, which keeps the connection pool free
+// during a rush on a few seats.
+//
+// Every method may fail. The service then carries on without the gate (fail open), and the database decides alone,
+// as it always does.
+type HoldGate interface {
+	// Acquire claims the seats for token for ttl, all or nothing, and returns the seats that other tokens hold.
+	Acquire(ctx context.Context, showtimeID int64, seatIDs []int64, token uuid.UUID, ttl time.Duration) (conflicts []int64, err error)
+	// ExtendUntil keeps the seats that token holds claimed until the given time.
+	ExtendUntil(ctx context.Context, showtimeID int64, seatIDs []int64, token uuid.UUID, until time.Time) error
+	// Release frees the seats that token holds.
+	Release(ctx context.Context, showtimeID int64, seatIDs []int64, token uuid.UUID) error
+}
+
+// SeatMapCache is told after every committed change to the seats of showtimes, so that cached seat maps stop
+// showing the old state at once instead of when they expire. It is implemented by repository/redis.CatalogCache.
+// A failure leaves the cached seat maps to expire on their own.
+type SeatMapCache interface {
+	InvalidateSeatMaps(ctx context.Context, showtimeIDs ...int64) error
 }

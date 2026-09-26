@@ -191,12 +191,21 @@ func TestScheduleDefaultsToToday(t *testing.T) {
 func TestScheduleFiltersByMovie(t *testing.T) {
 	t.Parallel()
 
-	repo := &fakeRepo{}
-	if _, err := New(repo, time.UTC).Schedule(t.Context(), ScheduleQuery{MovieID: 7}); err != nil {
+	day := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	repo := &fakeRepo{showtimes: map[int64]domain.Showtime{
+		1: {ID: 1, Movie: domain.MovieSummary{ID: 7}, StartsAt: day.Add(10 * time.Hour)},
+		2: {ID: 2, Movie: domain.MovieSummary{ID: 8}, StartsAt: day.Add(11 * time.Hour)},
+	}}
+	sched, err := New(repo, time.UTC).Schedule(t.Context(), ScheduleQuery{Day: day, MovieID: 7})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if repo.listed[0].MovieID != 7 {
-		t.Errorf("movie filter = %d, want 7", repo.listed[0].MovieID)
+	// The whole day is read, so that every filter of the day can share one cache entry.
+	if repo.listed[0].MovieID != 0 {
+		t.Errorf("repository movie filter = %d, want 0 (the whole day)", repo.listed[0].MovieID)
+	}
+	if len(sched.Showtimes) != 1 || sched.Showtimes[0].ID != 1 {
+		t.Errorf("showtimes = %+v, want only showtime 1 of movie 7", sched.Showtimes)
 	}
 }
 

@@ -5,9 +5,11 @@ import (
 	"bytes"
 	"log/slog"
 	"net/http"
+	"net/netip"
 	"strconv"
 
 	"github.com/onetodone/cinema-api/internal/domain"
+	"github.com/onetodone/cinema-api/internal/platform/metrics"
 	"github.com/onetodone/cinema-api/internal/transport/httpapi/handler"
 	"github.com/onetodone/cinema-api/internal/transport/httpapi/middleware"
 	"github.com/onetodone/cinema-api/internal/transport/httpapi/problem"
@@ -23,6 +25,20 @@ type RouterDeps struct {
 	Bookings *handler.Bookings
 	Payments *handler.Payments
 	Admin    *handler.Admin
+
+	// Metrics records what the request guards do; it may be nil only when no guard is set. MetricsHandler serves
+	// GET /metrics; nil leaves the route out.
+	Metrics        *metrics.Metrics
+	MetricsHandler http.Handler
+
+	// Request guards backed by Redis. A nil store still requires a well-formed Idempotency-Key where one is
+	// required, but stores nothing; a nil limiter turns its limit off.
+	Idempotency       middleware.IdempotencyStore
+	BookingLimiter    middleware.RateLimiter // booking attempts per user
+	AuthIPLimiter     middleware.RateLimiter // login and registration attempts per client address
+	LoginEmailLimiter middleware.RateLimiter // login attempts per account email
+	// TrustedProxies are the networks whose X-Forwarded-For names the client address.
+	TrustedProxies []netip.Prefix
 }
 
 // NewRouter registers all routes and wraps them in the shared middleware stack.
@@ -31,18 +47,38 @@ func NewRouter(d RouterDeps) http.Handler {
 
 	// Access levels. Routes registered with mux.HandleFunc directly are public.
 	authenticate := middleware.Authenticate(d.Tokens, d.Logger)
-	user := func(h http.HandlerFunc) http.Handler {
-		return middleware.Chain(h, authenticate)
+	public := func(h http.HandlerFunc, mws ...middleware.Middleware) http.Handler {
+		return middleware.Chain(h, mws...)
+	}
+	user := func(h http.HandlerFunc, mws ...middleware.Middleware) http.Handler {
+		return middleware.Chain(h, append([]middleware.Middleware{authenticate}, mws...)...)
 	}
 	admin := func(h http.HandlerFunc) http.Handler {
 		return middleware.Chain(h, authenticate, middleware.RequireRole(domain.RoleAdmin))
 	}
 
+	// Request guards. Limits come first, so that a rejected attempt costs one Redis call and nothing else.
+	limit := func(name string, limiter middleware.RateLimiter, key middleware.RateKey) middleware.Middleware {
+		if limiter == nil {
+			return func(next http.Handler) http.Handler { return next }
+		}
+		return middleware.RateLimit(name, limiter, key, d.Metrics)
+	}
+	limitAuthByIP := limit(metrics.LimitAuthIP, d.AuthIPLimiter, middleware.ByClientIP(d.TrustedProxies))
+	limitLoginByEmail := limit(metrics.LimitLoginEmail, d.LoginEmailLimiter, middleware.ByEmail)
+	limitBookings := limit(metrics.LimitBooking, d.BookingLimiter, middleware.ByUser)
+	idempotent := func(required bool) middleware.Middleware {
+		return middleware.Idempotency(d.Idempotency, required, d.Metrics, d.Logger)
+	}
+
 	mux.HandleFunc("GET /healthz", d.Health.Live)
 	mux.HandleFunc("GET /readyz", d.Health.Ready)
+	if d.MetricsHandler != nil {
+		mux.Handle("GET /metrics", d.MetricsHandler)
+	}
 
-	mux.HandleFunc("POST /v1/auth/register", d.Auth.Register)
-	mux.HandleFunc("POST /v1/auth/login", d.Auth.Login)
+	mux.Handle("POST /v1/auth/register", public(d.Auth.Register, limitAuthByIP))
+	mux.Handle("POST /v1/auth/login", public(d.Auth.Login, limitAuthByIP, limitLoginByEmail))
 	mux.Handle("GET /v1/me", user(d.Auth.Me))
 
 	mux.HandleFunc("GET /v1/movies", d.Catalog.ListMovies)
@@ -51,13 +87,13 @@ func NewRouter(d RouterDeps) http.Handler {
 	mux.HandleFunc("GET /v1/showtimes/{showtimeID}", d.Catalog.GetShowtime)
 	mux.HandleFunc("GET /v1/showtimes/{showtimeID}/seats", d.Catalog.SeatMap)
 
-	mux.Handle("POST /v1/bookings", user(d.Bookings.Create))
+	mux.Handle("POST /v1/bookings", user(d.Bookings.Create, limitBookings, idempotent(false)))
 	mux.Handle("GET /v1/bookings", user(d.Bookings.List))
 	mux.Handle("GET /v1/bookings/{bookingID}", user(d.Bookings.Get))
 	mux.Handle("DELETE /v1/bookings/{bookingID}", user(d.Bookings.Cancel))
 
 	mux.HandleFunc("GET /v1/payment-methods", d.Payments.ListMethods)
-	mux.Handle("POST /v1/bookings/{bookingID}/payments", user(d.Payments.Pay))
+	mux.Handle("POST /v1/bookings/{bookingID}/payments", user(d.Payments.Pay, idempotent(true)))
 
 	mux.Handle("POST /v1/admin/movies", admin(d.Admin.CreateMovie))
 

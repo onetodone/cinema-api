@@ -37,8 +37,8 @@ func TestPaymentAPI(t *testing.T) {
 	}
 	pay := func(token, location, method, paymentToken string) apiResponse {
 		t.Helper()
-		return api.do(http.MethodPost, location+"/payments", token,
-			map[string]string{"payment_method": method, "payment_token": paymentToken})
+		return api.doWith(http.MethodPost, location+"/payments", token,
+			map[string]string{"payment_method": method, "payment_token": paymentToken}, withKey(""))
 	}
 
 	annBooking := book(ann, "A1")

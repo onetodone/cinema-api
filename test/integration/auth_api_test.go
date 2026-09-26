@@ -26,8 +26,9 @@ import (
 
 // apiClient sends JSON requests to a test server.
 type apiClient struct {
-	t   *testing.T
-	srv *httptest.Server
+	t     *testing.T
+	srv   *httptest.Server
+	redis *redisEnv // the Redis layer of the server, if it has one
 }
 
 type apiResponse struct {
@@ -37,6 +38,12 @@ type apiResponse struct {
 }
 
 func (c apiClient) do(method, path, token string, body any) apiResponse {
+	c.t.Helper()
+	return c.doWith(method, path, token, body, nil)
+}
+
+// doWith is do with extra request headers.
+func (c apiClient) doWith(method, path, token string, body any, header http.Header) apiResponse {
 	c.t.Helper()
 	var reader io.Reader
 	if body != nil {
@@ -55,6 +62,9 @@ func (c apiClient) do(method, path, token string, body any) apiResponse {
 	}
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	for k, v := range header {
+		req.Header[k] = v
 	}
 	resp, err := c.srv.Client().Do(req)
 	if err != nil {

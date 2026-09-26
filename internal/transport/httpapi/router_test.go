@@ -11,8 +11,11 @@ import (
 	"time"
 	"uuid"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/onetodone/cinema-api/internal/domain"
 	"github.com/onetodone/cinema-api/internal/payment"
+	"github.com/onetodone/cinema-api/internal/platform/metrics"
 	"github.com/onetodone/cinema-api/internal/service/auth"
 	"github.com/onetodone/cinema-api/internal/service/booking"
 	"github.com/onetodone/cinema-api/internal/service/catalog"
@@ -109,9 +112,15 @@ var testTokens = func() *auth.Tokens {
 }()
 
 func newTestRouter() http.Handler {
+	return NewRouter(testRouterDeps())
+}
+
+// testRouterDeps returns router dependencies with fake services and no Redis guards.
+func testRouterDeps() RouterDeps {
 	logger := slog.New(slog.DiscardHandler)
 	user := domain.User{ID: uuid.NewV7(), Email: "ann@example.com", Role: domain.RoleCustomer}
-	return NewRouter(RouterDeps{
+	registry := prometheus.NewRegistry()
+	return RouterDeps{
 		Logger: logger,
 		Tokens: testTokens,
 		Health: handler.NewHealth(logger, time.Second,
@@ -122,7 +131,10 @@ func newTestRouter() http.Handler {
 		Bookings: handler.NewBookings(noBookings{}, "USD", logger),
 		Payments: handler.NewPayments(paysAll{}, localMethod{}, "USD", logger),
 		Admin:    handler.NewAdmin(echoAdmin{}, logger),
-	})
+
+		Metrics:        metrics.New(registry),
+		MetricsHandler: metrics.Handler(registry),
+	}
 }
 
 func serve(t *testing.T, router http.Handler, method, target string) *httptest.ResponseRecorder {
@@ -130,8 +142,8 @@ func serve(t *testing.T, router http.Handler, method, target string) *httptest.R
 	return serveAs(t, router, method, target, "", "")
 }
 
-// serveAs sends a request with an optional bearer token and JSON body.
-func serveAs(t *testing.T, router http.Handler, method, target, token, body string) *httptest.ResponseRecorder {
+// serveAs sends a request with an optional bearer token and JSON body, and headers given as name, value pairs.
+func serveAs(t *testing.T, router http.Handler, method, target, token, body string, header ...string) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequestWithContext(t.Context(), method, target, strings.NewReader(body))
 	if body != "" {
@@ -139,6 +151,9 @@ func serveAs(t *testing.T, router http.Handler, method, target, token, body stri
 	}
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	for i := 0; i+1 < len(header); i += 2 {
+		req.Header.Set(header[i], header[i+1])
 	}
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -163,6 +178,7 @@ func TestRouterServesRegisteredRoutes(t *testing.T) {
 		"/v1/movies", "/v1/movies/1",
 		"/v1/showtimes", "/v1/showtimes/1", "/v1/showtimes/1/seats",
 		"/v1/payment-methods",
+		"/metrics",
 	} {
 		t.Run(path, func(t *testing.T) {
 			t.Parallel()
@@ -254,6 +270,7 @@ func TestRouterEnforcesAccessLevels(t *testing.T) {
 		path   string
 		token  string
 		body   string
+		key    string // Idempotency-Key
 		status int
 	}{
 		{name: "register is public", method: http.MethodPost, path: "/v1/auth/register", body: credentials, status: http.StatusCreated},
@@ -274,7 +291,9 @@ func TestRouterEnforcesAccessLevels(t *testing.T) {
 		{name: "booking cancel for a customer", method: http.MethodDelete, path: bookingPath, token: customer, status: http.StatusNoContent},
 		{name: "payment methods are public", method: http.MethodGet, path: "/v1/payment-methods", status: http.StatusOK},
 		{name: "payment needs a token", method: http.MethodPost, path: bookingPath + "/payments", body: pay, status: http.StatusUnauthorized},
-		{name: "payment for a customer", method: http.MethodPost, path: bookingPath + "/payments", token: customer, body: pay, status: http.StatusOK},
+		{name: "payment for a customer", method: http.MethodPost, path: bookingPath + "/payments", token: customer, body: pay, key: "k1", status: http.StatusOK},
+		{name: "payment needs an idempotency key", method: http.MethodPost, path: bookingPath + "/payments", token: customer, body: pay, status: http.StatusBadRequest},
+		{name: "metrics are public", method: http.MethodGet, path: "/metrics", status: http.StatusOK},
 		{name: "admin route needs a token", method: http.MethodPost, path: "/v1/admin/movies", body: movie, status: http.StatusUnauthorized},
 		{name: "admin route refuses customers", method: http.MethodPost, path: "/v1/admin/movies", token: customer, body: movie, status: http.StatusForbidden},
 		{name: "admin route for an admin", method: http.MethodPost, path: "/v1/admin/movies", token: admin, body: movie, status: http.StatusCreated},
@@ -283,7 +302,11 @@ func TestRouterEnforcesAccessLevels(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			rec := serveAs(t, router, tt.method, tt.path, tt.token, tt.body)
+			var header []string
+			if tt.key != "" {
+				header = []string{"Idempotency-Key", tt.key}
+			}
+			rec := serveAs(t, router, tt.method, tt.path, tt.token, tt.body, header...)
 			if rec.Code != tt.status {
 				t.Errorf("status = %d, want %d (body %s)", rec.Code, tt.status, rec.Body.String())
 			}

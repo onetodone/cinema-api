@@ -5,6 +5,7 @@ package integration
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math/rand/v2"
 	"slices"
 	"sync"
@@ -13,8 +14,11 @@ import (
 	"uuid"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	goredis "github.com/redis/go-redis/v9"
 
 	"github.com/onetodone/cinema-api/internal/domain"
+	"github.com/onetodone/cinema-api/internal/platform/metrics"
+	"github.com/onetodone/cinema-api/internal/service/booking"
 )
 
 // The race tests do not call t.Parallel: they run alone, so their larger connection pool does not compete
@@ -49,12 +53,61 @@ func newPoolOf(t *testing.T, pool *pgxpool.Pool, maxConns int32) *pgxpool.Pool {
 	return p
 }
 
+// gateModes are the setups the race tests run in: PostgreSQL alone; with the Redis hold gate in front of it; and
+// with the gate pointed at an address where no Redis listens, so that every request fails open. The guarantee
+// must hold in all three.
+var gateModes = []struct {
+	name  string
+	redis func(t *testing.T) *redisEnv // nil: no gate
+}{
+	{name: "postgres only"},
+	{name: "hold gate", redis: newRedisEnv},
+	{name: "redis down", redis: newDeadRedisEnv},
+}
+
+// bookingOptions returns the booking service options of a gate mode, and the Redis of the mode, if any.
+func bookingOptions(t *testing.T, redis func(t *testing.T) *redisEnv) ([]booking.Option, *redisEnv) {
+	t.Helper()
+	if redis == nil {
+		return nil, nil
+	}
+	env := redis(t)
+	return withRedis(env), env
+}
+
 // TestBookingRaceOneSeat is the core guarantee: 200 users try to book the same seat at the same moment, and
 // exactly one of them gets it.
 func TestBookingRaceOneSeat(t *testing.T) {
-	f := newFixture(t)
-	env := newBookingEnvOn(t, f, newRacePool(t, f.pool), raceLockTimeout)
 	const contenders = 200
+	for _, mode := range gateModes {
+		t.Run(mode.name, func(t *testing.T) {
+			opts, redis := bookingOptions(t, mode.redis)
+			testBookingRaceOneSeat(t, contenders, opts...)
+
+			switch mode.name {
+			case "hold gate":
+				// The gate let the winner through and turned every other contender away before PostgreSQL.
+				if n := redis.gateRejections(); n != contenders-1 {
+					t.Errorf("hold gate rejected %v requests, want %d", n, contenders-1)
+				}
+				if n := redis.failedOpen(metrics.OpHoldAcquire); n != 0 {
+					t.Errorf("%v claims failed open with Redis up", n)
+				}
+			case "redis down":
+				if n := redis.failedOpen(metrics.OpHoldAcquire); n != contenders {
+					t.Errorf("%v claims failed open, want all %d", n, contenders)
+				}
+				if n := redis.gateRejections(); n != 0 {
+					t.Errorf("a gate without Redis rejected %v requests", n)
+				}
+			}
+		})
+	}
+}
+
+func testBookingRaceOneSeat(t *testing.T, contenders int, opts ...booking.Option) {
+	f := newFixture(t)
+	env := newBookingEnvOn(t, f, newRacePool(t, f.pool), raceLockTimeout, opts...)
 	users := newUsers(t, env.pool, contenders)
 	seat := env.seats["A1"]
 
@@ -112,10 +165,43 @@ func TestBookingRaceOneSeat(t *testing.T) {
 
 // TestBookingOverlappingMultiSeat lets many users book and cancel overlapping multi-seat sets, each listed in
 // random order, on one showtime. Without the lock order, two bookings could each lock a seat the other one
-// needs and deadlock; with it, no transaction is ever aborted, and no seat ends up in two bookings.
+// needs and deadlock; with it, no transaction is ever aborted, and no seat ends up in two bookings. With the
+// hold gate, claims are all or nothing as well, and a cancel frees them at once.
 func TestBookingOverlappingMultiSeat(t *testing.T) {
+	for _, mode := range gateModes {
+		t.Run(mode.name, func(t *testing.T) {
+			opts, redis := bookingOptions(t, mode.redis)
+			env, st, seats := testBookingOverlappingMultiSeat(t, opts...)
+			if mode.name == "hold gate" {
+				assertGateMatchesInventory(t, redis, env.pool, st.ID, seats)
+			}
+		})
+	}
+}
+
+// assertGateMatchesInventory checks that the hold gate claims exactly the seats that bookings hold or bought, each
+// for its booking: no claim leaked from a failed request or a cancel.
+func assertGateMatchesInventory(t *testing.T, redis *redisEnv, pool *pgxpool.Pool, showtimeID int64, seatIDs []int64) {
+	t.Helper()
+	states := seatStates(t, pool, showtimeID)
+	for _, id := range seatIDs {
+		claim, err := redis.client.Get(t.Context(), fmt.Sprintf("%s:hold:{%d}:%d", redis.prefix, showtimeID, id)).Result()
+		if err != nil && !errors.Is(err, goredis.Nil) {
+			t.Fatal(err)
+		}
+		var holder string
+		if s := states[id]; s.bookingID != nil {
+			holder = s.bookingID.String()
+		}
+		if claim != holder {
+			t.Errorf("seat %d: gate claim %q, database holder %q", id, claim, holder)
+		}
+	}
+}
+
+func testBookingOverlappingMultiSeat(t *testing.T, opts ...booking.Option) (*bookingEnv, domain.Showtime, []int64) {
 	f := newFixture(t)
-	env := newBookingEnvOn(t, f, newRacePool(t, f.pool), raceLockTimeout)
+	env := newBookingEnvOn(t, f, newRacePool(t, f.pool), raceLockTimeout, opts...)
 	ctx, cancel := context.WithTimeout(t.Context(), stressDeadline)
 	defer cancel()
 
@@ -252,4 +338,5 @@ WHERE b.showtime_id = $1
 	if n := countRows(t, env.pool, `SELECT count(*) FROM bookings WHERE status = 'pending'`); n > workers {
 		t.Errorf("%d pending bookings for %d users", n, workers)
 	}
+	return env, st, allSeats
 }

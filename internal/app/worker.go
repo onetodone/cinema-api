@@ -6,9 +6,14 @@ import (
 	"sync"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/onetodone/cinema-api/internal/config"
+	"github.com/onetodone/cinema-api/internal/platform/metrics"
 	"github.com/onetodone/cinema-api/internal/platform/pgpool"
+	redisrepo "github.com/onetodone/cinema-api/internal/repository/redis"
+	"github.com/onetodone/cinema-api/internal/service/booking"
 	"github.com/onetodone/cinema-api/internal/worker"
 )
 
@@ -20,11 +25,14 @@ type Worker struct {
 	cfg        config.Config
 	logger     *slog.Logger
 	db         *pgxpool.Pool
+	redis      *redis.Client
 	expirer    *worker.Expirer
 	reconciler *worker.Reconciler
 }
 
-// NewWorker connects to PostgreSQL and builds the background jobs.
+// NewWorker connects to PostgreSQL and Redis and builds the background jobs. Redis may be down: the jobs only use
+// it to release the hold gate claims of the bookings they expire and to invalidate the cached seat maps of the
+// showtimes they change. Both expire by themselves otherwise.
 func NewWorker(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Worker, error) {
 	db, err := pgpool.New(ctx, cfg.DB, workerName)
 	if err != nil {
@@ -36,13 +44,18 @@ func NewWorker(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Wo
 		db.Close()
 		return nil, err
 	}
-	bookingSvc := newBookingService(db, cfg, providers, logger)
+	rdb := newRedis(ctx, cfg.Redis, workerName, logger)
+	// The worker serves no metrics yet (Sprint 7), so they go to a registry of their own.
+	store := redisrepo.New(rdb, cfg.Redis.KeyPrefix, metrics.New(prometheus.NewRegistry()), logger)
+	bookingSvc := newBookingService(db, cfg, providers, logger,
+		booking.WithHoldGate(store.HoldGate()),
+		booking.WithSeatMapCache(store.CatalogCache(cfg.Cache.SeatMapTTL, cfg.Cache.ScheduleTTL)))
 	expirer := worker.NewExpirer(bookingSvc,
 		worker.ExpirerConfig{Interval: cfg.Expirer.Interval, BatchSize: cfg.Expirer.BatchSize}, logger)
 	reconciler := worker.NewReconciler(bookingSvc,
 		worker.ReconcilerConfig{Interval: cfg.Reconciler.Interval, BatchSize: worker.DefaultReconcileBatchSize}, logger)
 
-	return &Worker{cfg: cfg, logger: logger, db: db, expirer: expirer, reconciler: reconciler}, nil
+	return &Worker{cfg: cfg, logger: logger, db: db, redis: rdb, expirer: expirer, reconciler: reconciler}, nil
 }
 
 // Run runs the jobs side by side until ctx is canceled. Each job finishes what it is working on before Run
@@ -63,7 +76,10 @@ func (w *Worker) Run(ctx context.Context) error {
 	return nil
 }
 
-// Close releases the database pool. Call it once, after Run has returned.
+// Close releases the database pool and the Redis client. Call it once, after Run has returned.
 func (w *Worker) Close() {
 	w.db.Close()
+	if err := w.redis.Close(); err != nil {
+		w.logger.Warn("closing redis client", slog.Any("error", err))
+	}
 }

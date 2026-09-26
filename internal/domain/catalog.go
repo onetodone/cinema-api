@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"time"
 	"unicode/utf8"
+	"uuid"
 )
 
 // CleaningBuffer is the time a hall needs between two showtimes. It is part of a showtime's occupied range.
@@ -175,6 +176,9 @@ type ShowtimeSeat struct {
 	Type       SeatType
 	PriceCents int64
 	Status     SeatStatus
+	// BookingID is the booking that holds or bought the seat. Only the locking reads of the booking use cases
+	// load it; it is zero for available seats and on seat maps.
+	BookingID uuid.UUID
 }
 
 // SeatPrice returns the price of a seat of type t for a showtime with the given base price.

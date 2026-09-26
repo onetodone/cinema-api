@@ -224,23 +224,31 @@ func (s bookingStore) Lock(ctx context.Context, id uuid.UUID) (domain.Booking, b
 	return s.lock(ctx, id, nil)
 }
 
+// ownColumns selects a booking's own columns and whether its hold has run out by the database clock; scanOwn
+// reads them. Showtime gets just its ID, and Seats stays empty.
+const ownColumns = `
+SELECT id, user_id, showtime_id, status, total_cents, expires_at, paid_at, created_at, updated_at,
+       expires_at <= now()
+FROM bookings`
+
+func scanOwn(row pgx.Row) (b domain.Booking, holdOver bool, err error) {
+	var paidAt *time.Time
+	err = row.Scan(
+		&b.ID, &b.UserID, &b.Showtime.ID, &b.Status, &b.TotalCents, &b.ExpiresAt, &paidAt, &b.CreatedAt, &b.UpdatedAt,
+		&holdOver)
+	if paidAt != nil {
+		b.PaidAt = *paidAt
+	}
+	return b, holdOver, err
+}
+
 // lock locks a booking row, of userID only when it is not nil. FOR NO KEY UPDATE: the status UPDATE that
 // follows changes no key column, and this lock does not block the foreign key checks of rows that reference the
 // booking, such as its payments.
 func (s bookingStore) lock(ctx context.Context, id uuid.UUID, userID *uuid.UUID) (domain.Booking, bool, error) {
-	var (
-		b        domain.Booking
-		paidAt   *time.Time
-		holdOver bool
-	)
-	err := s.q.QueryRow(ctx, `
-SELECT id, user_id, showtime_id, status, total_cents, expires_at, paid_at, created_at, updated_at,
-       expires_at <= now()
-FROM bookings
+	b, holdOver, err := scanOwn(s.q.QueryRow(ctx, ownColumns+`
 WHERE id = $1 AND ($2::uuid IS NULL OR user_id = $2)
-FOR NO KEY UPDATE`, id, userID).Scan(
-		&b.ID, &b.UserID, &b.Showtime.ID, &b.Status, &b.TotalCents, &b.ExpiresAt, &paidAt, &b.CreatedAt, &b.UpdatedAt,
-		&holdOver)
+FOR NO KEY UPDATE`, id, userID))
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 		return domain.Booking{}, false, domain.BookingNotFound(id)
@@ -249,9 +257,6 @@ FOR NO KEY UPDATE`, id, userID).Scan(
 			"booking %s is being changed by another request; try again in a moment", id)
 	case err != nil:
 		return domain.Booking{}, false, fmt.Errorf("lock booking %s: %w", id, err)
-	}
-	if paidAt != nil {
-		b.PaidAt = *paidAt
 	}
 	return b, holdOver, nil
 }
@@ -265,10 +270,8 @@ FOR NO KEY UPDATE`, id, userID).Scan(
 //
 // The status filter and the ORDER BY match the partial index bookings_expiry_idx, so a sweep reads only
 // live bookings, earliest deadline first.
-func (s bookingStore) LockExpired(ctx context.Context, limit int) ([]uuid.UUID, error) {
-	rows, err := s.q.Query(ctx, `
-SELECT id
-FROM bookings
+func (s bookingStore) LockExpired(ctx context.Context, limit int) ([]domain.Booking, error) {
+	rows, err := s.q.Query(ctx, ownColumns+`
 WHERE status = 'pending' AND expires_at <= now()
 ORDER BY expires_at
 LIMIT $1
@@ -276,11 +279,14 @@ FOR NO KEY UPDATE SKIP LOCKED`, limit)
 	if err != nil {
 		return nil, fmt.Errorf("lock expired bookings: %w", err)
 	}
-	ids, err := pgx.CollectRows(rows, pgx.RowTo[uuid.UUID])
+	due, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (domain.Booking, error) {
+		b, _, err := scanOwn(row)
+		return b, err
+	})
 	if err != nil {
 		return nil, fmt.Errorf("lock expired bookings: %w", err)
 	}
-	return ids, nil
+	return due, nil
 }
 
 func (s bookingStore) SetStatus(ctx context.Context, from, to domain.BookingStatus, ids ...uuid.UUID) error {

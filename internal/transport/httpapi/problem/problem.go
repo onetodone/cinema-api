@@ -3,8 +3,10 @@ package problem
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/onetodone/cinema-api/internal/domain"
 	"github.com/onetodone/cinema-api/internal/transport/httpapi/render"
@@ -23,6 +25,11 @@ const (
 	CodeNotFound             = "NOT_FOUND"
 	CodeMethodNotAllowed     = "METHOD_NOT_ALLOWED"
 	CodeInternal             = "INTERNAL"
+	CodeRateLimited          = "RATE_LIMITED"
+	// CodeIdempotencyKeyReused: the Idempotency-Key was already used for a request with another body.
+	CodeIdempotencyKeyReused = "IDEMPOTENCY_KEY_REUSED"
+	// CodeIdempotencyInProgress: the first request with this Idempotency-Key has not finished yet.
+	CodeIdempotencyInProgress = "IDEMPOTENCY_IN_PROGRESS"
 )
 
 // BearerChallenge is the WWW-Authenticate challenge of this API (RFC 6750). Write adds it to every 401
@@ -85,6 +92,16 @@ func Validation(errs ...FieldError) Problem {
 // Internal returns a 500 problem without any detail about the cause.
 func Internal() Problem {
 	return New(http.StatusInternalServerError, CodeInternal, "An unexpected error occurred.")
+}
+
+// TooManyRequests returns a 429 problem whose Retry-After tells the client when its limit resets, in whole
+// seconds, rounded up.
+func TooManyRequests(retryAfter time.Duration) Problem {
+	seconds := max(1, int((retryAfter+time.Second-1)/time.Second))
+	p := New(http.StatusTooManyRequests, CodeRateLimited,
+		fmt.Sprintf("Too many attempts; try again in %d seconds.", seconds))
+	p.RetryAfter = seconds
+	return p
 }
 
 // FromError maps err to a problem. A *domain.ValidationError becomes a 400 that lists its fields. Other domain

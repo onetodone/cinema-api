@@ -21,6 +21,7 @@ var (
 
 const (
 	holdTTL        = 15 * time.Minute
+	holdClaimTTL   = 15 * time.Second
 	paymentTimeout = 10 * time.Second
 	paymentGrace   = 2 * time.Minute
 )
@@ -37,7 +38,7 @@ func newTestService(t *testing.T) (*Service, *memDB) {
 
 // newPayTestService is newTestService with the payment provider "card", whose answers the test scripts. By
 // default it charges every payment. A second provider, "old", is registered but takes no new payments.
-func newPayTestService(t *testing.T) (*Service, *memDB, *fakeProvider) {
+func newPayTestService(t *testing.T, opts ...Option) (*Service, *memDB, *fakeProvider) {
 	t.Helper()
 	db := newMemDB(testNow)
 	st := func(id int64, status domain.ShowtimeStatus) domain.ShowtimeRef {
@@ -61,10 +62,10 @@ func newPayTestService(t *testing.T) (*Service, *memDB, *fakeProvider) {
 		}
 	}
 	cfg := Config{
-		Location: cinema, Currency: "EUR", HoldTTL: holdTTL, MaxSeats: 4,
+		Location: cinema, Currency: "EUR", HoldTTL: holdTTL, MaxSeats: 4, HoldClaimTTL: holdClaimTTL,
 		PaymentTimeout: paymentTimeout, PaymentGrace: paymentGrace,
 	}
-	return New(db, db, providers, cfg, slog.New(slog.DiscardHandler)), db, card
+	return New(db, db, providers, cfg, slog.New(slog.DiscardHandler), opts...), db, card
 }
 
 func code(err error) string {

@@ -7,24 +7,51 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
+	"uuid"
 
 	"golang.org/x/crypto/bcrypt"
 
+	"github.com/onetodone/cinema-api/internal/config"
 	"github.com/onetodone/cinema-api/internal/repository/postgres"
 	"github.com/onetodone/cinema-api/internal/service/admin"
 	"github.com/onetodone/cinema-api/internal/service/auth"
 	"github.com/onetodone/cinema-api/internal/service/catalog"
 	"github.com/onetodone/cinema-api/internal/transport/httpapi"
 	"github.com/onetodone/cinema-api/internal/transport/httpapi/handler"
+	"github.com/onetodone/cinema-api/internal/transport/httpapi/middleware"
 )
 
-// newAPIServer serves the complete router over the fixture's database, wired as internal/app wires it.
+// Cache TTLs of the tests: long enough that only invalidation can make a test see a change in time.
+const (
+	testSeatMapTTL  = time.Minute
+	testScheduleTTL = time.Minute
+)
+
+// apiOptions configure newAPIServerWith.
+type apiOptions struct {
+	redis   *redisEnv              // nil: the test Redis, with a key prefix of its own
+	limits  config.RateLimitConfig // zero: no rate limits
+	trusted []netip.Prefix
+}
+
+// newAPIServer serves the complete router over the fixture's database and the test Redis, wired as internal/app
+// wires it, without rate limits.
 func newAPIServer(t *testing.T, f *fixture) apiClient {
 	t.Helper()
+	return newAPIServerWith(t, f, apiOptions{})
+}
+
+func newAPIServerWith(t *testing.T, f *fixture, opts apiOptions) apiClient {
+	t.Helper()
 	logger := slog.New(slog.DiscardHandler)
+	env := opts.redis
+	if env == nil {
+		env = newRedisEnv(t)
+	}
 
 	tokens, err := auth.NewTokens(strings.Repeat("k", auth.MinSecretBytes), time.Hour)
 	if err != nil {
@@ -35,21 +62,43 @@ func newAPIServer(t *testing.T, f *fixture) apiClient {
 		t.Fatal(err)
 	}
 	providers, _ := testProviders(t)
-	bookingSvc := newBookingService(f.pool, 3*time.Second, providers, logger)
+	cache := env.store.CatalogCache(testSeatMapTTL, testScheduleTTL)
+	bookingSvc := newBookingService(f.pool, 3*time.Second, providers, logger, withRedis(env)...)
+	limiter := func(name string, perMinute int) middleware.RateLimiter {
+		if perMinute == 0 {
+			return nil
+		}
+		return env.store.RateLimiter(name, perMinute, time.Minute)
+	}
 
 	router := httpapi.NewRouter(httpapi.RouterDeps{
 		Logger:   logger,
 		Tokens:   tokens,
 		Health:   handler.NewHealth(logger, time.Second),
-		Catalog:  handler.NewCatalog(catalog.New(f.catalog, time.UTC), "USD", logger),
+		Catalog:  handler.NewCatalog(catalog.New(f.catalog, time.UTC, catalog.WithCache(cache)), "USD", logger),
 		Auth:     handler.NewAuth(authSvc, tokens, logger),
 		Bookings: handler.NewBookings(bookingSvc, "USD", logger),
 		Payments: handler.NewPayments(bookingSvc, providers, "USD", logger),
 		Admin:    handler.NewAdmin(admin.New(f.catalog), logger),
+
+		Metrics:           env.metrics,
+		Idempotency:       env.store.Idempotency(),
+		BookingLimiter:    limiter("book", opts.limits.BookingPerMin),
+		AuthIPLimiter:     limiter("auth-ip", opts.limits.AuthIPPerMin),
+		LoginEmailLimiter: limiter("login-email", opts.limits.LoginEmailPerMin),
+		TrustedProxies:    opts.trusted,
 	})
 	srv := httptest.NewServer(router)
 	t.Cleanup(srv.Close)
-	return apiClient{t: t, srv: srv}
+	return apiClient{t: t, srv: srv, redis: env}
+}
+
+// withKey returns request headers with an Idempotency-Key, a new one if key is empty.
+func withKey(key string) http.Header {
+	if key == "" {
+		key = uuid.NewV7().String()
+	}
+	return http.Header{"Idempotency-Key": {key}}
 }
 
 // signUp registers an account and returns an access token for it.

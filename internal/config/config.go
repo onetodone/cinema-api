@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"reflect"
 	"strings"
 	"time"
@@ -24,6 +25,8 @@ type Config struct {
 	Expirer    ExpirerConfig
 	Payment    PaymentConfig
 	Reconciler ReconcilerConfig
+	Cache      CacheConfig
+	RateLimit  RateLimitConfig
 }
 
 // Limits for authentication settings.
@@ -62,6 +65,36 @@ const (
 	minReconcilerInterval = time.Second
 	maxReconcilerInterval = 10 * time.Minute
 )
+
+// Limits for the Redis layer.
+const (
+	maxHoldClaimTTL = time.Minute
+	// maxCacheTTL bounds how stale a cached seat map or schedule may be.
+	maxCacheTTL      = time.Minute
+	maxRateLimit     = 10000
+	maxKeyPrefixSize = 64
+)
+
+// CacheConfig configures the Redis read caches of the catalog. A TTL of 0 turns that cache off.
+type CacheConfig struct {
+	// SeatMapTTL is how long a seat map is served from the cache. Every committed seat change also deletes the
+	// cached seat map of its showtime, so the TTL only bounds the staleness left by a lost race or a failed delete.
+	SeatMapTTL time.Duration `env:"SEATMAP_CACHE_TTL" envDefault:"5s"`
+	// ScheduleTTL is how long the schedule of a day is served from the cache. It bounds how stale the free seat
+	// counts in the schedule may be, because bookings do not delete cached schedules.
+	ScheduleTTL time.Duration `env:"SCHEDULE_CACHE_TTL" envDefault:"10s"`
+}
+
+// RateLimitConfig configures the per-minute limits on attempts. A limit of 0 turns it off. The limits count in
+// Redis and let every request through while Redis is unavailable.
+type RateLimitConfig struct {
+	// BookingPerMin caps booking attempts per user.
+	BookingPerMin int `env:"BOOKING_RATE_LIMIT_PER_MIN" envDefault:"20"`
+	// AuthIPPerMin caps login and registration attempts per client IP address (per /64 network for IPv6).
+	AuthIPPerMin int `env:"AUTH_IP_RATE_LIMIT_PER_MIN" envDefault:"30"`
+	// LoginEmailPerMin caps login attempts per account email, whichever address they come from.
+	LoginEmailPerMin int `env:"LOGIN_EMAIL_RATE_LIMIT_PER_MIN" envDefault:"10"`
+}
 
 // PaymentConfig configures payments and the payment providers. Each provider has its own block of settings; a
 // provider that is not enabled takes no new payments, but still settles the payments it has in flight.
@@ -104,6 +137,10 @@ type BookingConfig struct {
 	HoldTTL time.Duration `env:"BOOKING_HOLD_TTL"  envDefault:"15m"`
 	// MaxSeats is the most seats one booking may hold.
 	MaxSeats int `env:"BOOKING_MAX_SEATS" envDefault:"10"`
+	// HoldClaimTTL is how long the Redis hold gate reserves seats for a booking request whose transaction has not
+	// committed yet. It must outlast the transaction's lock waits (DB_LOCK_TIMEOUT); a claim left behind by a
+	// crashed request blocks its seats for at most this long.
+	HoldClaimTTL time.Duration `env:"HOLD_CLAIM_TTL" envDefault:"15s"`
 }
 
 // AuthConfig configures accounts and access tokens.
@@ -137,6 +174,10 @@ type HTTPConfig struct {
 	WriteTimeout      time.Duration `env:"HTTP_WRITE_TIMEOUT"       envDefault:"15s"`
 	IdleTimeout       time.Duration `env:"HTTP_IDLE_TIMEOUT"        envDefault:"60s"`
 	ShutdownTimeout   time.Duration `env:"HTTP_SHUTDOWN_TIMEOUT"    envDefault:"15s"`
+	// TrustedProxies lists the networks of reverse proxies and load balancers, in CIDR notation. A request from
+	// one of them is attributed to the client address its X-Forwarded-For header names; any other request to its
+	// connection's address. Empty trusts nobody, which is right when clients connect directly.
+	TrustedProxies []netip.Prefix `env:"HTTP_TRUSTED_PROXIES" envSeparator:","`
 }
 
 // DBConfig configures the PostgreSQL connection pool.
@@ -166,6 +207,8 @@ type RedisConfig struct {
 	DialAttempts int `env:"REDIS_DIAL_ATTEMPTS" envDefault:"1"`
 	// MaxRetries: -1 disables retries. One retry covers a stale pooled connection after a Redis restart.
 	MaxRetries int `env:"REDIS_MAX_RETRIES" envDefault:"1"`
+	// KeyPrefix starts every key the application writes, so that several deployments can share one Redis.
+	KeyPrefix string `env:"REDIS_KEY_PREFIX" envDefault:"cinema"`
 }
 
 // LogConfig configures structured logging.
@@ -316,12 +359,57 @@ func (c Config) Validate() error {
 		errs = append(errs, fmt.Errorf("RECONCILER_INTERVAL must be between %s and %s, got %s",
 			minReconcilerInterval, maxReconcilerInterval, c.Reconciler.Interval))
 	}
+	if !isKeyPrefix(c.Redis.KeyPrefix) {
+		errs = append(errs, fmt.Errorf("REDIS_KEY_PREFIX must be 1 to %d letters, digits, or any of _ . - :, got %q",
+			maxKeyPrefixSize, c.Redis.KeyPrefix))
+	}
+	if c.Booking.HoldClaimTTL <= c.DB.LockTimeout || c.Booking.HoldClaimTTL > maxHoldClaimTTL {
+		errs = append(errs, fmt.Errorf("HOLD_CLAIM_TTL must be longer than DB_LOCK_TIMEOUT (%s) and at most %s, got %s",
+			c.DB.LockTimeout, maxHoldClaimTTL, c.Booking.HoldClaimTTL))
+	}
+	cacheTTLs := map[string]time.Duration{
+		"SEATMAP_CACHE_TTL":  c.Cache.SeatMapTTL,
+		"SCHEDULE_CACHE_TTL": c.Cache.ScheduleTTL,
+	}
+	for name, ttl := range cacheTTLs {
+		// Redis stores expiry times in milliseconds, so a positive TTL below 1ms would not expire at all.
+		if ttl != 0 && (ttl < time.Millisecond || ttl > maxCacheTTL) {
+			errs = append(errs, fmt.Errorf("%s must be 0 (off) or between 1ms and %s, got %s", name, maxCacheTTL, ttl))
+		}
+	}
+	rateLimits := map[string]int{
+		"BOOKING_RATE_LIMIT_PER_MIN":     c.RateLimit.BookingPerMin,
+		"AUTH_IP_RATE_LIMIT_PER_MIN":     c.RateLimit.AuthIPPerMin,
+		"LOGIN_EMAIL_RATE_LIMIT_PER_MIN": c.RateLimit.LoginEmailPerMin,
+	}
+	for name, n := range rateLimits {
+		if n < 0 || n > maxRateLimit {
+			errs = append(errs, fmt.Errorf("%s must be between 0 (off) and %d, got %d", name, maxRateLimit, n))
+		}
+	}
 	if !isCurrencyCode(c.Cinema.Currency) {
 		errs = append(errs, fmt.Errorf("CINEMA_CURRENCY must be a 3-letter uppercase ISO 4217 code, got %q",
 			c.Cinema.Currency))
 	}
 
 	return errors.Join(errs...)
+}
+
+// isKeyPrefix accepts Redis key prefixes without braces, which would change the hash slots of keys that rely on
+// a hash tag, and without spaces or other characters that make keys awkward to inspect.
+func isKeyPrefix(s string) bool {
+	if s == "" || len(s) > maxKeyPrefixSize {
+		return false
+	}
+	for _, c := range s {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case c == '_', c == '.', c == '-', c == ':':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func isCurrencyCode(s string) bool {

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/onetodone/cinema-api/internal/domain"
 	"github.com/onetodone/cinema-api/internal/transport/httpapi/requestid"
@@ -252,5 +253,23 @@ func TestWriteAddsBearerChallengeTo401(t *testing.T) {
 	Write(rec, req, New(http.StatusForbidden, domain.CodeForbidden, ""))
 	if got := rec.Header().Get("WWW-Authenticate"); got != "" {
 		t.Errorf("a 403 got WWW-Authenticate %q", got)
+	}
+}
+
+func TestTooManyRequestsRoundsRetryAfterUp(t *testing.T) {
+	t.Parallel()
+
+	for retryAfter, want := range map[time.Duration]int{
+		0:                       1,
+		time.Millisecond:        1,
+		time.Second:             1,
+		1001 * time.Millisecond: 2,
+		59*time.Second + 1:      60,
+	} {
+		p := TooManyRequests(retryAfter)
+		if p.Status != http.StatusTooManyRequests || p.Code != CodeRateLimited || p.RetryAfter != want {
+			t.Errorf("TooManyRequests(%s) = %d %s, Retry-After %d; want 429 %s, %d",
+				retryAfter, p.Status, p.Code, p.RetryAfter, CodeRateLimited, want)
+		}
 	}
 }

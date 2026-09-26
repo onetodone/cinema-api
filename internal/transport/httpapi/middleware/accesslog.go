@@ -6,8 +6,9 @@ import (
 	"time"
 )
 
-// probePaths are logged at debug level so that load-balancer health checks do not flood the logs.
-var probePaths = map[string]bool{"/healthz": true, "/readyz": true}
+// probePaths are logged at debug level so that load-balancer health checks and metric scrapes do not flood the
+// logs.
+var probePaths = map[string]bool{"/healthz": true, "/readyz": true, "/metrics": true}
 
 // AccessLog writes one structured log line per request with its route, status, size, and latency.
 // It must run inside RequestID so that the line carries the request ID.

@@ -1,9 +1,11 @@
 //go:build integration
 
-// Package integration runs repository and HTTP tests against a real PostgreSQL in a throwaway container.
+// Package integration runs repository and HTTP tests against a real PostgreSQL and Redis in throwaway
+// containers.
 //
-// One container is started per test run. Migrations are applied once to a template database, and every test
-// gets its own database cloned from that template, so tests are isolated and can run in parallel.
+// One container of each is started per test run. Migrations are applied once to a template database, and every
+// test gets its own database cloned from that template, and a Redis key prefix of its own, so tests are isolated
+// and can run in parallel.
 package integration
 
 import (
@@ -18,12 +20,14 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
+	tcredis "github.com/testcontainers/testcontainers-go/modules/redis"
 
 	"github.com/onetodone/cinema-api/internal/platform/dbmigrate"
 )
 
 const (
 	postgresImage = "postgres:18.4-alpine"
+	redisImage    = "redis:8.8-alpine"
 	templateDB    = "cinema_template"
 )
 
@@ -31,6 +35,7 @@ var (
 	baseDSN   string        // DSN of the template database; other databases differ only in the path
 	adminPool *pgxpool.Pool // connected to the "postgres" database, used to create and drop test databases
 	dbCounter atomic.Int64
+	redisAddr string // host:port of the test Redis
 )
 
 func TestMain(m *testing.M) {
@@ -63,6 +68,21 @@ func run(m *testing.M) int {
 	baseDSN, err = ctr.ConnectionString(ctx, "sslmode=disable")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "connection string: %v\n", err)
+		return 1
+	}
+
+	rctr, err := tcredis.Run(ctx, redisImage)
+	defer func() {
+		if err := testcontainers.TerminateContainer(rctr); err != nil {
+			fmt.Fprintf(os.Stderr, "terminate redis container: %v\n", err)
+		}
+	}()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "start redis container: %v\n", err)
+		return 1
+	}
+	if redisAddr, err = rctr.Endpoint(ctx, ""); err != nil {
+		fmt.Fprintf(os.Stderr, "redis endpoint: %v\n", err)
 		return 1
 	}
 

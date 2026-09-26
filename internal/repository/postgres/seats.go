@@ -24,7 +24,7 @@ type seatStore struct {
 //
 // OF ss locks only the inventory rows; the hall_seats rows are just read.
 const lockSeatsSelect = `
-SELECT ss.seat_id, hs.row_label, hs.seat_number, hs.seat_type, ss.price_cents, ss.status
+SELECT ss.seat_id, hs.row_label, hs.seat_number, hs.seat_type, ss.price_cents, ss.status, ss.booking_id
 FROM showtime_seats ss
 JOIN hall_seats hs ON hs.id = ss.seat_id
 `
@@ -54,7 +54,7 @@ func (s seatStore) lock(ctx context.Context, sql string, args ...any) ([]domain.
 	var seats []domain.ShowtimeSeat
 	rows, err := s.q.Query(ctx, sql, args...)
 	if err == nil {
-		seats, err = pgx.CollectRows(rows, scanShowtimeSeat)
+		seats, err = pgx.CollectRows(rows, scanLockedSeat)
 	}
 	if pgErrorCode(err) == sqlstateLockNotAvailable {
 		return nil, domain.Busy(domain.CodeSeatBusy,
@@ -98,6 +98,19 @@ WHERE booking_id = $1 AND status = 'held'`, bookingID)
 		return 0, fmt.Errorf("sell seats of booking %s: %w", bookingID, err)
 	}
 	return tag.RowsAffected(), nil
+}
+
+// scanLockedSeat reads a row of lockSeatsSelect: a seat with its holder.
+func scanLockedSeat(row pgx.CollectableRow) (domain.ShowtimeSeat, error) {
+	var (
+		s      domain.ShowtimeSeat
+		holder *uuid.UUID
+	)
+	err := row.Scan(&s.SeatID, &s.Row, &s.Number, &s.Type, &s.PriceCents, &s.Status, &holder)
+	if holder != nil {
+		s.BookingID = *holder
+	}
+	return s, err
 }
 
 func scanShowtimeSeat(row pgx.CollectableRow) (domain.ShowtimeSeat, error) {

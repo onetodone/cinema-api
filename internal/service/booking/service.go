@@ -25,6 +25,8 @@ type Config struct {
 	Currency string         // ISO 4217 code of all prices, sent to payment providers
 	HoldTTL  time.Duration  // how long a booking holds its seats while waiting for payment
 	MaxSeats int            // most seats one booking may hold
+	// HoldClaimTTL is how long the hold gate reserves seats for a booking whose transaction has not committed.
+	HoldClaimTTL time.Duration
 	// PaymentTimeout bounds each call to a payment provider.
 	PaymentTimeout time.Duration
 	// PaymentGrace is how long a payment may stay in flight before ReconcileBatch asks its provider about it.
@@ -39,11 +41,30 @@ type Service struct {
 	providers PaymentProviders
 	cfg       Config
 	logger    *slog.Logger
+	gate      HoldGate     // nil: no gate, the database alone turns requests for taken seats away
+	seatMaps  SeatMapCache // nil: no seat map cache to invalidate
+}
+
+// Option customizes a Service.
+type Option func(*Service)
+
+// WithHoldGate checks requested seats against g before the database locks them (see Create).
+func WithHoldGate(g HoldGate) Option {
+	return func(s *Service) { s.gate = g }
+}
+
+// WithSeatMapCache invalidates the cached seat maps of c after every committed seat change.
+func WithSeatMapCache(c SeatMapCache) Option {
+	return func(s *Service) { s.seatMaps = c }
 }
 
 // New returns a booking Service.
-func New(uow UnitOfWork, reader Reader, providers PaymentProviders, cfg Config, logger *slog.Logger) *Service {
-	return &Service{uow: uow, reader: reader, providers: providers, cfg: cfg, logger: logger}
+func New(uow UnitOfWork, reader Reader, providers PaymentProviders, cfg Config, logger *slog.Logger, opts ...Option) *Service {
+	s := &Service{uow: uow, reader: reader, providers: providers, cfg: cfg, logger: logger}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // Create holds seats of one showtime for userID until the hold expires. The request is all or nothing: if
@@ -58,17 +79,27 @@ func New(uow UnitOfWork, reader Reader, providers PaymentProviders, cfg Config, 
 // lock that every seat is available, and then flips them to held with an UPDATE that repeats the
 // status = 'available' condition. A competing transaction waits on the row locks and, once the winner has
 // committed, sees the seats as held.
+//
+// With a hold gate, the seats are claimed in the gate first. A request whose seats another booking holds or claims
+// fails with SEAT_UNAVAILABLE right there, listing the seats the gate knows to be taken, without touching the
+// database. After the transaction, the claim is extended to the booking's deadline, or released if the
+// transaction failed. When the gate cannot be reached, the request goes to the database unchecked.
 func (s *Service) Create(ctx context.Context, userID uuid.UUID, nb domain.NewBooking) (domain.Booking, error) {
 	if err := nb.Validate(s.cfg.MaxSeats); err != nil {
 		return domain.Booking{}, err
 	}
 	seatIDs := slices.Sorted(slices.Values(nb.SeatIDs))
-	// The id exists before the transaction does. Retries of the transaction reuse it, and the Redis hold gate
-	// will use it as its owner token.
+	// The id exists before the transaction does. Retries of the transaction reuse it, and the hold gate uses it
+	// as the token of its claim.
 	id := uuid.NewV7()
 
+	claimed, err := s.claimSeats(ctx, nb.ShowtimeID, seatIDs, id)
+	if err != nil {
+		return domain.Booking{}, err
+	}
+
 	var created domain.Booking
-	err := s.uow.Do(ctx, func(ctx context.Context, r TxRepos) error {
+	err = s.uow.Do(ctx, func(ctx context.Context, r TxRepos) error {
 		st, started, err := r.Showtimes().GetForBooking(ctx, nb.ShowtimeID)
 		if err != nil {
 			return err
@@ -115,10 +146,64 @@ func (s *Service) Create(ctx context.Context, userID uuid.UUID, nb domain.NewBoo
 		created = b
 		return nil
 	})
+
+	// The outcome is decided; a client that hangs up now must not leave the gate or the cache behind.
+	after := context.WithoutCancel(ctx)
 	if err != nil {
+		if claimed {
+			_ = s.gate.Release(after, nb.ShowtimeID, seatIDs, id) // on failure, the claim expires by itself
+		}
 		return domain.Booking{}, err
 	}
+	if claimed {
+		// The gate now rejects contenders for as long as the database holds the seats.
+		_ = s.gate.ExtendUntil(after, created.Showtime.ID, seatIDs, id, created.ExpiresAt)
+	}
+	s.seatsChanged(after, created.Showtime.ID)
 	return s.localize(created), nil
+}
+
+// claimSeats claims the seats in the hold gate for the booking token and reports whether it did. Seats that
+// other bookings hold or claim fail with a *domain.SeatsUnavailableError. Without a gate, or when the gate
+// fails, nothing is claimed and the database decides alone.
+func (s *Service) claimSeats(ctx context.Context, showtimeID int64, seatIDs []int64, token uuid.UUID) (bool, error) {
+	if s.gate == nil {
+		return false, nil
+	}
+	conflicts, err := s.gate.Acquire(ctx, showtimeID, seatIDs, token, s.cfg.HoldClaimTTL)
+	if len(conflicts) > 0 {
+		return false, domain.SeatsUnavailable(conflicts)
+	}
+	// A gate that failed claimed nothing, and the database decides alone: fail open. The gate recorded the failure.
+	return err == nil, nil
+}
+
+// seatsChanged invalidates the cached seat maps of showtimes whose seats a committed transaction changed.
+func (s *Service) seatsChanged(ctx context.Context, showtimeIDs ...int64) {
+	if s.seatMaps == nil || len(showtimeIDs) == 0 {
+		return
+	}
+	_ = s.seatMaps.InvalidateSeatMaps(ctx, showtimeIDs...) // on failure, the cached seat maps expire by themselves
+}
+
+// releaseClaims frees the hold gate claims of bookings whose seats a committed transaction released, as they
+// were locked: each seat carries its holder. A claim would expire at the booking's deadline by itself; releasing
+// it at once lets contenders through without waiting for that, and keeps the gate right even if the clocks of
+// Redis and the database disagree. If it fails, the gate turns contenders for those seats away until then,
+// though the seat map shows the seats available.
+func (s *Service) releaseClaims(ctx context.Context, bookings []domain.Booking, released []domain.ShowtimeSeat) {
+	if s.gate == nil {
+		return
+	}
+	seatsOf := make(map[uuid.UUID][]int64, len(bookings))
+	for _, seat := range released {
+		seatsOf[seat.BookingID] = append(seatsOf[seat.BookingID], seat.SeatID)
+	}
+	for _, b := range bookings {
+		if seatIDs := seatsOf[b.ID]; len(seatIDs) > 0 {
+			_ = s.gate.Release(ctx, b.Showtime.ID, seatIDs, b.ID) // the gate records a failure
+		}
+	}
 }
 
 // bookableSeats checks the locked seats against the requested ones and returns them in seat map order.
@@ -203,7 +288,12 @@ func (s *Service) List(ctx context.Context, userID, beforeID uuid.UUID, limit in
 // expired succeeds without changes, so a retried request gets the same answer. A booking with a payment in
 // progress, or a paid one, fails with BOOKING_NOT_CANCELABLE.
 func (s *Service) Cancel(ctx context.Context, userID, id uuid.UUID) error {
-	return s.uow.Do(ctx, func(ctx context.Context, r TxRepos) error {
+	var (
+		canceled domain.Booking
+		released []domain.ShowtimeSeat
+	)
+	err := s.uow.Do(ctx, func(ctx context.Context, r TxRepos) error {
+		released = nil // a retried attempt starts from scratch
 		// Lock order: the booking first, then its seats.
 		b, _, err := r.Bookings().LockForUser(ctx, id, userID)
 		if err != nil {
@@ -217,11 +307,24 @@ func (s *Service) Cancel(ctx context.Context, userID, id uuid.UUID) error {
 				"booking %s is %s and can no longer be canceled", id, b.Status)
 		}
 
-		if _, err := releaseSeats(ctx, r, id); err != nil {
+		seats, err := releaseSeats(ctx, r, id)
+		if err != nil {
 			return err
 		}
-		return r.Bookings().SetStatus(ctx, b.Status, domain.BookingCanceled, id)
+		if err := r.Bookings().SetStatus(ctx, b.Status, domain.BookingCanceled, id); err != nil {
+			return err
+		}
+		canceled, released = b, seats
+		return nil
 	})
+	if err != nil || len(released) == 0 {
+		return err
+	}
+
+	after := context.WithoutCancel(ctx)
+	s.releaseClaims(after, []domain.Booking{canceled}, released)
+	s.seatsChanged(after, canceled.Showtime.ID)
+	return nil
 }
 
 // ExpiredBatch reports what one ExpireBatch call changed.
@@ -245,46 +348,61 @@ func (s *Service) ExpireBatch(ctx context.Context, limit int) (ExpiredBatch, err
 		return ExpiredBatch{}, fmt.Errorf("expire bookings: limit must be positive, got %d", limit)
 	}
 
-	var batch ExpiredBatch
+	var (
+		batch     ExpiredBatch
+		due       []domain.Booking
+		released  []domain.ShowtimeSeat
+		showtimes []int64
+	)
 	err := s.uow.Do(ctx, func(ctx context.Context, r TxRepos) error {
-		batch = ExpiredBatch{} // a retried attempt starts from scratch
+		batch, showtimes = ExpiredBatch{}, nil // a retried attempt starts from scratch
 		// Lock order: the bookings first, then their seats.
-		ids, err := r.Bookings().LockExpired(ctx, limit)
-		if err != nil || len(ids) == 0 {
+		var err error
+		if due, err = r.Bookings().LockExpired(ctx, limit); err != nil || len(due) == 0 {
 			return err
 		}
-		released, err := releaseSeats(ctx, r, ids...)
-		if err != nil {
+		ids := make([]uuid.UUID, len(due))
+		for i, b := range due {
+			ids[i] = b.ID
+			if !slices.Contains(showtimes, b.Showtime.ID) {
+				showtimes = append(showtimes, b.Showtime.ID)
+			}
+		}
+		if released, err = releaseSeats(ctx, r, ids...); err != nil {
 			return err
 		}
 		if err := r.Bookings().SetStatus(ctx, domain.BookingPending, domain.BookingExpired, ids...); err != nil {
 			return err
 		}
-		batch = ExpiredBatch{BookingIDs: ids, Seats: released}
+		batch = ExpiredBatch{BookingIDs: ids, Seats: int64(len(released))}
 		return nil
 	})
 	if err != nil {
 		return ExpiredBatch{}, err
 	}
+
+	after := context.WithoutCancel(ctx)
+	s.releaseClaims(after, due, released)
+	s.seatsChanged(after, showtimes...)
 	return batch, nil
 }
 
 // releaseSeats locks the seats of bookings whose rows the caller has locked, makes them available, and returns
-// how many were released. Every seat of an unpaid booking is held, so a count that differs from the locked
-// seats means the inventory is inconsistent, and the transaction must not commit.
-func releaseSeats(ctx context.Context, r TxRepos, bookingIDs ...uuid.UUID) (int64, error) {
+// them. Every seat of an unpaid booking is held, so a count that differs from the locked seats means the
+// inventory is inconsistent, and the transaction must not commit.
+func releaseSeats(ctx context.Context, r TxRepos, bookingIDs ...uuid.UUID) ([]domain.ShowtimeSeat, error) {
 	seats, err := r.Seats().LockByBookings(ctx, bookingIDs...)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	released, err := r.Seats().Release(ctx, bookingIDs...)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	if released != int64(len(seats)) {
-		return 0, fmt.Errorf("release seats: %d of %d locked seats changed", released, len(seats))
+		return nil, fmt.Errorf("release seats: %d of %d locked seats changed", released, len(seats))
 	}
-	return released, nil
+	return seats, nil
 }
 
 func (s *Service) localize(b domain.Booking) domain.Booking {
