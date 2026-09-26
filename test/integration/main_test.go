@@ -46,6 +46,9 @@ func run(m *testing.M) int {
 		tcpostgres.WithUsername("postgres"),
 		tcpostgres.WithPassword("postgres"),
 		tcpostgres.BasicWaitStrategies(),
+		// Detect deadlocks after 100 ms instead of 1 s. The deadlock test finishes sooner, and if a change ever
+		// breaks the lock order, the concurrency tests fail within seconds instead of crawling to the timeout.
+		testcontainers.WithCmdArgs("-c", "deadlock_timeout=100ms"),
 	)
 	defer func() {
 		if err := testcontainers.TerminateContainer(ctr); err != nil {

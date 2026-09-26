@@ -19,6 +19,8 @@ func TestErrorKindsSurviveWrapping(t *testing.T) {
 		{err: Invalid("SOME_CODE", "bad"), kind: ErrInvalid},
 		{err: Unauthenticated(CodeInvalidToken, "bad token"), kind: ErrUnauthenticated},
 		{err: Forbidden(CodeForbidden, "no"), kind: ErrForbidden},
+		{err: Busy(CodeSeatBusy, "locked"), kind: ErrBusy},
+		{err: SeatsUnavailable([]int64{3}), kind: ErrConflict},
 	}
 
 	for _, tt := range tests {

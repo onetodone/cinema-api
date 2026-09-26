@@ -2,7 +2,6 @@ package handler
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"net/http"
 	"uuid"
@@ -10,7 +9,6 @@ import (
 	"github.com/onetodone/cinema-api/internal/domain"
 	"github.com/onetodone/cinema-api/internal/service/auth"
 	"github.com/onetodone/cinema-api/internal/transport/httpapi/dto"
-	"github.com/onetodone/cinema-api/internal/transport/httpapi/principal"
 	"github.com/onetodone/cinema-api/internal/transport/httpapi/render"
 )
 
@@ -77,9 +75,8 @@ func (h *Auth) Login(w http.ResponseWriter, r *http.Request) {
 
 // Me handles GET /v1/me. It must run behind the Authenticate middleware.
 func (h *Auth) Me(w http.ResponseWriter, r *http.Request) {
-	p, ok := principal.FromContext(r.Context())
+	p, ok := caller(h.logger, w, r)
 	if !ok {
-		writeError(h.logger, w, r, errors.New("GET /v1/me is routed without authentication"))
 		return
 	}
 

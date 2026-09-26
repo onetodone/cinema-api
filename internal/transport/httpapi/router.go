@@ -15,12 +15,13 @@ import (
 
 // RouterDeps holds everything the router needs to build its handlers.
 type RouterDeps struct {
-	Logger  *slog.Logger
-	Tokens  middleware.TokenVerifier
-	Health  *handler.Health
-	Catalog *handler.Catalog
-	Auth    *handler.Auth
-	Admin   *handler.Admin
+	Logger   *slog.Logger
+	Tokens   middleware.TokenVerifier
+	Health   *handler.Health
+	Catalog  *handler.Catalog
+	Auth     *handler.Auth
+	Bookings *handler.Bookings
+	Admin    *handler.Admin
 }
 
 // NewRouter registers all routes and wraps them in the shared middleware stack.
@@ -48,6 +49,11 @@ func NewRouter(d RouterDeps) http.Handler {
 	mux.HandleFunc("GET /v1/showtimes", d.Catalog.Schedule)
 	mux.HandleFunc("GET /v1/showtimes/{showtimeID}", d.Catalog.GetShowtime)
 	mux.HandleFunc("GET /v1/showtimes/{showtimeID}/seats", d.Catalog.SeatMap)
+
+	mux.Handle("POST /v1/bookings", user(d.Bookings.Create))
+	mux.Handle("GET /v1/bookings", user(d.Bookings.List))
+	mux.Handle("GET /v1/bookings/{bookingID}", user(d.Bookings.Get))
+	mux.Handle("DELETE /v1/bookings/{bookingID}", user(d.Bookings.Cancel))
 
 	mux.Handle("POST /v1/admin/movies", admin(d.Admin.CreateMovie))
 

@@ -143,11 +143,7 @@ ORDER BY length(hs.row_label), hs.row_label, hs.seat_number`, showtimeID)
 	if err != nil {
 		return nil, fmt.Errorf("list seats of showtime %d: %w", showtimeID, err)
 	}
-	seats, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (domain.ShowtimeSeat, error) {
-		var s domain.ShowtimeSeat
-		err := row.Scan(&s.SeatID, &s.Row, &s.Number, &s.Type, &s.PriceCents, &s.Status)
-		return s, err
-	})
+	seats, err := pgx.CollectRows(rows, scanShowtimeSeat)
 	if err != nil {
 		return nil, fmt.Errorf("list seats of showtime %d: %w", showtimeID, err)
 	}

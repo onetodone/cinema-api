@@ -14,12 +14,13 @@ import (
 
 // Config is the complete runtime configuration shared by all binaries.
 type Config struct {
-	HTTP   HTTPConfig
-	DB     DBConfig
-	Redis  RedisConfig
-	Log    LogConfig
-	Cinema CinemaConfig
-	Auth   AuthConfig
+	HTTP    HTTPConfig
+	DB      DBConfig
+	Redis   RedisConfig
+	Log     LogConfig
+	Cinema  CinemaConfig
+	Auth    AuthConfig
+	Booking BookingConfig
 }
 
 // Limits for authentication settings.
@@ -30,6 +31,21 @@ const (
 	minBcryptCost     = 10 // OWASP minimum
 	maxBcryptCost     = 14 // about 0.7 s per hash on the development machine; more would make logins a DoS vector
 )
+
+// Limits for booking settings.
+const (
+	minHoldTTL      = 10 * time.Second
+	maxHoldTTL      = 24 * time.Hour
+	maxSeatsCeiling = 50
+)
+
+// BookingConfig configures seat holds.
+type BookingConfig struct {
+	// HoldTTL is how long a booking holds its seats while waiting for payment.
+	HoldTTL time.Duration `env:"BOOKING_HOLD_TTL"  envDefault:"15m"`
+	// MaxSeats is the most seats one booking may hold.
+	MaxSeats int `env:"BOOKING_MAX_SEATS" envDefault:"10"`
+}
 
 // AuthConfig configures accounts and access tokens.
 type AuthConfig struct {
@@ -72,6 +88,9 @@ type DBConfig struct {
 	MaxConnLifetime time.Duration `env:"DB_MAX_CONN_LIFETIME"  envDefault:"30m"`
 	MaxConnIdleTime time.Duration `env:"DB_MAX_CONN_IDLE_TIME" envDefault:"5m"`
 	ConnectTimeout  time.Duration `env:"DB_CONNECT_TIMEOUT"    envDefault:"5s"`
+	// LockTimeout bounds how long a booking transaction waits for a row lock. It turns a pile-up on a hot seat
+	// into a quick "busy, retry" answer instead of a request that hangs until the HTTP timeout.
+	LockTimeout time.Duration `env:"DB_LOCK_TIMEOUT" envDefault:"3s"`
 }
 
 // RedisConfig configures the Redis client. Redis is a fail-open accelerator, so the defaults favor failing fast
@@ -205,6 +224,18 @@ func (c Config) Validate() error {
 	if c.Auth.BcryptCost < minBcryptCost || c.Auth.BcryptCost > maxBcryptCost {
 		errs = append(errs, fmt.Errorf("BCRYPT_COST must be between %d and %d, got %d",
 			minBcryptCost, maxBcryptCost, c.Auth.BcryptCost))
+	}
+	if c.DB.LockTimeout < time.Millisecond || c.DB.LockTimeout >= c.HTTP.WriteTimeout {
+		errs = append(errs, fmt.Errorf("DB_LOCK_TIMEOUT must be at least 1ms and shorter than HTTP_WRITE_TIMEOUT (%s), got %s",
+			c.HTTP.WriteTimeout, c.DB.LockTimeout))
+	}
+	if c.Booking.HoldTTL < minHoldTTL || c.Booking.HoldTTL > maxHoldTTL {
+		errs = append(errs, fmt.Errorf("BOOKING_HOLD_TTL must be between %s and %s, got %s",
+			minHoldTTL, maxHoldTTL, c.Booking.HoldTTL))
+	}
+	if c.Booking.MaxSeats < 1 || c.Booking.MaxSeats > maxSeatsCeiling {
+		errs = append(errs, fmt.Errorf("BOOKING_MAX_SEATS must be between 1 and %d, got %d",
+			maxSeatsCeiling, c.Booking.MaxSeats))
 	}
 	if !isCurrencyCode(c.Cinema.Currency) {
 		errs = append(errs, fmt.Errorf("CINEMA_CURRENCY must be a 3-letter uppercase ISO 4217 code, got %q",

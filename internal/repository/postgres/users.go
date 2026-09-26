@@ -7,7 +7,6 @@ import (
 	"uuid"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/onetodone/cinema-api/internal/domain"
@@ -98,6 +97,5 @@ RETURNING `+userColumns,
 
 // isUniqueViolation reports whether err is a unique violation of the named constraint or index.
 func isUniqueViolation(err error, constraint string) bool {
-	var pgErr *pgconn.PgError
-	return errors.As(err, &pgErr) && pgErr.Code == sqlstateUniqueViolation && pgErr.ConstraintName == constraint
+	return isViolation(err, sqlstateUniqueViolation, constraint)
 }

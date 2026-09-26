@@ -13,6 +13,7 @@ import (
 
 	"github.com/onetodone/cinema-api/internal/domain"
 	"github.com/onetodone/cinema-api/internal/service/auth"
+	"github.com/onetodone/cinema-api/internal/service/booking"
 	"github.com/onetodone/cinema-api/internal/service/catalog"
 	"github.com/onetodone/cinema-api/internal/transport/httpapi/handler"
 	"github.com/onetodone/cinema-api/internal/transport/httpapi/middleware"
@@ -57,6 +58,23 @@ func (o oneUser) User(context.Context, uuid.UUID) (domain.User, error) {
 	return o.user, nil
 }
 
+// noBookings holds every seat it is asked for and knows no booking.
+type noBookings struct{}
+
+func (noBookings) Create(_ context.Context, userID uuid.UUID, nb domain.NewBooking) (domain.Booking, error) {
+	return domain.Booking{ID: uuid.NewV7(), UserID: userID, Showtime: domain.ShowtimeRef{ID: nb.ShowtimeID}}, nil
+}
+
+func (noBookings) Get(_ context.Context, _, id uuid.UUID) (domain.Booking, error) {
+	return domain.Booking{}, domain.BookingNotFound(id)
+}
+
+func (noBookings) List(context.Context, uuid.UUID, uuid.UUID, int) (booking.Page, error) {
+	return booking.Page{}, nil
+}
+
+func (noBookings) Cancel(context.Context, uuid.UUID, uuid.UUID) error { return nil }
+
 // echoAdmin creates every movie with id 1.
 type echoAdmin struct{}
 
@@ -81,9 +99,10 @@ func newTestRouter() http.Handler {
 		Health: handler.NewHealth(logger, time.Second,
 			handler.Check{Name: "postgres", Critical: true, Probe: func(context.Context) error { return nil }},
 		),
-		Catalog: handler.NewCatalog(emptyCatalog{}, "USD", logger),
-		Auth:    handler.NewAuth(oneUser{user: user}, testTokens, logger),
-		Admin:   handler.NewAdmin(echoAdmin{}, logger),
+		Catalog:  handler.NewCatalog(emptyCatalog{}, "USD", logger),
+		Auth:     handler.NewAuth(oneUser{user: user}, testTokens, logger),
+		Bookings: handler.NewBookings(noBookings{}, "USD", logger),
+		Admin:    handler.NewAdmin(echoAdmin{}, logger),
 	})
 }
 
@@ -205,6 +224,8 @@ func TestRouterEnforcesAccessLevels(t *testing.T) {
 	customer, admin := tokenFor(t, domain.RoleCustomer), tokenFor(t, domain.RoleAdmin)
 	credentials := `{"email":"ann@example.com","password":"correct horse"}`
 	movie := `{"title":"Dune","duration_min":155}`
+	seats := `{"showtime_id":1,"seat_ids":[1,2]}`
+	bookingPath := "/v1/bookings/" + uuid.NewV7().String()
 
 	tests := []struct {
 		name   string
@@ -221,6 +242,15 @@ func TestRouterEnforcesAccessLevels(t *testing.T) {
 		{name: "me rejects a forged token", method: http.MethodGet, path: "/v1/me", token: "forged", status: http.StatusUnauthorized},
 		{name: "me for a customer", method: http.MethodGet, path: "/v1/me", token: customer, status: http.StatusOK},
 		{name: "me for an admin", method: http.MethodGet, path: "/v1/me", token: admin, status: http.StatusOK},
+		{name: "booking needs a token", method: http.MethodPost, path: "/v1/bookings", body: seats, status: http.StatusUnauthorized},
+		{name: "booking for a customer", method: http.MethodPost, path: "/v1/bookings", token: customer, body: seats, status: http.StatusCreated},
+		{name: "booking for an admin", method: http.MethodPost, path: "/v1/bookings", token: admin, body: seats, status: http.StatusCreated},
+		{name: "booking list needs a token", method: http.MethodGet, path: "/v1/bookings", status: http.StatusUnauthorized},
+		{name: "booking list for a customer", method: http.MethodGet, path: "/v1/bookings", token: customer, status: http.StatusOK},
+		{name: "booking read needs a token", method: http.MethodGet, path: bookingPath, status: http.StatusUnauthorized},
+		{name: "booking read for a customer", method: http.MethodGet, path: bookingPath, token: customer, status: http.StatusNotFound},
+		{name: "booking cancel needs a token", method: http.MethodDelete, path: bookingPath, status: http.StatusUnauthorized},
+		{name: "booking cancel for a customer", method: http.MethodDelete, path: bookingPath, token: customer, status: http.StatusNoContent},
 		{name: "admin route needs a token", method: http.MethodPost, path: "/v1/admin/movies", body: movie, status: http.StatusUnauthorized},
 		{name: "admin route refuses customers", method: http.MethodPost, path: "/v1/admin/movies", token: customer, body: movie, status: http.StatusForbidden},
 		{name: "admin route for an admin", method: http.MethodPost, path: "/v1/admin/movies", token: admin, body: movie, status: http.StatusCreated},

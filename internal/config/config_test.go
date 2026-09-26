@@ -57,6 +57,27 @@ func TestLoadAppliesDefaults(t *testing.T) {
 		t.Errorf("Auth admin = %q/%q, want admin@cinema.local and no password",
 			cfg.Auth.AdminEmail, cfg.Auth.AdminPassword)
 	}
+	if cfg.Booking.HoldTTL != 15*time.Minute || cfg.Booking.MaxSeats != 10 || cfg.DB.LockTimeout != 3*time.Second {
+		t.Errorf("Booking hold/max seats/lock timeout = %s/%d/%s, want 15m/10/3s",
+			cfg.Booking.HoldTTL, cfg.Booking.MaxSeats, cfg.DB.LockTimeout)
+	}
+}
+
+func TestLoadReadsBookingSettings(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := loadFrom(t, map[string]string{
+		"DATABASE_URL":      testDSN,
+		"BOOKING_HOLD_TTL":  "30s",
+		"BOOKING_MAX_SEATS": "4",
+		"DB_LOCK_TIMEOUT":   "250ms",
+	})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Booking.HoldTTL != 30*time.Second || cfg.Booking.MaxSeats != 4 || cfg.DB.LockTimeout != 250*time.Millisecond {
+		t.Errorf("Booking = %+v, lock timeout %s", cfg.Booking, cfg.DB.LockTimeout)
+	}
 }
 
 func TestLoadReadsAuthSettings(t *testing.T) {
@@ -221,6 +242,31 @@ func TestLoadRejectsInvalidInput(t *testing.T) {
 			name:    "slow bcrypt cost",
 			vars:    map[string]string{"DATABASE_URL": testDSN, "BCRYPT_COST": "15"},
 			wantErr: "BCRYPT_COST",
+		},
+		{
+			name:    "sub-millisecond lock timeout",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "DB_LOCK_TIMEOUT": "500us"},
+			wantErr: "DB_LOCK_TIMEOUT",
+		},
+		{
+			name:    "lock timeout not below the write timeout",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "DB_LOCK_TIMEOUT": "15s"},
+			wantErr: "DB_LOCK_TIMEOUT must be at least 1ms and shorter than HTTP_WRITE_TIMEOUT (15s), got 15s",
+		},
+		{
+			name:    "hold ttl too short",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "BOOKING_HOLD_TTL": "5s"},
+			wantErr: "BOOKING_HOLD_TTL",
+		},
+		{
+			name:    "hold ttl above a day",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "BOOKING_HOLD_TTL": "25h"},
+			wantErr: "BOOKING_HOLD_TTL",
+		},
+		{
+			name:    "zero max seats",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "BOOKING_MAX_SEATS": "0"},
+			wantErr: "BOOKING_MAX_SEATS must be between 1 and 50, got 0",
 		},
 		{
 			name:    "unknown log level",

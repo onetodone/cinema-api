@@ -14,6 +14,9 @@ var (
 	ErrInvalid         = errors.New("invalid")
 	ErrUnauthenticated = errors.New("unauthenticated")
 	ErrForbidden       = errors.New("forbidden")
+	// ErrBusy means another operation holds a lock on the same data. The request itself is fine and is likely
+	// to succeed when retried shortly.
+	ErrBusy = errors.New("busy")
 )
 
 // Stable, machine-readable error codes returned to API clients.
@@ -31,6 +34,15 @@ const (
 	CodeInvalidToken       = "INVALID_TOKEN"
 	CodeTokenExpired       = "TOKEN_EXPIRED"
 	CodeForbidden          = "FORBIDDEN"
+
+	CodeBookingNotFound      = "BOOKING_NOT_FOUND"
+	CodeShowtimeNotBookable  = "SHOWTIME_NOT_BOOKABLE"
+	CodeUnknownSeat          = "UNKNOWN_SEAT"
+	CodeSeatUnavailable      = "SEAT_UNAVAILABLE"
+	CodeSeatBusy             = "SEAT_BUSY"
+	CodeBookingBusy          = "BOOKING_BUSY"
+	CodeActiveBookingExists  = "ACTIVE_BOOKING_EXISTS"
+	CodeBookingNotCancelable = "BOOKING_NOT_CANCELABLE"
 )
 
 // Error is a business error. Its message is safe to show to API clients; Code is stable across releases.
@@ -68,6 +80,11 @@ func Unauthenticated(code, format string, args ...any) error {
 // Forbidden builds an ErrForbidden error: the caller is known but not allowed to do this.
 func Forbidden(code, format string, args ...any) error {
 	return &Error{Kind: ErrForbidden, Code: code, Message: fmt.Sprintf(format, args...)}
+}
+
+// Busy builds an ErrBusy error: the data is locked by a concurrent operation, and a retry will likely succeed.
+func Busy(code, format string, args ...any) error {
+	return &Error{Kind: ErrBusy, Code: code, Message: fmt.Sprintf(format, args...)}
 }
 
 // FieldError explains why one input field is invalid. Field is the API's name for it, such as "email".

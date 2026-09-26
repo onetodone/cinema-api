@@ -9,11 +9,14 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-// SQLSTATE codes this package maps to domain errors.
+// SQLSTATE codes this package maps to domain errors or retries.
 const (
-	sqlstateForeignKeyViolation = "23503"
-	sqlstateUniqueViolation     = "23505"
-	sqlstateExclusionViolation  = "23P01"
+	sqlstateForeignKeyViolation  = "23503"
+	sqlstateUniqueViolation      = "23505"
+	sqlstateExclusionViolation   = "23P01"
+	sqlstateSerializationFailure = "40001"
+	sqlstateDeadlockDetected     = "40P01"
+	sqlstateLockNotAvailable     = "55P03" // lock_timeout expired
 )
 
 // querier is satisfied by both *pgxpool.Pool and pgx.Tx, so queries can run inside or outside a transaction.
@@ -30,6 +33,12 @@ func pgErrorCode(err error) string {
 		return pgErr.Code
 	}
 	return ""
+}
+
+// isViolation reports whether err is a PostgreSQL error with the given SQLSTATE on the named constraint or index.
+func isViolation(err error, sqlstate, constraint string) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == sqlstate && pgErr.ConstraintName == constraint
 }
 
 // deref returns the string behind a nullable column, or "" for NULL.

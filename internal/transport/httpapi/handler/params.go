@@ -6,8 +6,8 @@ import (
 	"net/http"
 	"strconv"
 	"time"
+	"uuid"
 
-	"github.com/onetodone/cinema-api/internal/service/catalog"
 	"github.com/onetodone/cinema-api/internal/transport/httpapi/problem"
 )
 
@@ -39,6 +39,16 @@ func (p *params) pathID(r *http.Request, name string) int64 {
 	return id
 }
 
+// pathUUID parses a UUID path parameter.
+func (p *params) pathUUID(r *http.Request, name string) uuid.UUID {
+	id, err := uuid.Parse(r.PathValue(name))
+	if err != nil {
+		p.fail(name, "must be a UUID")
+		return uuid.UUID{}
+	}
+	return id
+}
+
 // optionalID parses an optional positive integer query parameter; absent means 0.
 func (p *params) optionalID(r *http.Request, name string) int64 {
 	raw := r.URL.Query().Get(name)
@@ -53,15 +63,15 @@ func (p *params) optionalID(r *http.Request, name string) int64 {
 	return id
 }
 
-// limit parses the optional page size; absent means the service default.
-func (p *params) limit(r *http.Request) int {
+// limit parses the optional page size, at most maxSize; absent means the service default.
+func (p *params) limit(r *http.Request, maxSize int) int {
 	raw := r.URL.Query().Get("limit")
 	if raw == "" {
 		return 0
 	}
 	n, err := strconv.Atoi(raw)
-	if err != nil || n < 1 || n > catalog.MaxPageSize {
-		p.fail("limit", "must be an integer between 1 and %d", catalog.MaxPageSize)
+	if err != nil || n < 1 || n > maxSize {
+		p.fail("limit", "must be an integer between 1 and %d", maxSize)
 		return 0
 	}
 	return n
@@ -77,6 +87,20 @@ func (p *params) cursor(r *http.Request) int64 {
 	if err != nil {
 		p.fail("cursor", "is not a valid cursor")
 		return 0
+	}
+	return id
+}
+
+// uuidCursor decodes an opaque pagination cursor that wraps a UUID; absent means the first page.
+func (p *params) uuidCursor(r *http.Request) uuid.UUID {
+	raw := r.URL.Query().Get("cursor")
+	if raw == "" {
+		return uuid.UUID{}
+	}
+	id, err := decodeUUIDCursor(raw)
+	if err != nil {
+		p.fail("cursor", "is not a valid cursor")
+		return uuid.UUID{}
 	}
 	return id
 }
@@ -114,4 +138,16 @@ func decodeCursor(s string) (int64, error) {
 		return 0, fmt.Errorf("cursor id %d is not positive", id)
 	}
 	return id, nil
+}
+
+func encodeUUIDCursor(id uuid.UUID) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(id.String()))
+}
+
+func decodeUUIDCursor(s string) (uuid.UUID, error) {
+	raw, err := base64.RawURLEncoding.DecodeString(s)
+	if err != nil {
+		return uuid.UUID{}, err
+	}
+	return uuid.Parse(string(raw))
 }

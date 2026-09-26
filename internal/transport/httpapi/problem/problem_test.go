@@ -88,6 +88,45 @@ func TestFromErrorMapsDomainKinds(t *testing.T) {
 	}
 }
 
+func TestFromErrorListsUnavailableSeats(t *testing.T) {
+	t.Parallel()
+
+	p := FromError(fmt.Errorf("create booking: %w", domain.SeatsUnavailable([]int64{7, 9})))
+	if p.Status != http.StatusConflict || p.Code != domain.CodeSeatUnavailable || p.Detail != "seats 7, 9 are already held or sold" {
+		t.Errorf("got %d %s %q", p.Status, p.Code, p.Detail)
+	}
+	if len(p.UnavailableSeatIDs) != 2 || p.UnavailableSeatIDs[0] != 7 || p.UnavailableSeatIDs[1] != 9 {
+		t.Errorf("unavailable seats = %v, want [7 9]", p.UnavailableSeatIDs)
+	}
+
+	other := FromError(domain.Conflict(domain.CodeActiveBookingExists, "one at a time"))
+	if other.UnavailableSeatIDs != nil || other.RetryAfter != 0 {
+		t.Errorf("a plain conflict got extensions: %+v", other)
+	}
+}
+
+func TestBusyErrorsAskForARetry(t *testing.T) {
+	t.Parallel()
+
+	p := FromError(domain.Busy(domain.CodeSeatBusy, "locked"))
+	if p.Status != http.StatusConflict || p.Code != domain.CodeSeatBusy || p.RetryAfter != 1 {
+		t.Fatalf("got %+v, want 409 SEAT_BUSY with a retry after 1 s", p)
+	}
+
+	rec := httptest.NewRecorder()
+	Write(rec, httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/bookings", nil), p)
+	if got := rec.Header().Get("Retry-After"); got != "1" {
+		t.Errorf("Retry-After = %q, want 1", got)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if _, leaked := body["RetryAfter"]; leaked {
+		t.Error("RetryAfter is part of the body")
+	}
+}
+
 func TestWriteFillsInstanceAndRequestID(t *testing.T) {
 	t.Parallel()
 

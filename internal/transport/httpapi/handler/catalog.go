@@ -35,7 +35,7 @@ func NewCatalog(svc CatalogService, currency string, logger *slog.Logger) *Catal
 // ListMovies handles GET /v1/movies?limit=&cursor=.
 func (h *Catalog) ListMovies(w http.ResponseWriter, r *http.Request) {
 	var p params
-	limit, afterID := p.limit(r), p.cursor(r)
+	limit, afterID := p.limit(r, catalog.MaxPageSize), p.cursor(r)
 	if !p.ok(w, r) {
 		return
 	}

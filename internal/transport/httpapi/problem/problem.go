@@ -4,6 +4,7 @@ package problem
 import (
 	"errors"
 	"net/http"
+	"strconv"
 
 	"github.com/onetodone/cinema-api/internal/domain"
 	"github.com/onetodone/cinema-api/internal/transport/httpapi/render"
@@ -34,6 +35,10 @@ type FieldError struct {
 	Message string `json:"message"`
 }
 
+// busyRetryAfterSeconds is the Retry-After of a 409 caused by a lock held by a concurrent request. Booking
+// transactions hold their locks for milliseconds, so one second is plenty.
+const busyRetryAfterSeconds = 1
+
 // Problem is an RFC 9457 problem details object. Type is "about:blank", so Title is the HTTP status phrase;
 // clients branch on Code, which is stable across releases.
 type Problem struct {
@@ -45,6 +50,10 @@ type Problem struct {
 	Code      string       `json:"code"`
 	RequestID string       `json:"request_id,omitempty"`
 	Errors    []FieldError `json:"errors,omitempty"`
+	// UnavailableSeatIDs lists the requested seats that are taken, with code SEAT_UNAVAILABLE.
+	UnavailableSeatIDs []int64 `json:"unavailable_seat_ids,omitempty"`
+	// RetryAfter, in seconds, is sent as the Retry-After header when positive.
+	RetryAfter int `json:"-"`
 }
 
 // New returns a problem for an HTTP status with a machine-readable code and a human-readable detail.
@@ -71,9 +80,19 @@ func Internal() Problem {
 }
 
 // FromError maps err to a problem. A *domain.ValidationError becomes a 400 that lists its fields. Other domain
-// errors keep their code and client-safe message. Any other error becomes a generic 500, so internal details
-// never reach clients.
+// errors keep their code and client-safe message; a *domain.SeatsUnavailableError adds the taken seats, and a
+// busy error becomes a 409 with Retry-After. Any other error becomes a generic 500, so internal details never
+// reach clients.
 func FromError(err error) Problem {
+	p := fromError(err)
+	var unavailable *domain.SeatsUnavailableError
+	if errors.As(err, &unavailable) {
+		p.UnavailableSeatIDs = unavailable.SeatIDs
+	}
+	return p
+}
+
+func fromError(err error) Problem {
 	var ve *domain.ValidationError
 	if errors.As(err, &ve) {
 		fields := make([]FieldError, 0, len(ve.Fields))
@@ -93,6 +112,10 @@ func FromError(err error) Problem {
 		return New(http.StatusNotFound, de.Code, de.Message)
 	case errors.Is(de.Kind, domain.ErrConflict):
 		return New(http.StatusConflict, de.Code, de.Message)
+	case errors.Is(de.Kind, domain.ErrBusy):
+		p := New(http.StatusConflict, de.Code, de.Message)
+		p.RetryAfter = busyRetryAfterSeconds
+		return p
 	case errors.Is(de.Kind, domain.ErrInvalid):
 		return New(http.StatusUnprocessableEntity, de.Code, de.Message)
 	case errors.Is(de.Kind, domain.ErrUnauthenticated):
@@ -107,6 +130,9 @@ func FromError(err error) Problem {
 // Write sends p, filling in the request path as the instance and the request ID. A 401 gets the
 // BearerChallenge unless the caller already set WWW-Authenticate.
 func Write(w http.ResponseWriter, r *http.Request, p Problem) {
+	if p.RetryAfter > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(p.RetryAfter))
+	}
 	if p.Status == http.StatusUnauthorized && w.Header().Get("WWW-Authenticate") == "" {
 		w.Header().Set("WWW-Authenticate", BearerChallenge)
 	}
