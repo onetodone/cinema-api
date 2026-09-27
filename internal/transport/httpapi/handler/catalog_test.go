@@ -53,6 +53,12 @@ func (s *stubCatalog) SeatMap(context.Context, int64) (catalog.SeatMap, error) {
 
 func serveCatalog(t *testing.T, svc CatalogService, target string) *httptest.ResponseRecorder {
 	t.Helper()
+	return serveCatalogWith(t, svc, target, nil)
+}
+
+// serveCatalogWith is serveCatalog with request headers.
+func serveCatalogWith(t *testing.T, svc CatalogService, target string, header http.Header) *httptest.ResponseRecorder {
+	t.Helper()
 	h := NewCatalog(svc, "USD", slog.New(slog.DiscardHandler))
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/movies", h.ListMovies)
@@ -61,8 +67,12 @@ func serveCatalog(t *testing.T, svc CatalogService, target string) *httptest.Res
 	mux.HandleFunc("GET /v1/showtimes/{showtimeID}", h.GetShowtime)
 	mux.HandleFunc("GET /v1/showtimes/{showtimeID}/seats", h.SeatMap)
 
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, target, nil)
+	for k, v := range header {
+		req.Header[k] = v
+	}
 	rec := httptest.NewRecorder()
-	mux.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, target, nil))
+	mux.ServeHTTP(rec, req)
 	return rec
 }
 
@@ -317,5 +327,71 @@ func TestSeatMap(t *testing.T) {
 	}
 	if len(body.Seats) != 2 || body.Seats[1]["status"] != "held" || body.Seats[1]["type"] != "vip" {
 		t.Errorf("seats = %v", body.Seats)
+	}
+}
+
+// TestPolledReadsAnswerNotModified covers the two routes that clients poll: an ETag and no-cache on every answer,
+// and 304 without a body when If-None-Match names the current ETag.
+func TestPolledReadsAnswerNotModified(t *testing.T) {
+	t.Parallel()
+
+	seatMap := func(held domain.SeatStatus) *stubCatalog {
+		return &stubCatalog{seatMap: catalog.SeatMap{
+			Showtime: sampleShowtime,
+			Seats:    []domain.ShowtimeSeat{{SeatID: 100, Row: "A", Number: 1, Type: domain.SeatStandard, Status: held}},
+			Summary:  catalog.SeatSummary{Available: 1, Total: 1},
+		}}
+	}
+	schedule := func(available int) *stubCatalog {
+		st := sampleShowtime
+		st.SeatsAvailable = available
+		return &stubCatalog{sched: catalog.Schedule{Day: time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC), Showtimes: []domain.Showtime{st}}}
+	}
+	routes := []struct {
+		name          string
+		target        string
+		before, after *stubCatalog // the data before and after a change
+	}{
+		{"seat map", "/v1/showtimes/11/seats", seatMap(domain.SeatAvailable), seatMap(domain.SeatHeld)},
+		{"schedule", "/v1/showtimes?date=2026-10-01", schedule(90), schedule(89)},
+	}
+	for _, rt := range routes {
+		t.Run(rt.name, func(t *testing.T) {
+			t.Parallel()
+
+			first := serveCatalog(t, rt.before, rt.target)
+			etag := first.Header().Get("ETag")
+			if first.Code != http.StatusOK || !strings.HasPrefix(etag, `W/"`) || len(etag) != len(`W/""`)+43 {
+				t.Fatalf("status %d, ETag %q; want 200 and a weak SHA-256 tag", first.Code, etag)
+			}
+			if cc := first.Header().Get("Cache-Control"); cc != "no-cache" {
+				t.Errorf("Cache-Control = %q, want no-cache", cc)
+			}
+			if again := serveCatalog(t, rt.before, rt.target); again.Header().Get("ETag") != etag {
+				t.Errorf("the same content got ETag %q, then %q", etag, again.Header().Get("ETag"))
+			}
+
+			unchanged := serveCatalogWith(t, rt.before, rt.target, http.Header{"If-None-Match": {etag}})
+			if unchanged.Code != http.StatusNotModified || unchanged.Body.Len() != 0 {
+				t.Errorf("If-None-Match with the current ETag = %d with %d bytes, want 304 without a body",
+					unchanged.Code, unchanged.Body.Len())
+			}
+			if unchanged.Header().Get("ETag") != etag || unchanged.Header().Get("Cache-Control") != "no-cache" {
+				t.Errorf("304 headers = %v, want the ETag and Cache-Control of a 200", unchanged.Header())
+			}
+
+			changed := serveCatalogWith(t, rt.after, rt.target, http.Header{"If-None-Match": {etag}})
+			if changed.Code != http.StatusOK || changed.Header().Get("ETag") == etag || changed.Body.Len() == 0 {
+				t.Errorf("after a change: %d, ETag %q; want 200 with a new ETag and the body", changed.Code, changed.Header().Get("ETag"))
+			}
+		})
+	}
+
+	// Errors carry no ETag, whatever the request says.
+	notFound := &stubCatalog{err: domain.NotFound(domain.CodeShowtimeNotFound, "showtime 5 not found")}
+	rec := serveCatalogWith(t, notFound, "/v1/showtimes/5/seats", http.Header{"If-None-Match": {"*"}})
+	assertProblem(t, rec, http.StatusNotFound, domain.CodeShowtimeNotFound)
+	if rec.Header().Get("ETag") != "" {
+		t.Errorf("a problem carries ETag %q", rec.Header().Get("ETag"))
 	}
 }

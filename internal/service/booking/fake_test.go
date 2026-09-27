@@ -58,6 +58,8 @@ type memDB struct {
 	sellShortfall int64    // Sell reports this many fewer changed seats than it changed
 	finishErr     error    // Finish fails with this error
 	listLimit     int      // the limit the last ListBookings call received
+	activeErr     error    // ActiveBookingID fails with this error
+	afterCreate   func()   // runs after a Create that failed, before the transaction ends; it holds db.mu
 }
 
 func newMemDB(now time.Time) *memDB {
@@ -172,13 +174,14 @@ func (db *memDB) GetBooking(_ context.Context, id, userID uuid.UUID) (domain.Boo
 	return b, nil
 }
 
-func (db *memDB) ListBookings(_ context.Context, userID, beforeID uuid.UUID, limit int) ([]domain.Booking, error) {
+func (db *memDB) ListBookings(_ context.Context, userID, beforeID uuid.UUID, statuses []domain.BookingStatus,
+	limit int) ([]domain.Booking, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	db.listLimit = limit
 	var out []domain.Booking
 	for _, b := range db.state.bookings {
-		if b.UserID == userID && b.ID.Compare(beforeID) < 0 {
+		if b.UserID == userID && b.ID.Compare(beforeID) < 0 && (len(statuses) == 0 || slices.Contains(statuses, b.Status)) {
 			out = append(out, b)
 		}
 	}
@@ -187,6 +190,20 @@ func (db *memDB) ListBookings(_ context.Context, userID, beforeID uuid.UUID, lim
 		out = out[:limit]
 	}
 	return out, nil
+}
+
+func (db *memDB) ActiveBookingID(_ context.Context, userID uuid.UUID, showtimeID int64) (uuid.UUID, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.activeErr != nil {
+		return uuid.UUID{}, db.activeErr
+	}
+	for _, b := range db.state.bookings {
+		if b.UserID == userID && b.Showtime.ID == showtimeID && b.Status.Active() {
+			return b.ID, nil
+		}
+	}
+	return uuid.UUID{}, nil
 }
 
 func (db *memDB) ListStuckPayments(_ context.Context, age time.Duration, afterID uuid.UUID, limit int) ([]domain.Payment, error) {
@@ -303,7 +320,11 @@ func (tx *memTx) Create(_ context.Context, b domain.Booking, holdTTL time.Durati
 	tx.record("insert booking")
 	for _, other := range tx.state.bookings {
 		if other.UserID == b.UserID && other.Showtime.ID == b.Showtime.ID && other.Status.Active() {
-			return domain.Booking{}, domain.Conflict(domain.CodeActiveBookingExists, "one active booking per showtime")
+			if tx.db.afterCreate != nil {
+				tx.db.afterCreate()
+			}
+			// Like the unique index: the violation does not say which booking blocks.
+			return domain.Booking{}, domain.ActiveBookingExists(b.Showtime.ID, uuid.UUID{})
 		}
 	}
 	b.Status = domain.BookingPending

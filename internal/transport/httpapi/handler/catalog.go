@@ -64,7 +64,8 @@ func (h *Catalog) GetMovie(w http.ResponseWriter, r *http.Request) {
 	render.JSON(w, http.StatusOK, dto.NewMovieDetails(details, h.currency))
 }
 
-// Schedule handles GET /v1/showtimes?date=YYYY-MM-DD&movie_id=. Without a date it lists today.
+// Schedule handles GET /v1/showtimes?date=YYYY-MM-DD&movie_id=. Without a date it lists today. Clients poll it
+// with If-None-Match (see render.ValidatedJSON).
 func (h *Catalog) Schedule(w http.ResponseWriter, r *http.Request) {
 	var p params
 	q := catalog.ScheduleQuery{Day: p.date(r, "date"), MovieID: p.optionalID(r, "movie_id")}
@@ -77,7 +78,7 @@ func (h *Catalog) Schedule(w http.ResponseWriter, r *http.Request) {
 		writeError(h.logger, w, r, err)
 		return
 	}
-	render.JSON(w, http.StatusOK, dto.NewSchedule(sched, h.currency))
+	render.ValidatedJSON(w, r, dto.NewSchedule(sched, h.currency))
 }
 
 // GetShowtime handles GET /v1/showtimes/{showtimeID}.
@@ -96,7 +97,8 @@ func (h *Catalog) GetShowtime(w http.ResponseWriter, r *http.Request) {
 	render.JSON(w, http.StatusOK, dto.NewShowtime(st, h.currency))
 }
 
-// SeatMap handles GET /v1/showtimes/{showtimeID}/seats.
+// SeatMap handles GET /v1/showtimes/{showtimeID}/seats. Clients poll it with If-None-Match (see
+// render.ValidatedJSON).
 func (h *Catalog) SeatMap(w http.ResponseWriter, r *http.Request) {
 	var p params
 	id := p.pathID(r, "showtimeID")
@@ -109,5 +111,5 @@ func (h *Catalog) SeatMap(w http.ResponseWriter, r *http.Request) {
 		writeError(h.logger, w, r, err)
 		return
 	}
-	render.JSON(w, http.StatusOK, dto.NewSeatMap(sm, h.currency))
+	render.ValidatedJSON(w, r, dto.NewSeatMap(sm, h.currency))
 }

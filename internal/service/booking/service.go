@@ -4,6 +4,7 @@ package booking
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"slices"
@@ -73,7 +74,8 @@ func New(uow UnitOfWork, reader Reader, providers PaymentProviders, cfg Config, 
 // Errors: a *domain.ValidationError for bad input; SHOWTIME_NOT_FOUND; SHOWTIME_NOT_BOOKABLE for a canceled
 // or started showtime; UNKNOWN_SEAT for seats that are not part of the showtime; a *domain.SeatsUnavailableError
 // (SEAT_UNAVAILABLE); SEAT_BUSY when the seats stay locked by other bookings for longer than the lock timeout;
-// ACTIVE_BOOKING_EXISTS when the user already has an unpaid booking for the showtime.
+// a *domain.ActiveBookingExistsError (ACTIVE_BOOKING_EXISTS) when the user already has an unpaid booking for the
+// showtime, naming that booking.
 //
 // How double-selling is prevented: the transaction locks the seat rows in seat id order, checks under the
 // lock that every seat is available, and then flips them to held with an UPDATE that repeats the
@@ -153,7 +155,7 @@ func (s *Service) Create(ctx context.Context, userID uuid.UUID, nb domain.NewBoo
 		if claimed {
 			_ = s.gate.Release(after, nb.ShowtimeID, seatIDs, id) // on failure, the claim expires by itself
 		}
-		return domain.Booking{}, err
+		return domain.Booking{}, s.nameActiveBooking(ctx, userID, nb.ShowtimeID, err)
 	}
 	if claimed {
 		// The gate now rejects contenders for as long as the database holds the seats.
@@ -161,6 +163,29 @@ func (s *Service) Create(ctx context.Context, userID uuid.UUID, nb domain.NewBoo
 	}
 	s.seatsChanged(after, created.Showtime.ID)
 	return s.localize(created), nil
+}
+
+// nameActiveBooking adds the id of the blocking booking to an ACTIVE_BOOKING_EXISTS error, so that a client can
+// offer to continue with that booking or to cancel it. The unique index violation aborted the transaction, so
+// the booking is read after it, outside any transaction. If it ended in the meantime, or the read fails, the
+// error goes out as it is: the conflict itself is certain, the id only a convenience. Other errors pass through.
+func (s *Service) nameActiveBooking(ctx context.Context, userID uuid.UUID, showtimeID int64, err error) error {
+	var active *domain.ActiveBookingExistsError
+	if !errors.As(err, &active) || active.BookingID != (uuid.UUID{}) {
+		return err
+	}
+	id, lookupErr := s.reader.ActiveBookingID(ctx, userID, showtimeID)
+	if lookupErr != nil {
+		if ctx.Err() == nil { // a client that hung up is not worth a warning
+			s.logger.WarnContext(ctx, "active booking lookup failed; answering without its id",
+				slog.Int64("showtime_id", showtimeID), slog.Any("error", lookupErr))
+		}
+		return err
+	}
+	if id == (uuid.UUID{}) {
+		return err
+	}
+	return domain.ActiveBookingExists(showtimeID, id)
 }
 
 // claimSeats claims the seats in the hold gate for the booking token and reports whether it did. Seats that
@@ -254,9 +279,20 @@ type Page struct {
 	NextBeforeID uuid.UUID
 }
 
-// List returns the bookings of userID that are older than beforeID, newest first. The zero beforeID starts
-// at the newest booking. A limit outside [1, MaxPageSize] is clamped.
-func (s *Service) List(ctx context.Context, userID, beforeID uuid.UUID, limit int) (Page, error) {
+// ListQuery selects a page of a user's bookings.
+type ListQuery struct {
+	// BeforeID continues the list with the bookings older than this one; the zero UUID starts at the newest.
+	BeforeID uuid.UUID
+	// Limit is the page size; outside [1, MaxPageSize] it is clamped.
+	Limit int
+	// Statuses keeps only the bookings in one of these statuses; empty keeps them all. The next page needs the
+	// same statuses.
+	Statuses []domain.BookingStatus
+}
+
+// List returns one page of the bookings of userID that q selects, newest first.
+func (s *Service) List(ctx context.Context, userID uuid.UUID, q ListQuery) (Page, error) {
+	limit, beforeID := q.Limit, q.BeforeID
 	switch {
 	case limit <= 0:
 		limit = DefaultPageSize
@@ -268,7 +304,7 @@ func (s *Service) List(ctx context.Context, userID, beforeID uuid.UUID, limit in
 	}
 
 	// Fetch one extra row to learn whether another page exists without a COUNT query.
-	list, err := s.reader.ListBookings(ctx, userID, beforeID, limit+1)
+	list, err := s.reader.ListBookings(ctx, userID, beforeID, q.Statuses, limit+1)
 	if err != nil {
 		return Page{}, err
 	}

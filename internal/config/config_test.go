@@ -98,6 +98,27 @@ func TestLoadAppliesDefaults(t *testing.T) {
 	if want := (MetricsConfig{Addr: ":9090", WorkerAddr: ":9091"}); cfg.Metrics != want {
 		t.Errorf("Metrics = %+v, want %+v", cfg.Metrics, want)
 	}
+	if cfg.Seed.PosterURLTemplate != "" {
+		t.Errorf("Seed.PosterURLTemplate = %q, want none", cfg.Seed.PosterURLTemplate)
+	}
+}
+
+func TestLoadReadsSeedPosterTemplate(t *testing.T) {
+	t.Parallel()
+
+	const template = "https://picsum.photos/seed/{slug}/400/600"
+	cfg, err := loadFrom(t, map[string]string{"DATABASE_URL": testDSN, "SEED_POSTER_URL_TEMPLATE": template})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Seed.PosterURLTemplate != template {
+		t.Errorf("Seed.PosterURLTemplate = %q, want %q", cfg.Seed.PosterURLTemplate, template)
+	}
+	for _, ok := range []string{"http://localhost:3001/posters/{slug}.jpg", "https://img.example/{slug}?w=400&title={slug}"} {
+		if !isPosterURLTemplate(ok) {
+			t.Errorf("template %q is rejected", ok)
+		}
+	}
 }
 
 func TestLoadReadsMetricsListeners(t *testing.T) {
@@ -348,6 +369,21 @@ func TestLoadRejectsInvalidInput(t *testing.T) {
 			name:    "short jwt secret",
 			vars:    map[string]string{"DATABASE_URL": testDSN, "JWT_SECRET": "change-me"},
 			wantErr: "JWT_SECRET must be at least 32 bytes, got 9",
+		},
+		{
+			name:    "poster template without placeholder",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "SEED_POSTER_URL_TEMPLATE": "https://img.example/poster.jpg"},
+			wantErr: "SEED_POSTER_URL_TEMPLATE must be an absolute http or https URL with a {slug} placeholder",
+		},
+		{
+			name:    "relative poster template",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "SEED_POSTER_URL_TEMPLATE": "/posters/{slug}.jpg"},
+			wantErr: "SEED_POSTER_URL_TEMPLATE",
+		},
+		{
+			name:    "poster template of another scheme",
+			vars:    map[string]string{"DATABASE_URL": testDSN, "SEED_POSTER_URL_TEMPLATE": "ftp://img.example/{slug}"},
+			wantErr: "SEED_POSTER_URL_TEMPLATE",
 		},
 		{
 			name:    "zero jwt ttl",

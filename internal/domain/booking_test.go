@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"uuid"
 )
 
 func TestNewBookingValidate(t *testing.T) {
@@ -95,6 +96,14 @@ func TestBookingTransitions(t *testing.T) {
 		if s.Active() != active {
 			t.Errorf("%s.Active() = %v, want %v", s, s.Active(), active)
 		}
+		if !s.Valid() {
+			t.Errorf("%s is not valid", s)
+		}
+	}
+	for _, s := range []BookingStatus{"", "held", "Pending", "pending "} {
+		if s.Valid() {
+			t.Errorf("%q is valid", s)
+		}
 	}
 }
 
@@ -134,6 +143,28 @@ func TestSeatsUnavailableError(t *testing.T) {
 	}
 	if got := SeatsUnavailable([]int64{4}).Error(); got != "seat 4 is already held or sold" {
 		t.Errorf("message = %q", got)
+	}
+}
+
+func TestActiveBookingExistsError(t *testing.T) {
+	t.Parallel()
+
+	id := uuid.MustParse("01920000-0000-7000-8000-0000000000b1")
+	err := fmt.Errorf("create booking: %w", ActiveBookingExists(11, id))
+	if !errors.Is(err, ErrConflict) {
+		t.Error("not a conflict")
+	}
+	var de *Error
+	if !errors.As(err, &de) || de.Code != CodeActiveBookingExists {
+		t.Errorf("errors.As(*Error) = %+v, want code %s", de, CodeActiveBookingExists)
+	}
+	var ae *ActiveBookingExistsError
+	if !errors.As(err, &ae) || ae.BookingID != id {
+		t.Errorf("errors.As(*ActiveBookingExistsError) = %+v", ae)
+	}
+	want := "you already have an unpaid booking for showtime 11; pay for it or cancel it first"
+	if got := ActiveBookingExists(11, uuid.UUID{}).Error(); got != want {
+		t.Errorf("message = %q, want %q", got, want)
 	}
 }
 

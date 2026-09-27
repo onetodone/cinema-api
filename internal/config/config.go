@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"net/url"
 	"reflect"
 	"strings"
 	"time"
@@ -30,6 +31,7 @@ type Config struct {
 	Sweeper    SweeperConfig
 	Cache      CacheConfig
 	RateLimit  RateLimitConfig
+	Seed       SeedConfig
 }
 
 // Limits for authentication settings.
@@ -88,6 +90,13 @@ const (
 	maxRateLimit     = 10000
 	maxKeyPrefixSize = 64
 )
+
+// SeedConfig configures the demo data that cmd/seed writes.
+type SeedConfig struct {
+	// PosterURLTemplate gives every demo movie a poster URL: {slug} is replaced by a slug of the movie's title, such
+	// as the-quiet-heist. Empty seeds no posters.
+	PosterURLTemplate string `env:"SEED_POSTER_URL_TEMPLATE"`
+}
 
 // CacheConfig configures the Redis read caches of the catalog. A TTL of 0 turns that cache off.
 type CacheConfig struct {
@@ -458,6 +467,10 @@ func (c Config) Validate() error {
 	if _, port, _ := net.SplitHostPort(c.HTTP.Addr); c.Metrics.Addr == c.HTTP.Addr && port != "0" {
 		errs = append(errs, fmt.Errorf("METRICS_ADDR must differ from HTTP_ADDR (%s)", c.HTTP.Addr))
 	}
+	// Only cmd/seed uses the template, so, like JWT_SECRET, it is rejected only when it is set and wrong.
+	if t := c.Seed.PosterURLTemplate; t != "" && !isPosterURLTemplate(t) {
+		errs = append(errs, fmt.Errorf("SEED_POSTER_URL_TEMPLATE must be an absolute http or https URL with a {slug} placeholder, got %q", t))
+	}
 	if !isCurrencyCode(c.Cinema.Currency) {
 		errs = append(errs, fmt.Errorf("CINEMA_CURRENCY must be a 3-letter uppercase ISO 4217 code, got %q",
 			c.Cinema.Currency))
@@ -520,6 +533,15 @@ func isKeyPrefix(s string) bool {
 		}
 	}
 	return true
+}
+
+// isPosterURLTemplate accepts absolute http and https URLs that contain {slug}.
+func isPosterURLTemplate(s string) bool {
+	if !strings.Contains(s, "{slug}") {
+		return false
+	}
+	u, err := url.Parse(strings.ReplaceAll(s, "{slug}", "slug"))
+	return err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != ""
 }
 
 func isCurrencyCode(s string) bool {

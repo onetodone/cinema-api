@@ -15,7 +15,8 @@ The project is small on purpose. It shows how to solve a handful of hard backend
   and a three-step payment that stays consistent when the provider answers late or never.
 - **Caching.** Redis as a fail-open accelerator: a hold gate that turns losers away in about 0.1 ms, cached seat
   maps that are cleared on every change, idempotency records, rate limits, and a list of revoked sessions. With
-  Redis down, everything still works and stays correct, only slower.
+  Redis down, everything still works and stays correct, only slower. Clients that poll a seat map get
+  `304 Not Modified` until a seat changes.
 - **Background processing.** A worker expires unpaid bookings, settles stuck payments, and sweeps expired
   sessions. Any number of them can run next to each other, thanks to `SKIP LOCKED`.
 - **Sessions.** Browser-grade login: a short-lived access token, and a refresh token in an `HttpOnly` cookie that
@@ -46,7 +47,8 @@ cp .env.example .env            # its JWT_SECRET is a local placeholder; anywher
 sed -i 's/^PAYMENT_LOCAL_ENABLED=.*/PAYMENT_LOCAL_ENABLED=true/; s/^AUTH_COOKIE_SECURE=.*/AUTH_COOKIE_SECURE=false/' .env
 
 # 3. Database: create it, apply the migrations, and seed demo data (6 movies, 3 halls, a week of showtimes,
-#    and the admin account from ADMIN_EMAIL / ADMIN_PASSWORD).
+#    and the admin account from ADMIN_EMAIL / ADMIN_PASSWORD). For poster images, first set
+#    SEED_POSTER_URL_TEMPLATE=https://picsum.photos/seed/{slug}/400/600 in .env.
 make db-create migrate-up seed
 
 # 4. Run the API (:8080) and, in a second terminal, the worker.
@@ -72,11 +74,20 @@ TOKEN=$(curl -s -c jar -X POST $API/v1/auth/login -H 'Content-Type: application/
 # Tomorrow's schedule, and the seat map of its first showtime
 ST=$(curl -s "$API/v1/showtimes?date=$(date -u -d tomorrow +%F)" | jq '.items[0].id')
 curl -s $API/v1/showtimes/$ST/seats | jq '{summary, first: .seats[0]}'
+# Poll it like a client: sent back in If-None-Match, its ETag gets 304 while no seat changes
+ETAG=$(curl -s -o /dev/null -w '%header{etag}' $API/v1/showtimes/$ST/seats)
+curl -s -o /dev/null -w '%{http_code}\n' -H "If-None-Match: $ETAG" $API/v1/showtimes/$ST/seats
 
-# Hold two seats for 15 minutes, then pay for them
-SEATS=$(curl -s $API/v1/showtimes/$ST/seats | jq -c '[.seats[] | select(.status == "available") | .id][:2]')
+# Hold two seats for 15 minutes. A second hold for the showtime is refused and names the first
+FREE=$(curl -s $API/v1/showtimes/$ST/seats | jq -c '[.seats[] | select(.status == "available") | .id][:3]')
 BOOKING=$(curl -s -X POST $API/v1/bookings -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  -d "{\"showtime_id\":$ST,\"seat_ids\":$SEATS}" | jq -r .id)
+  -d "{\"showtime_id\":$ST,\"seat_ids\":$(jq -c '.[:2]' <<< "$FREE")}" | jq -r .id)
+curl -s -X POST $API/v1/bookings -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d "{\"showtime_id\":$ST,\"seat_ids\":[$(jq '.[2]' <<< "$FREE")]}" | jq '{code, booking_id}'
+# The seat map has changed: the old ETag gets the whole map again (200). The caller's unpaid holds:
+curl -s -o /dev/null -w '%{http_code}\n' -H "If-None-Match: $ETAG" $API/v1/showtimes/$ST/seats
+curl -s "$API/v1/bookings?status=pending,processing" -H "Authorization: Bearer $TOKEN" | jq -c '[.items[].id]'
+# Pay for the hold
 curl -s -X POST $API/v1/bookings/$BOOKING/payments -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' -H "Idempotency-Key: pay-$BOOKING-1" \
   -d '{"payment_method":"local","payment_token":"tok_success"}' | jq '{payment: .payment.status, booking: .booking.status}'
@@ -414,9 +425,9 @@ to the contract on `main`, so it never has to be updated by hand.
 | `GET /v1/auth/sessions` · `DELETE /v1/auth/sessions/{sessionID}` | user · owner | The caller's sessions; end one (its access tokens stop at once) |
 | `GET /v1/me` | user | The caller's account |
 | `GET /v1/movies`, `GET /v1/movies/{movieID}` | public | Movies, a movie with its showtimes of the next 14 days |
-| `GET /v1/showtimes?date=&movie_id=` | public | The schedule of a day in the cinema's time zone |
-| `GET /v1/showtimes/{showtimeID}` · `/seats` | public | A showtime; its seat map with each seat's status and price |
-| `POST /v1/bookings` · `GET /v1/bookings` | user | Hold 1–10 seats for 15 minutes; list own bookings |
+| `GET /v1/showtimes?date=&movie_id=` | public | The schedule of a day in the cinema's time zone (`ETag`) |
+| `GET /v1/showtimes/{showtimeID}` · `/seats` | public | A showtime; its seat map with each seat's status and price (`ETag`) |
+| `POST /v1/bookings` · `GET /v1/bookings?status=` | user | Hold 1–10 seats for 15 minutes; list own bookings, optionally of some statuses only |
 | `GET` · `DELETE /v1/bookings/{bookingID}` | owner | Read; cancel (releases the seats) |
 | `GET /v1/payment-methods` | public | The enabled payment providers |
 | `POST /v1/bookings/{bookingID}/payments` | owner | Pay (`Idempotency-Key` required) |
@@ -435,7 +446,17 @@ Errors are RFC 9457 problem details with a stable `code`, such as:
 ```
 
 Validation errors list every bad field at once in `errors`. Answers worth retrying unchanged (`SEAT_BUSY`,
-`BOOKING_BUSY`, `IDEMPOTENCY_IN_PROGRESS`, 429, 503) carry `Retry-After`.
+`BOOKING_BUSY`, `IDEMPOTENCY_IN_PROGRESS`, 429, 503) carry `Retry-After`. A second unpaid hold for a showtime is
+`409 ACTIVE_BOOKING_EXISTS`, and `booking_id` names the first one, so a client can offer to continue with it or cancel
+it. The unique index that refuses the second hold aborts its transaction, so the booking is read right after; if it
+ended in that moment, `booking_id` is left out.
+
+**Polling.** The schedule and seat maps carry a weak `ETag` (the SHA-256 of the body) and `Cache-Control: no-cache`.
+A client that sends the tag back in `If-None-Match` gets `304 Not Modified` without a body while nothing has changed;
+browsers do that by themselves. The tag is computed from the content alone, nothing is stored for it, and every
+replica, cache hit or miss, gives the same tag for the same content. `GET /v1/bookings?status=pending,processing` (or
+`status=pending&status=processing`) finds the caller's unpaid holds in one request; pagination works as without the
+filter, as long as the next page gets the same `status`.
 
 **Idempotency.** `POST /v1/bookings` accepts, and payments require, an `Idempotency-Key`. A retry with the same key
 and body replays the first answer (`Idempotent-Replayed: true`) for 24 hours; the same key with another body is
@@ -487,6 +508,7 @@ All settings are environment variables, validated at startup (every problem is r
 | `*_RATE_LIMIT_PER_MIN` | `20` / `30` / `10` / `60` | Booking, auth per address, login per account, refresh per session; `0` turns a limit off |
 | `PAYMENT_LOCAL_ENABLED` | `false` | The local test provider |
 | `ADMIN_EMAIL` · `ADMIN_PASSWORD` | `admin@cinema.local` · none | Admin account that `make seed` creates or resets |
+| `SEED_POSTER_URL_TEMPLATE` | none | Poster URL of each demo movie, `{slug}` replaced by a slug of its title (`the-quiet-heist`) |
 
 ## Observability
 
@@ -530,7 +552,9 @@ make load-test          # k6: 500 users race for one seat against a running API
 - **Mutation checks** were run by hand on the key guards (random lock order, no `SKIP LOCKED`, expiring
   `processing` bookings, ignoring the payment deadline, no cache invalidation, a rotation without its
   compare-and-set, a login without the user lock, no grace window, no revocation check, a revocation before the
-  ownership check, a revocation lifetime without the second leeway): each made a test fail.
+  ownership check, a revocation lifetime without the second leeway, no lookup of the blocking booking, never
+  answering 304, an ETag that depends on more than the content, an ignored status filter, one poster for every
+  movie): each made a test fail.
 - **Load test.** Start the API without the per-address auth limit, since setup logs 500 accounts in from one
   address, and with a cheaper password hash:
 
@@ -583,6 +607,9 @@ the services declare, so services never import pgx, go-redis, or Prometheus, and
   queued it. That is the point during a rush; the seat map shows the truth within milliseconds.
 - **Staleness is bounded, not zero.** `seats_available` in the schedule may be 10 s old; the seat map is cleared on
   every change. Bookings always check PostgreSQL.
+- **A 304 saves the network and the client, not the server.** The server still reads the seat map (usually from
+  the cache), encodes it, and hashes it before it can compare tags. Storing the tag with the cached entry would
+  save the encoding, at the price of a tag that the cache, the database read, and every replica must agree on.
 - **Expiry lags by up to one worker pause** (5 s ± 20%). Payment rejects an expired hold by itself, so the lag
   only delays when seats return to sale.
 - **Revocation is immediate only while Redis is up.** An ended session can never refresh again, but its access

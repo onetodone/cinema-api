@@ -4,10 +4,13 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net/http"
+	"slices"
 	"strconv"
+	"strings"
 	"time"
 	"uuid"
 
+	"github.com/onetodone/cinema-api/internal/domain"
 	"github.com/onetodone/cinema-api/internal/transport/httpapi/problem"
 )
 
@@ -103,6 +106,29 @@ func (p *params) uuidCursor(r *http.Request) uuid.UUID {
 		return uuid.UUID{}
 	}
 	return id
+}
+
+// bookingStatuses parses an optional filter of booking statuses: comma-separated, as in status=pending,processing,
+// and also accepted as a repeated parameter (status=pending&status=processing), the form many client libraries
+// send arrays in. A status named twice counts once. Absent or empty means every status.
+func (p *params) bookingStatuses(r *http.Request, name string) []domain.BookingStatus {
+	var out []domain.BookingStatus
+	for _, raw := range r.URL.Query()[name] {
+		if raw == "" {
+			continue
+		}
+		for part := range strings.SplitSeq(raw, ",") {
+			s := domain.BookingStatus(part)
+			if !s.Valid() {
+				p.fail(name, "must be a comma-separated list of booking statuses: pending, processing, paid, expired, canceled")
+				return nil
+			}
+			if !slices.Contains(out, s) {
+				out = append(out, s)
+			}
+		}
+	}
+	return out
 }
 
 // date parses an optional YYYY-MM-DD query parameter; absent means the zero time.

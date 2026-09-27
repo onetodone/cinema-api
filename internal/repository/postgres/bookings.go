@@ -77,13 +77,20 @@ func (r *Bookings) GetBooking(ctx context.Context, id, userID uuid.UUID) (domain
 	return b, nil
 }
 
-// ListBookings returns up to limit bookings of userID with an id below beforeID, newest first. UUIDv7 ids
-// grow over time, so the id is a keyset pagination key.
-func (r *Bookings) ListBookings(ctx context.Context, userID, beforeID uuid.UUID, limit int) ([]domain.Booking, error) {
+// ListBookings returns up to limit bookings of userID with an id below beforeID and one of the given statuses (any
+// status when there are none), newest first. UUIDv7 ids grow over time, so the id is a keyset pagination key;
+// bookings_user_idx serves the scan, and the status filter drops rows on the way.
+func (r *Bookings) ListBookings(ctx context.Context, userID, beforeID uuid.UUID, statuses []domain.BookingStatus,
+	limit int) ([]domain.Booking, error) {
+	var only []string // nil encodes as NULL: every status
+	for _, s := range statuses {
+		only = append(only, string(s))
+	}
 	rows, err := r.pool.Query(ctx, bookingSelect+`
 WHERE b.user_id = $1 AND b.id < $2
+  AND ($4::text[] IS NULL OR b.status = ANY ($4::text[]::booking_status[]))
 ORDER BY b.id DESC
-LIMIT $3`, userID, beforeID, limit)
+LIMIT $3`, userID, beforeID, limit, only)
 	if err != nil {
 		return nil, fmt.Errorf("list bookings of user %s: %w", userID, err)
 	}
@@ -107,6 +114,19 @@ LIMIT $3`, userID, beforeID, limit)
 		list[i].Seats = seats[list[i].ID]
 	}
 	return list, nil
+}
+
+// ActiveBookingID returns the id of the pending or processing booking of userID for the showtime, or the zero UUID
+// if there is none. bookings_one_active_uq allows at most one and serves the lookup.
+func (r *Bookings) ActiveBookingID(ctx context.Context, userID uuid.UUID, showtimeID int64) (uuid.UUID, error) {
+	var id uuid.UUID
+	err := r.pool.QueryRow(ctx, `
+SELECT id FROM bookings
+WHERE user_id = $1 AND showtime_id = $2 AND status IN ('pending', 'processing')`, userID, showtimeID).Scan(&id)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return uuid.UUID{}, fmt.Errorf("find the active booking of user %s for showtime %d: %w", userID, showtimeID, err)
+	}
+	return id, nil
 }
 
 // bookedSeats returns the seats of the given bookings, in seat map order. The rows of booking_seats never
@@ -187,8 +207,9 @@ RETURNING status, expires_at, created_at, updated_at`,
 	).Scan(&b.Status, &b.ExpiresAt, &b.CreatedAt, &b.UpdatedAt)
 	switch {
 	case isUniqueViolation(err, activeBookingIndex):
-		return domain.Booking{}, domain.Conflict(domain.CodeActiveBookingExists,
-			"you already have an unpaid booking for showtime %d; pay for it or cancel it first", b.Showtime.ID)
+		// The violation aborts the transaction, so the blocking booking cannot be read here; the service reads it
+		// after the rollback.
+		return domain.Booking{}, domain.ActiveBookingExists(b.Showtime.ID, uuid.UUID{})
 	case pgErrorCode(err) == sqlstateLockNotAvailable:
 		// The unique index makes this insert wait for another uncommitted booking of the same user and showtime.
 		return domain.Booking{}, domain.Busy(domain.CodeBookingBusy,

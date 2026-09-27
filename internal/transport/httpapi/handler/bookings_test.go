@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -38,14 +39,13 @@ var sampleBooking = domain.Booking{
 
 // stubBookings records the arguments it receives and returns canned results.
 type stubBookings struct {
-	userID   uuid.UUID
-	id       uuid.UUID
-	beforeID uuid.UUID
-	limit    int
-	input    domain.NewBooking
-	booking  domain.Booking
-	page     booking.Page
-	err      error
+	userID  uuid.UUID
+	id      uuid.UUID
+	query   booking.ListQuery
+	input   domain.NewBooking
+	booking domain.Booking
+	page    booking.Page
+	err     error
 }
 
 func (s *stubBookings) Create(_ context.Context, userID uuid.UUID, nb domain.NewBooking) (domain.Booking, error) {
@@ -58,8 +58,8 @@ func (s *stubBookings) Get(_ context.Context, userID, id uuid.UUID) (domain.Book
 	return s.booking, s.err
 }
 
-func (s *stubBookings) List(_ context.Context, userID, beforeID uuid.UUID, limit int) (booking.Page, error) {
-	s.userID, s.beforeID, s.limit = userID, beforeID, limit
+func (s *stubBookings) List(_ context.Context, userID uuid.UUID, q booking.ListQuery) (booking.Page, error) {
+	s.userID, s.query = userID, q
 	return s.page, s.err
 }
 
@@ -154,6 +154,14 @@ func TestCreateBookingErrors(t *testing.T) {
 		t.Errorf("Retry-After = %q, want 1", rec.Header().Get("Retry-After"))
 	}
 
+	blocking := uuid.MustParse("01920000-0000-7000-8000-0000000000b0")
+	rec = serveBookings(t, &stubBookings{err: domain.ActiveBookingExists(11, blocking)},
+		http.MethodPost, "/v1/bookings", `{"showtime_id":11,"seat_ids":[7]}`, false)
+	p = assertProblem(t, rec, http.StatusConflict, domain.CodeActiveBookingExists)
+	if p.BookingID != blocking.String() || rec.Header().Get("Retry-After") != "" {
+		t.Errorf("booking_id = %q, Retry-After %q; want %s and none", p.BookingID, rec.Header().Get("Retry-After"), blocking)
+	}
+
 	rec = serveBookings(t, &stubBookings{err: domain.UnknownSeats(11, []int64{99})},
 		http.MethodPost, "/v1/bookings", `{"showtime_id":11,"seat_ids":[99]}`, false)
 	assertProblem(t, rec, http.StatusUnprocessableEntity, domain.CodeUnknownSeat)
@@ -174,8 +182,8 @@ func TestListBookings(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
 	}
-	if svc.limit != 1 || svc.beforeID != (uuid.UUID{}) || svc.userID != sampleUser.ID {
-		t.Errorf("service got limit %d before %s user %s", svc.limit, svc.beforeID, svc.userID)
+	if svc.query.Limit != 1 || svc.query.BeforeID != (uuid.UUID{}) || svc.query.Statuses != nil || svc.userID != sampleUser.ID {
+		t.Errorf("service got query %+v user %s", svc.query, svc.userID)
 	}
 	body := decode[struct {
 		Items      []map[string]any `json:"items"`
@@ -187,8 +195,8 @@ func TestListBookings(t *testing.T) {
 
 	// The cursor leads to the next page.
 	serveBookings(t, svc, http.MethodGet, "/v1/bookings?cursor="+body.NextCursor, "", false)
-	if svc.beforeID != next {
-		t.Errorf("cursor decoded to %s, want %s", svc.beforeID, next)
+	if svc.query.BeforeID != next {
+		t.Errorf("cursor decoded to %s, want %s", svc.query.BeforeID, next)
 	}
 
 	// An empty last page encodes as [] and has no cursor.
@@ -201,6 +209,52 @@ func TestListBookings(t *testing.T) {
 	p := assertProblem(t, rec, http.StatusBadRequest, problem.CodeValidationFailed)
 	if len(p.Errors) != 2 {
 		t.Errorf("errors = %+v, want limit and cursor", p.Errors)
+	}
+}
+
+func TestListBookingsByStatus(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		query string
+		want  []domain.BookingStatus
+	}{
+		{"status=pending", []domain.BookingStatus{domain.BookingPending}},
+		{"status=pending,processing", []domain.BookingStatus{domain.BookingPending, domain.BookingProcessing}},
+		// The repeated form that many client libraries send arrays in.
+		{"status=paid&status=expired,canceled", []domain.BookingStatus{domain.BookingPaid, domain.BookingExpired, domain.BookingCanceled}},
+		{"status=pending,pending&status=pending", []domain.BookingStatus{domain.BookingPending}},
+		{"status=", nil},
+		{"limit=5", nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.query, func(t *testing.T) {
+			t.Parallel()
+			svc := &stubBookings{}
+			if rec := serveBookings(t, svc, http.MethodGet, "/v1/bookings?"+tt.query, "", false); rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+			}
+			if !slices.Equal(svc.query.Statuses, tt.want) {
+				t.Errorf("statuses = %v, want %v", svc.query.Statuses, tt.want)
+			}
+		})
+	}
+
+	for _, query := range []string{
+		"status=held", "status=Pending", "status=pending,", "status=,pending", "status=pending%20", "status=pending&status=sold",
+	} {
+		t.Run(query, func(t *testing.T) {
+			t.Parallel()
+			svc := &stubBookings{}
+			rec := serveBookings(t, svc, http.MethodGet, "/v1/bookings?"+query, "", false)
+			p := assertProblem(t, rec, http.StatusBadRequest, problem.CodeValidationFailed)
+			if len(p.Errors) != 1 || p.Errors[0].Field != "status" {
+				t.Errorf("errors = %+v, want one on status", p.Errors)
+			}
+			if svc.userID != (uuid.UUID{}) {
+				t.Error("the service was called")
+			}
+		})
 	}
 }
 

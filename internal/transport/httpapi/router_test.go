@@ -102,7 +102,7 @@ func (noBookings) Get(_ context.Context, _, id uuid.UUID) (domain.Booking, error
 	return domain.Booking{}, domain.BookingNotFound(id)
 }
 
-func (noBookings) List(context.Context, uuid.UUID, uuid.UUID, int) (booking.Page, error) {
+func (noBookings) List(context.Context, uuid.UUID, booking.ListQuery) (booking.Page, error) {
 	return booking.Page{}, nil
 }
 

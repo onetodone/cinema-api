@@ -312,15 +312,15 @@ func TestBookingLifecycle(t *testing.T) {
 
 	// Ann can book again; her list is newest first.
 	again := must(env.svc.Create(ctx, ann, domain.NewBooking{ShowtimeID: env.st.ID, SeatIDs: []int64{a1}}))(t)
-	page := must(env.svc.List(ctx, ann, uuid.UUID{}, 1))(t)
+	page := must(env.svc.List(ctx, ann, booking.ListQuery{Limit: 1}))(t)
 	if len(page.Bookings) != 1 || page.Bookings[0].ID != again.ID || page.NextBeforeID != again.ID {
 		t.Fatalf("page 1 = %+v", page)
 	}
-	page = must(env.svc.List(ctx, ann, page.NextBeforeID, 1))(t)
+	page = must(env.svc.List(ctx, ann, booking.ListQuery{BeforeID: page.NextBeforeID, Limit: 1}))(t)
 	if len(page.Bookings) != 1 || page.Bookings[0].ID != held.ID || len(page.Bookings[0].Seats) != 2 || page.NextBeforeID != (uuid.UUID{}) {
 		t.Errorf("page 2 = %+v", page)
 	}
-	if page := must(env.svc.List(ctx, bob, uuid.UUID{}, 10))(t); len(page.Bookings) != 0 {
+	if page := must(env.svc.List(ctx, bob, booking.ListQuery{Limit: 10}))(t); len(page.Bookings) != 0 {
 		t.Errorf("bob's list = %+v", page.Bookings)
 	}
 

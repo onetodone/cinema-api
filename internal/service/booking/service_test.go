@@ -192,6 +192,10 @@ func TestCreateAllowsOneActiveBookingPerShowtime(t *testing.T) {
 	if code(err) != domain.CodeActiveBookingExists {
 		t.Fatalf("second booking: %v, want ACTIVE_BOOKING_EXISTS", err)
 	}
+	var active *domain.ActiveBookingExistsError
+	if !errors.As(err, &active) || active.BookingID != first.ID {
+		t.Errorf("the conflict names booking %v, want the first one, %s", active, first.ID)
+	}
 	if s := db.seat(1, 2); s.seat.Status != domain.SeatAvailable {
 		t.Errorf("seat 2 = %s after the rejected booking", s.seat.Status)
 	}
@@ -203,6 +207,53 @@ func TestCreateAllowsOneActiveBookingPerShowtime(t *testing.T) {
 	if _, err := svc.Create(t.Context(), ann, domain.NewBooking{ShowtimeID: 1, SeatIDs: []int64{2}}); err != nil {
 		t.Errorf("booking after cancel: %v", err)
 	}
+}
+
+func TestCreateAnswersWithoutTheBlockingBookingWhenItCannotBeRead(t *testing.T) {
+	t.Parallel()
+
+	blockingID := func(t *testing.T, err error) uuid.UUID {
+		t.Helper()
+		var active *domain.ActiveBookingExistsError
+		if !errors.As(err, &active) {
+			t.Fatalf("err = %v, want ACTIVE_BOOKING_EXISTS", err)
+		}
+		return active.BookingID
+	}
+
+	t.Run("the lookup fails", func(t *testing.T) {
+		t.Parallel()
+		svc, db := newTestService(t)
+		if _, err := svc.Create(t.Context(), ann, domain.NewBooking{ShowtimeID: 1, SeatIDs: []int64{1}}); err != nil {
+			t.Fatal(err)
+		}
+		db.activeErr = errors.New("connection reset")
+
+		_, err := svc.Create(t.Context(), ann, domain.NewBooking{ShowtimeID: 1, SeatIDs: []int64{2}})
+		if id := blockingID(t, err); id != (uuid.UUID{}) {
+			t.Errorf("booking id = %s, want none", id)
+		}
+	})
+
+	t.Run("the blocking booking ended in between", func(t *testing.T) {
+		t.Parallel()
+		svc, db := newTestService(t)
+		first, err := svc.Create(t.Context(), ann, domain.NewBooking{ShowtimeID: 1, SeatIDs: []int64{1}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The insert fails on the unique index; the owner cancels the first booking before the lookup.
+		db.afterCreate = func() {
+			b := db.state.bookings[first.ID]
+			b.Status = domain.BookingCanceled
+			db.state.bookings[first.ID] = b
+		}
+
+		_, err = svc.Create(t.Context(), ann, domain.NewBooking{ShowtimeID: 1, SeatIDs: []int64{2}})
+		if id := blockingID(t, err); id != (uuid.UUID{}) {
+			t.Errorf("booking id = %s, want none", id)
+		}
+	})
 }
 
 func TestCreateRollsBackWhenTheHoldIsIncomplete(t *testing.T) {
@@ -256,7 +307,7 @@ func TestListPagesNewestFirst(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	page1, err := svc.List(t.Context(), ann, uuid.UUID{}, 2)
+	page1, err := svc.List(t.Context(), ann, ListQuery{Limit: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -267,7 +318,7 @@ func TestListPagesNewestFirst(t *testing.T) {
 		t.Errorf("next = %s, want %s", page1.NextBeforeID, ids[1])
 	}
 
-	page2, err := svc.List(t.Context(), ann, page1.NextBeforeID, 2)
+	page2, err := svc.List(t.Context(), ann, ListQuery{BeforeID: page1.NextBeforeID, Limit: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -276,10 +327,70 @@ func TestListPagesNewestFirst(t *testing.T) {
 	}
 
 	for limit, want := range map[int]int{0: DefaultPageSize + 1, -3: DefaultPageSize + 1, 500: MaxPageSize + 1} {
-		if _, err := svc.List(t.Context(), ann, uuid.UUID{}, limit); err != nil || db.listLimit != want {
+		if _, err := svc.List(t.Context(), ann, ListQuery{Limit: limit}); err != nil || db.listLimit != want {
 			t.Errorf("List(limit %d) asked the repository for %d rows, want %d (err %v)", limit, db.listLimit, want, err)
 		}
 	}
+}
+
+func TestListFiltersByStatus(t *testing.T) {
+	t.Parallel()
+	svc, db := newTestService(t)
+	// Five bookings of ann, one per showtime, oldest first: pending, paid, canceled, pending, expired.
+	statuses := []domain.BookingStatus{
+		domain.BookingPending, domain.BookingPaid, domain.BookingCanceled, domain.BookingPending, domain.BookingExpired,
+	}
+	var ids []uuid.UUID
+	for i, status := range statuses {
+		id := int64(10 + i)
+		db.addShowtime(domain.ShowtimeRef{ID: id, Status: domain.ShowtimeScheduled}, false, id*10, 1000)
+		b, err := svc.Create(t.Context(), ann, domain.NewBooking{ShowtimeID: id, SeatIDs: []int64{id * 10}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		db.setBookingStatus(b.ID, status)
+		ids = append(ids, b.ID)
+	}
+
+	pending := ListQuery{Limit: 1, Statuses: []domain.BookingStatus{domain.BookingPending}}
+	page1, err := svc.List(t.Context(), ann, pending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page1.Bookings) != 1 || page1.Bookings[0].ID != ids[3] || page1.NextBeforeID != ids[3] {
+		t.Fatalf("page 1 = %+v, want the newest pending booking and a next page", page1)
+	}
+	pending.BeforeID = page1.NextBeforeID
+	page2, err := svc.List(t.Context(), ann, pending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page2.Bookings) != 1 || page2.Bookings[0].ID != ids[0] || page2.NextBeforeID != (uuid.UUID{}) {
+		t.Errorf("page 2 = %+v, want the older pending booking and no next page", page2)
+	}
+
+	ended, err := svc.List(t.Context(), ann, ListQuery{
+		Statuses: []domain.BookingStatus{domain.BookingExpired, domain.BookingCanceled},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := bookingIDs(ended.Bookings); !slices.Equal(got, []uuid.UUID{ids[4], ids[2]}) {
+		t.Errorf("expired or canceled = %v, want %v", got, []uuid.UUID{ids[4], ids[2]})
+	}
+
+	all, err := svc.List(t.Context(), ann, ListQuery{})
+	if err != nil || len(all.Bookings) != len(statuses) {
+		t.Errorf("without a filter: %d bookings, %v; want %d", len(all.Bookings), err, len(statuses))
+	}
+}
+
+func bookingIDs(list []domain.Booking) []uuid.UUID {
+	ids := make([]uuid.UUID, len(list))
+	for i, b := range list {
+		ids[i] = b.ID
+	}
+	return ids
 }
 
 func TestCancelReleasesSeats(t *testing.T) {

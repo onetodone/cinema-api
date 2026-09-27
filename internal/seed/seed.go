@@ -4,6 +4,7 @@ package seed
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/onetodone/cinema-api/internal/domain"
@@ -21,6 +22,9 @@ type Options struct {
 	Days     int            // number of days to schedule, starting with FirstDay
 	FirstDay time.Time      // only year, month, and day are used
 	Location *time.Location // the cinema's time zone
+	// PosterURLTemplate gives each movie a poster URL, with {slug} replaced by the Slug of its title, such as
+	// https://picsum.photos/seed/{slug}/400/600. Empty gives no posters.
+	PosterURLTemplate string
 }
 
 // Stats reports what was created.
@@ -118,6 +122,13 @@ func Run(ctx context.Context, store Store, opts Options) (Stats, error) {
 
 	created := make([]domain.Movie, 0, len(movies))
 	for _, nm := range movies {
+		if opts.PosterURLTemplate != "" {
+			nm.PosterURL = strings.ReplaceAll(opts.PosterURLTemplate, "{slug}", Slug(nm.Title))
+		}
+		// The store writes what it gets; the rules of the admin API apply to demo movies too.
+		if err := nm.Validate(); err != nil {
+			return stats, fmt.Errorf("seed movie %q: %w", nm.Title, err)
+		}
 		m, err := store.CreateMovie(ctx, nm)
 		if err != nil {
 			return stats, fmt.Errorf("seed movies: %w", err)
@@ -159,6 +170,25 @@ func Run(ctx context.Context, store Store, opts Options) (Stats, error) {
 	}
 
 	return stats, nil
+}
+
+// Slug turns a title into its ASCII letters and digits in lowercase, with a hyphen between words: "The Quiet
+// Heist" becomes "the-quiet-heist". Anything else separates words.
+func Slug(title string) string {
+	var b strings.Builder
+	gap := false
+	for _, r := range strings.ToLower(title) {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') {
+			gap = true
+			continue
+		}
+		if gap && b.Len() > 0 {
+			b.WriteByte('-')
+		}
+		gap = false
+		b.WriteRune(r)
+	}
+	return b.String()
 }
 
 // Slot is one planned showtime.

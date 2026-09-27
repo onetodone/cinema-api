@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 	"time"
+	"uuid"
 
 	"github.com/onetodone/cinema-api/internal/domain"
 	"github.com/onetodone/cinema-api/internal/transport/httpapi/render"
@@ -65,6 +66,9 @@ type Problem struct {
 	Errors    []FieldError `json:"errors,omitempty"`
 	// UnavailableSeatIDs lists the requested seats that are taken, with code SEAT_UNAVAILABLE.
 	UnavailableSeatIDs []int64 `json:"unavailable_seat_ids,omitempty"`
+	// BookingID names the caller's unpaid booking that blocks a new one, with code ACTIVE_BOOKING_EXISTS. It is
+	// absent when that booking ended before it could be read.
+	BookingID string `json:"booking_id,omitempty"`
 	// DeclineCode is the payment provider's reason, with code PAYMENT_DECLINED.
 	DeclineCode string `json:"decline_code,omitempty"`
 	// RetryAfter, in seconds, is sent as the Retry-After header when positive.
@@ -106,16 +110,21 @@ func TooManyRequests(retryAfter time.Duration) Problem {
 
 // FromError maps err to a problem. A *domain.ValidationError becomes a 400 that lists its fields. Other domain
 // errors keep their code and client-safe message; a *domain.SeatsUnavailableError adds the taken seats, a
-// *domain.PaymentDeclinedError the decline code, and busy and unavailable errors get a Retry-After. Any other
-// error becomes a generic 500, so internal details never reach clients.
+// *domain.ActiveBookingExistsError the blocking booking, a *domain.PaymentDeclinedError the decline code, and busy
+// and unavailable errors get a Retry-After. Any other error becomes a generic 500, so internal details never reach
+// clients.
 func FromError(err error) Problem {
 	p := fromError(err)
 	var (
 		unavailable *domain.SeatsUnavailableError
+		active      *domain.ActiveBookingExistsError
 		declined    *domain.PaymentDeclinedError
 	)
 	if errors.As(err, &unavailable) {
 		p.UnavailableSeatIDs = unavailable.SeatIDs
+	}
+	if errors.As(err, &active) && active.BookingID != (uuid.UUID{}) {
+		p.BookingID = active.BookingID.String()
 	}
 	if errors.As(err, &declined) {
 		p.DeclineCode = declined.DeclineCode

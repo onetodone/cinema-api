@@ -60,8 +60,9 @@ type SeatRepo interface {
 type Repo interface {
 	// Create inserts b as a pending booking together with its seats. The hold expires holdTTL after the
 	// transaction started, by the database clock. The returned booking carries the stored status and
-	// timestamps. A second active booking of the same user for the same showtime fails with
-	// ACTIVE_BOOKING_EXISTS.
+	// timestamps. A second active booking of the same user for the same showtime fails with a
+	// *domain.ActiveBookingExistsError (ACTIVE_BOOKING_EXISTS) that does not name the first one: the violation
+	// aborts the transaction, so the first booking can only be read after it.
 	Create(ctx context.Context, b domain.Booking, holdTTL time.Duration) (domain.Booking, error)
 	// LockForUser locks the booking row with this id if it belongs to userID, and reports whether the booking's
 	// hold has run out by the database clock. It fails with BOOKING_NOT_FOUND otherwise, and with BOOKING_BUSY
@@ -97,8 +98,12 @@ type PaymentRepo interface {
 type Reader interface {
 	// GetBooking returns a booking of userID with its seats, or fails with BOOKING_NOT_FOUND.
 	GetBooking(ctx context.Context, id, userID uuid.UUID) (domain.Booking, error)
-	// ListBookings returns up to limit bookings of userID with an id below beforeID, newest first.
-	ListBookings(ctx context.Context, userID, beforeID uuid.UUID, limit int) ([]domain.Booking, error)
+	// ListBookings returns up to limit bookings of userID with an id below beforeID, newest first. With statuses,
+	// only bookings in one of them count.
+	ListBookings(ctx context.Context, userID, beforeID uuid.UUID, statuses []domain.BookingStatus, limit int) ([]domain.Booking, error)
+	// ActiveBookingID returns the id of the pending or processing booking of userID for the showtime, or the zero
+	// UUID if there is none.
+	ActiveBookingID(ctx context.Context, userID uuid.UUID, showtimeID int64) (uuid.UUID, error)
 	// ListStuckPayments returns up to limit pending payments that started at least age ago by the database
 	// clock and have an id above afterID, in id order.
 	ListStuckPayments(ctx context.Context, age time.Duration, afterID uuid.UUID, limit int) ([]domain.Payment, error)

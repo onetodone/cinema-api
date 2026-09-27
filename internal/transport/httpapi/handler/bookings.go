@@ -19,7 +19,7 @@ import (
 type BookingService interface {
 	Create(ctx context.Context, userID uuid.UUID, nb domain.NewBooking) (domain.Booking, error)
 	Get(ctx context.Context, userID, id uuid.UUID) (domain.Booking, error)
-	List(ctx context.Context, userID, beforeID uuid.UUID, limit int) (booking.Page, error)
+	List(ctx context.Context, userID uuid.UUID, q booking.ListQuery) (booking.Page, error)
 	Cancel(ctx context.Context, userID, id uuid.UUID) error
 }
 
@@ -77,19 +77,23 @@ func bookingResult(err error) string {
 	}
 }
 
-// List handles GET /v1/bookings?limit=&cursor=.
+// List handles GET /v1/bookings?limit=&cursor=&status=.
 func (h *Bookings) List(w http.ResponseWriter, r *http.Request) {
 	p, ok := caller(h.logger, w, r)
 	if !ok {
 		return
 	}
 	var ps params
-	limit, beforeID := ps.limit(r, booking.MaxPageSize), ps.uuidCursor(r)
+	q := booking.ListQuery{
+		Limit:    ps.limit(r, booking.MaxPageSize),
+		BeforeID: ps.uuidCursor(r),
+		Statuses: ps.bookingStatuses(r, "status"),
+	}
 	if !ps.ok(w, r) {
 		return
 	}
 
-	page, err := h.svc.List(r.Context(), p.UserID, beforeID, limit)
+	page, err := h.svc.List(r.Context(), p.UserID, q)
 	if err != nil {
 		writeError(h.logger, w, r, err)
 		return

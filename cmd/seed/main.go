@@ -3,6 +3,8 @@
 // The admin account comes from ADMIN_EMAIL and ADMIN_PASSWORD. It is created, or promoted and given the
 // configured password, on every run; without ADMIN_PASSWORD it is skipped.
 //
+// SEED_POSTER_URL_TEMPLATE, such as https://picsum.photos/seed/{slug}/400/600, gives every demo movie a poster.
+//
 // The catalog is only seeded into a database without movies, unless -reset is given. -reset truncates the
 // catalog and every booking and payment that depends on it; users are kept.
 package main
@@ -76,9 +78,10 @@ func run() error {
 
 	start := time.Now()
 	stats, err := seed.Run(ctx, postgres.NewCatalog(pool), seed.Options{
-		Days:     *days,
-		FirstDay: time.Now().In(cfg.Cinema.Location),
-		Location: cfg.Cinema.Location,
+		Days:              *days,
+		FirstDay:          time.Now().In(cfg.Cinema.Location),
+		Location:          cfg.Cinema.Location,
+		PosterURLTemplate: cfg.Seed.PosterURLTemplate,
 	})
 	if err != nil {
 		return err

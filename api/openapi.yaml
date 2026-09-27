@@ -26,6 +26,9 @@ info:
       unknown fields.
     - `Retry-After` (seconds) marks answers that are worth retrying unchanged: 409 `SEAT_BUSY`,
       `BOOKING_BUSY`, and `IDEMPOTENCY_IN_PROGRESS`, 429, and 503.
+    - The schedule and seat maps are made for polling: they carry a weak `ETag` and `Cache-Control: no-cache`.
+      Send the tag back in `If-None-Match`, and an unchanged answer is `304 Not Modified` without a body. Browsers
+      do that by themselves. The tag depends only on the content, so every API replica gives the same one.
     - Prometheus metrics are not part of this API: they are served on a separate internal port.
 
     **Sessions**
@@ -359,7 +362,8 @@ paths:
       security: []
       description: |
         Lists the scheduled showtimes that start on one day in the cinema's time zone, by start time. Served
-        from a cache: `seats_available` may be up to 10 seconds old; the seat map is fresher.
+        from a cache: `seats_available` may be up to 10 seconds old; the seat map is fresher. Poll it with
+        `If-None-Match`.
       parameters:
         - name: date
           in: query
@@ -369,12 +373,17 @@ paths:
           in: query
           description: Only this movie's showtimes.
           schema: { type: integer, format: int64, minimum: 1 }
+        - $ref: '#/components/parameters/IfNoneMatch'
       responses:
         '200':
           description: The schedule.
+          headers:
+            ETag: { $ref: '#/components/headers/ETag' }
+            Cache-Control: { $ref: '#/components/headers/Cache-Control-No-Cache' }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Schedule' }
+        '304': { $ref: '#/components/responses/NotModified' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '500': { $ref: '#/components/responses/InternalError' }
   /v1/showtimes/{showtimeID}:
@@ -404,14 +413,21 @@ paths:
         Every seat with its status and price, by row and number (row `AA` follows `Z`). Served from a cache
         that every booking, cancellation, expiry, and sale clears at once; otherwise at most 5 seconds old. A
         booking always checks the seats in the database, so a stale map never sells a seat twice.
+
+        Poll it with `If-None-Match`: while no seat changes, the answer is `304 Not Modified`.
       parameters:
         - $ref: '#/components/parameters/ShowtimeID'
+        - $ref: '#/components/parameters/IfNoneMatch'
       responses:
         '200':
           description: The seat map.
+          headers:
+            ETag: { $ref: '#/components/headers/ETag' }
+            Cache-Control: { $ref: '#/components/headers/Cache-Control-No-Cache' }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/SeatMap' }
+        '304': { $ref: '#/components/responses/NotModified' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
         '500': { $ref: '#/components/responses/InternalError' }
@@ -425,8 +441,10 @@ paths:
         Holds the seats for the caller until `expires_at` (15 minutes by default). All or nothing: if any seat
         is taken, nothing is held, and `unavailable_seat_ids` lists every taken seat of the request.
 
-        A caller has at most one unpaid booking per showtime. Limited to 20 attempts per caller and minute.
-        With an `Idempotency-Key`, a retry gets the first answer again instead of a conflict.
+        A caller has at most one unpaid booking per showtime: a second one is `409 ACTIVE_BOOKING_EXISTS`, whose
+        `booking_id` names the first, to continue with or cancel. Seats that the caller's own unpaid booking holds
+        are taken like any other (`SEAT_UNAVAILABLE`). Limited to 20 attempts per caller and minute. With an
+        `Idempotency-Key`, a retry gets the first answer again instead of a conflict.
       security: [{ bearerAuth: [] }]
       parameters:
         - $ref: '#/components/parameters/IdempotencyKeyOptional'
@@ -456,7 +474,8 @@ paths:
             - `SEAT_UNAVAILABLE`: seats are held or sold; `unavailable_seat_ids` lists them.
             - `SEAT_BUSY`: another booking kept the seats locked for too long; retry after `Retry-After`.
             - `BOOKING_BUSY`: another request of the caller for this showtime is running; retry.
-            - `ACTIVE_BOOKING_EXISTS`: the caller has an unpaid booking for this showtime.
+            - `ACTIVE_BOOKING_EXISTS`: the caller has an unpaid booking for this showtime; `booking_id` names it
+              (absent if it ended a moment before the answer).
             - `SHOWTIME_NOT_BOOKABLE`: the showtime has started or was canceled.
             - `IDEMPOTENCY_IN_PROGRESS`: the first request with this key is still running; retry.
           headers:
@@ -475,6 +494,16 @@ paths:
                     code: SEAT_UNAVAILABLE
                     request_id: 0199a1f0-7c1e-7d2a-9b3e-5f0c2d1e4a77
                     unavailable_seat_ids: [61, 62]
+                activeBooking:
+                  value:
+                    type: about:blank
+                    title: Conflict
+                    status: 409
+                    detail: you already have an unpaid booking for showtime 18; pay for it or cancel it first
+                    instance: /v1/bookings
+                    code: ACTIVE_BOOKING_EXISTS
+                    request_id: 0199a1f0-8d2f-7a41-8c55-1b9e6f3a0c12
+                    booking_id: 0199a1ef-f2c4-7b1d-a6e0-3c8d9b2e5f41
         '413': { $ref: '#/components/responses/PayloadTooLarge' }
         '415': { $ref: '#/components/responses/UnsupportedMediaType' }
         '422':
@@ -490,11 +519,26 @@ paths:
       tags: [Bookings]
       operationId: listBookings
       summary: List the caller's bookings
-      description: Newest first.
+      description: |
+        Newest first. With `status`, only the bookings in those statuses: `status=pending,processing` finds the
+        caller's unpaid holds in one request. Pass the same `status` with `cursor` for the next page.
       security: [{ bearerAuth: [] }]
       parameters:
         - $ref: '#/components/parameters/Limit'
         - $ref: '#/components/parameters/Cursor'
+        - name: status
+          in: query
+          description: |
+            Booking statuses, separated by commas. The parameter may also be repeated
+            (`status=pending&status=processing`). Absent or empty: every status. An unknown status is
+            `400 VALIDATION_FAILED` naming `status`.
+          style: form
+          explode: false
+          schema:
+            type: array
+            items: { $ref: '#/components/schemas/BookingStatus' }
+            uniqueItems: true
+          example: [pending, processing]
       responses:
         '200':
           description: One page of bookings.
@@ -812,6 +856,13 @@ components:
       in: query
       description: The `next_cursor` of the previous page.
       schema: { type: string }
+    IfNoneMatch:
+      name: If-None-Match
+      in: header
+      description: |
+        The `ETag` of an earlier answer, or several separated by commas. When one matches the current content,
+        the answer is `304 Not Modified`. Weak and strong forms of a tag match alike.
+      schema: { type: string, example: 'W/"_xiyV6uCKMp65F0a5RmocZLNa8hASDD2_Y5JERWfJ8Y"' }
     IdempotencyKeyOptional:
       name: Idempotency-Key
       in: header
@@ -844,6 +895,13 @@ components:
     Cache-Control-No-Store:
       description: Always `no-store` (RFC 6749 §5.1).
       schema: { type: string, const: no-store }
+    Cache-Control-No-Cache:
+      description: Always `no-cache`. Browsers and caches may keep the answer, but ask again, with its `ETag`, every time.
+      schema: { type: string, const: no-cache }
+    ETag:
+      description: |
+        A weak tag of the content: the unpadded base64url SHA-256 of the body. Send it back in `If-None-Match`.
+      schema: { type: string, example: 'W/"_xiyV6uCKMp65F0a5RmocZLNa8hASDD2_Y5JERWfJ8Y"' }
     Set-Refresh-Cookie:
       description: |
         The session's current refresh token. `Max-Age` runs until the session expires; `Secure` is left out only
@@ -858,6 +916,11 @@ components:
         example: 'cinema_refresh=; Path=/v1/auth; Max-Age=0; HttpOnly; Secure; SameSite=Strict'
 
   responses:
+    NotModified:
+      description: The content has not changed since the `ETag` in `If-None-Match`. No body.
+      headers:
+        ETag: { $ref: '#/components/headers/ETag' }
+        Cache-Control: { $ref: '#/components/headers/Cache-Control-No-Cache' }
     BadRequest:
       description: |
         - `VALIDATION_FAILED`: invalid parameters or fields; `errors` lists every one of them.
@@ -944,6 +1007,12 @@ components:
           type: array
           description: With `SEAT_UNAVAILABLE`, the requested seats that are taken.
           items: { type: integer, format: int64 }
+        booking_id:
+          type: string
+          format: uuid
+          description: |
+            With `ACTIVE_BOOKING_EXISTS`, the caller's unpaid booking for the showtime. Absent if that booking ended
+            a moment before the answer.
         decline_code:
           type: string
           description: With `PAYMENT_DECLINED`, the provider's reason.
@@ -1161,17 +1230,19 @@ components:
         number: { type: integer }
         type: { $ref: '#/components/schemas/SeatType' }
         price_cents: { type: integer, description: The price the seat was booked for. }
+    BookingStatus:
+      type: string
+      description: |
+        `pending` (seats held until `expires_at`), `processing` (a payment is in flight), `paid` (seats sold),
+        `expired` (the hold ran out; seats released), `canceled` (by the owner; seats released). `pending` and
+        `processing` bookings are unpaid and hold their seats; a caller has at most one per showtime.
+      enum: [pending, processing, paid, expired, canceled]
     Booking:
       type: object
       required: [id, status, showtime, seats, total_cents, currency, expires_at, created_at]
       properties:
         id: { type: string, format: uuid }
-        status:
-          type: string
-          description: |
-            `pending` (seats held until `expires_at`), `processing` (a payment is in flight), `paid` (seats
-            sold), `expired` (the hold ran out; seats released), `canceled` (by the owner; seats released).
-          enum: [pending, processing, paid, expired, canceled]
+        status: { $ref: '#/components/schemas/BookingStatus' }
         showtime:
           type: object
           required: [id, movie, hall, starts_at]

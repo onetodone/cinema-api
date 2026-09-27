@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
+	"uuid"
 
 	"github.com/onetodone/cinema-api/internal/domain"
 	"github.com/onetodone/cinema-api/internal/transport/httpapi/requestid"
@@ -107,9 +109,35 @@ func TestFromErrorListsUnavailableSeats(t *testing.T) {
 		t.Errorf("unavailable seats = %v, want [7 9]", p.UnavailableSeatIDs)
 	}
 
-	other := FromError(domain.Conflict(domain.CodeActiveBookingExists, "one at a time"))
-	if other.UnavailableSeatIDs != nil || other.RetryAfter != 0 {
+	other := FromError(domain.Conflict(domain.CodeBookingNotCancelable, "paid"))
+	if other.UnavailableSeatIDs != nil || other.BookingID != "" || other.RetryAfter != 0 {
 		t.Errorf("a plain conflict got extensions: %+v", other)
+	}
+}
+
+func TestFromErrorNamesTheActiveBooking(t *testing.T) {
+	t.Parallel()
+
+	id := uuid.MustParse("01920000-0000-7000-8000-0000000000b1")
+	p := FromError(fmt.Errorf("create booking: %w", domain.ActiveBookingExists(11, id)))
+	if p.Status != http.StatusConflict || p.Code != domain.CodeActiveBookingExists || p.RetryAfter != 0 {
+		t.Errorf("got %d %s, Retry-After %d", p.Status, p.Code, p.RetryAfter)
+	}
+	raw, err := json.Marshal(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"booking_id":"01920000-0000-7000-8000-0000000000b1"`) {
+		t.Errorf("JSON = %s, want booking_id", raw)
+	}
+
+	// A booking that ended before it could be read leaves the member out.
+	raw, err = json.Marshal(FromError(domain.ActiveBookingExists(11, uuid.UUID{})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "booking_id") {
+		t.Errorf("JSON = %s, want no booking_id", raw)
 	}
 }
 

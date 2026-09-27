@@ -2,6 +2,7 @@ package domain
 
 import (
 	"cmp"
+	"fmt"
 	"slices"
 	"strconv"
 	"strings"
@@ -26,6 +27,15 @@ const (
 var bookingTransitions = map[BookingStatus][]BookingStatus{
 	BookingPending:    {BookingProcessing, BookingCanceled, BookingExpired},
 	BookingProcessing: {BookingPaid, BookingPending, BookingExpired},
+}
+
+// Valid reports whether s is a known booking status.
+func (s BookingStatus) Valid() bool {
+	switch s {
+	case BookingPending, BookingProcessing, BookingPaid, BookingExpired, BookingCanceled:
+		return true
+	}
+	return false
 }
 
 // CanBecome reports whether a booking in status s may change to next.
@@ -133,6 +143,30 @@ func (e *SeatsUnavailableError) Error() string { return e.err.Message }
 
 // Unwrap exposes the underlying *Error, so the code and kind are visible to errors.As and errors.Is.
 func (e *SeatsUnavailableError) Unwrap() error { return e.err }
+
+// ActiveBookingExistsError reports that the user already has an unpaid booking for the showtime, which blocks a
+// second one. It is a conflict with code CodeActiveBookingExists: errors.Is(err, ErrConflict) holds, and
+// errors.As finds the *Error.
+type ActiveBookingExistsError struct {
+	// BookingID names the blocking booking; the zero UUID when it is not known, or ended in the meantime.
+	BookingID uuid.UUID
+	err       *Error
+}
+
+// ActiveBookingExists returns an *ActiveBookingExistsError for the showtime, naming the blocking booking if
+// bookingID is not the zero UUID.
+func ActiveBookingExists(showtimeID int64, bookingID uuid.UUID) error {
+	return &ActiveBookingExistsError{
+		BookingID: bookingID,
+		err: &Error{Kind: ErrConflict, Code: CodeActiveBookingExists, Message: fmt.Sprintf(
+			"you already have an unpaid booking for showtime %d; pay for it or cancel it first", showtimeID)},
+	}
+}
+
+func (e *ActiveBookingExistsError) Error() string { return e.err.Message }
+
+// Unwrap exposes the underlying *Error, so the code and kind are visible to errors.As and errors.Is.
+func (e *ActiveBookingExistsError) Unwrap() error { return e.err }
 
 // UnknownSeats returns the UNKNOWN_SEAT error for seats that are not part of a showtime.
 func UnknownSeats(showtimeID int64, seatIDs []int64) error {

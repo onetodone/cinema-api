@@ -2,6 +2,7 @@ package seed
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -112,14 +113,14 @@ func TestRoundUp(t *testing.T) {
 
 // memStore records what the seeder creates.
 type memStore struct {
-	movies    int
+	movies    []domain.NewMovie
 	halls     []string
 	showtimes []domain.NewShowtime
 }
 
 func (m *memStore) CreateMovie(_ context.Context, nm domain.NewMovie) (domain.Movie, error) {
-	m.movies++
-	return domain.Movie{ID: int64(m.movies), Title: nm.Title, DurationMin: nm.DurationMin}, nil
+	m.movies = append(m.movies, nm)
+	return domain.Movie{ID: int64(len(m.movies)), Title: nm.Title, DurationMin: nm.DurationMin}, nil
 }
 
 func (m *memStore) CreateHall(_ context.Context, name string, _ []domain.HallRow) (domain.HallLayout, error) {
@@ -158,6 +159,74 @@ func TestRunCreatesTheWholeCatalog(t *testing.T) {
 		if s.StartsAt.Before(time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)) ||
 			!s.StartsAt.Before(time.Date(2026, 10, 4, 0, 0, 0, 0, time.UTC)) {
 			t.Errorf("showtime at %s is outside the three seeded days", s.StartsAt)
+		}
+	}
+	for _, m := range store.movies {
+		if m.PosterURL != "" {
+			t.Errorf("movie %q got poster %q without a template", m.Title, m.PosterURL)
+		}
+	}
+}
+
+func TestRunGivesPostersFromTheTemplate(t *testing.T) {
+	t.Parallel()
+
+	store := &memStore{}
+	_, err := Run(t.Context(), store, Options{
+		Days: 1, FirstDay: time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC), Location: time.UTC,
+		PosterURLTemplate: "https://picsum.photos/seed/{slug}/400/600",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(store.movies) != len(movies) {
+		t.Fatalf("%d movies created, want %d", len(store.movies), len(movies))
+	}
+	seen := map[string]bool{}
+	for _, m := range store.movies {
+		want := "https://picsum.photos/seed/" + Slug(m.Title) + "/400/600"
+		if m.PosterURL != want {
+			t.Errorf("poster of %q = %q, want %q", m.Title, m.PosterURL, want)
+		}
+		if seen[m.PosterURL] {
+			t.Errorf("two movies share the poster %q", m.PosterURL)
+		}
+		seen[m.PosterURL] = true
+	}
+	if store.movies[0].PosterURL != "https://picsum.photos/seed/the-last-projectionist/400/600" {
+		t.Errorf("first poster = %q", store.movies[0].PosterURL)
+	}
+}
+
+func TestRunRejectsAnInvalidPosterURL(t *testing.T) {
+	t.Parallel()
+
+	store := &memStore{}
+	_, err := Run(t.Context(), store, Options{
+		Days: 1, FirstDay: time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC), Location: time.UTC,
+		PosterURLTemplate: "https://img.example/{slug}/" + strings.Repeat("x", domain.MaxPosterURLLength),
+	})
+	if err == nil || !strings.Contains(err.Error(), "poster_url") {
+		t.Fatalf("err = %v, want the poster_url rule", err)
+	}
+	if len(store.movies) != 0 {
+		t.Errorf("%d movies created before the error", len(store.movies))
+	}
+}
+
+func TestSlug(t *testing.T) {
+	t.Parallel()
+
+	for title, want := range map[string]string{
+		"The Last Projectionist":  "the-last-projectionist",
+		"Salt and Thunder":        "salt-and-thunder",
+		"  Dune: Part Two (2024)": "dune-part-two-2024",
+		"Amélie":                  "am-lie",
+		"WALL·E":                  "wall-e",
+		"!!!":                     "",
+	} {
+		if got := Slug(title); got != want {
+			t.Errorf("Slug(%q) = %q, want %q", title, got, want)
 		}
 	}
 }
