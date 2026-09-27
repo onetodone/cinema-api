@@ -4,6 +4,8 @@ package seed
 import (
 	"context"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 	"time"
 
@@ -12,6 +14,8 @@ import (
 
 // Store is the write access the seeder needs. It is implemented by repository/postgres.Catalog.
 type Store interface {
+	ListGenres(ctx context.Context) ([]domain.Genre, error)
+	CreateGenre(ctx context.Context, g domain.NewGenre) (domain.Genre, error)
 	CreateMovie(ctx context.Context, m domain.NewMovie) (domain.Movie, error)
 	CreateHall(ctx context.Context, name string, rows []domain.HallRow) (domain.HallLayout, error)
 	CreateShowtime(ctx context.Context, s domain.NewShowtime) (domain.Showtime, error)
@@ -47,10 +51,26 @@ const (
 	weekendSurcharge = 200
 )
 
-// demoMovie is a movie with the language versions it is screened in; its showtimes take them in turn.
+// demoMovie is a movie with its genres, named by slug, and the language versions it is screened in; its
+// showtimes take them in turn.
 type demoMovie struct {
 	domain.NewMovie
+	genres   []string
 	versions []domain.LanguageVersion
+}
+
+// demoGenres names the genres of the demo movies. The migrations create them; the seeder creates any that an admin
+// has deleted since.
+var demoGenres = map[string]string{
+	"adventure":       "Adventure",
+	"animation":       "Animation",
+	"comedy":          "Comedy",
+	"crime":           "Crime",
+	"drama":           "Drama",
+	"family":          "Family",
+	"horror":          "Horror",
+	"science_fiction": "Science fiction",
+	"thriller":        "Thriller",
 }
 
 // Language versions of the demo showtimes.
@@ -66,8 +86,8 @@ var movies = []demoMovie{
 			Title:       "The Last Projectionist",
 			Description: "A small-town projectionist fights to keep the last film cinema in the county alive.",
 			DurationMin: 118, AgeRating: "PG-13",
-			Genres: []domain.Genre{domain.GenreDrama},
 		},
+		genres:   []string{"drama"},
 		versions: []domain.LanguageVersion{englishThaiSubs, english},
 	},
 	{
@@ -75,8 +95,8 @@ var movies = []demoMovie{
 			Title:       "Midnight Matinee",
 			Description: "A horror comedy about a late-night screening that refuses to end.",
 			DurationMin: 96, AgeRating: "R",
-			Genres: []domain.Genre{domain.GenreHorror, domain.GenreComedy},
 		},
+		genres:   []string{"horror", "comedy"},
 		versions: []domain.LanguageVersion{englishThaiSubs},
 	},
 	{
@@ -84,8 +104,8 @@ var movies = []demoMovie{
 			Title:       "Orbit of Glass",
 			Description: "The crew of a fragile research station must choose between rescue and discovery.",
 			DurationMin: 142, AgeRating: "PG-13",
-			Genres: []domain.Genre{domain.GenreScienceFiction, domain.GenreThriller},
 		},
+		genres:   []string{"science_fiction", "thriller"},
 		versions: []domain.LanguageVersion{englishThaiSubs, thaiDubbed, english},
 	},
 	{
@@ -93,8 +113,8 @@ var movies = []demoMovie{
 			Title:       "Paper Lanterns",
 			Description: "An animated journey of two siblings who follow a lantern across a sleeping city.",
 			DurationMin: 104, AgeRating: "PG",
-			Genres: []domain.Genre{domain.GenreAnimation, domain.GenreFamily, domain.GenreAdventure},
 		},
+		genres:   []string{"animation", "family", "adventure"},
 		versions: []domain.LanguageVersion{thaiDubbed, englishThaiSubs},
 	},
 	{
@@ -102,8 +122,8 @@ var movies = []demoMovie{
 			Title:       "The Quiet Heist",
 			Description: "Four retired engineers plan a robbery that must not make a sound.",
 			DurationMin: 127, AgeRating: "R",
-			Genres: []domain.Genre{domain.GenreCrime, domain.GenreComedy},
 		},
+		genres:   []string{"crime", "comedy"},
 		versions: []domain.LanguageVersion{englishThaiSubs, english},
 	},
 	{
@@ -111,8 +131,8 @@ var movies = []demoMovie{
 			Title:       "Salt and Thunder",
 			Description: "A sailing race around a storm-bound archipelago turns into a rescue mission.",
 			DurationMin: 133, AgeRating: "PG-13",
-			Genres: []domain.Genre{domain.GenreAdventure, domain.GenreDrama},
 		},
+		genres:   []string{"adventure", "drama"},
 		versions: []domain.LanguageVersion{englishThaiSubs, thaiDubbed},
 	},
 }
@@ -157,10 +177,18 @@ func rows(specs ...rowSpec) []domain.HallRow {
 func Run(ctx context.Context, store Store, opts Options) (Stats, error) {
 	var stats Stats
 
+	genreIDs, err := resolveGenres(ctx, store)
+	if err != nil {
+		return stats, err
+	}
+
 	created := make([]domain.Movie, 0, len(movies))
 	versions := make(map[int64][]domain.LanguageVersion, len(movies)) // by movie id
 	for _, dm := range movies {
 		nm := dm.NewMovie
+		for _, slug := range dm.genres {
+			nm.GenreIDs = append(nm.GenreIDs, genreIDs[slug])
+		}
 		if opts.PosterURLTemplate != "" {
 			nm.PosterURL = strings.ReplaceAll(opts.PosterURLTemplate, "{slug}", Slug(nm.Title))
 		}
@@ -214,6 +242,31 @@ func Run(ctx context.Context, store Store, opts Options) (Stats, error) {
 	}
 
 	return stats, nil
+}
+
+// resolveGenres returns the ids of the demo genres by slug, and creates the ones that do not exist.
+func resolveGenres(ctx context.Context, store Store) (map[string]int64, error) {
+	existing, err := store.ListGenres(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("seed genres: %w", err)
+	}
+	ids := make(map[string]int64, len(demoGenres))
+	for _, g := range existing {
+		if _, ok := demoGenres[g.Slug]; ok {
+			ids[g.Slug] = g.ID
+		}
+	}
+	for _, slug := range slices.Sorted(maps.Keys(demoGenres)) {
+		if _, ok := ids[slug]; ok {
+			continue
+		}
+		g, err := store.CreateGenre(ctx, domain.NewGenre{Slug: slug, Name: demoGenres[slug]})
+		if err != nil {
+			return nil, fmt.Errorf("seed genre %s: %w", slug, err)
+		}
+		ids[slug] = g.ID
+	}
+	return ids, nil
 }
 
 // Slug turns a title into its ASCII letters and digits in lowercase, with a hyphen between words: "The Quiet

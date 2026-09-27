@@ -18,6 +18,8 @@ info:
     - Money is in integer cents of the currency named next to it.
     - Languages are lowercase ISO 639-3 codes, such as `eng` or `tha`. A showtime has one `audio_language` and at
       most one `subtitle_language`; a client can show them upper-cased, as in "ENG | SUB: THA".
+    - Genres are managed by admins. A movie's `genres` are objects with `id`, `slug`, and `name`; requests refer
+      to a genre by `id`. `GET /v1/genres` lists them all.
     - Lists use keyset pagination: pass `next_cursor` of one page as `cursor` to get the next. A page without
       `next_cursor` is the last one. Cursors are opaque.
     - Errors are `application/problem+json` (RFC 9457) with `type: about:blank`. Clients branch on `code`,
@@ -28,9 +30,9 @@ info:
       unknown fields.
     - `Retry-After` (seconds) marks answers that are worth retrying unchanged: 409 `SEAT_BUSY`,
       `BOOKING_BUSY`, and `IDEMPOTENCY_IN_PROGRESS`, 429, and 503.
-    - The schedule and seat maps are made for polling: they carry a weak `ETag` and `Cache-Control: no-cache`.
-      Send the tag back in `If-None-Match`, and an unchanged answer is `304 Not Modified` without a body. Browsers
-      do that by themselves. The tag depends only on the content, so every API replica gives the same one.
+    - The schedule, seat maps, and the genre list are made for polling: they carry a weak `ETag` and
+      `Cache-Control: no-cache`. Send the tag back in `If-None-Match`, and an unchanged answer is
+      `304 Not Modified` without a body. Browsers do that by themselves. The tag depends only on the content, so every API replica gives the same one.
     - Prometheus metrics are not part of this API: they are served on a separate internal port.
 
     **Sessions**
@@ -353,6 +355,45 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/MovieDetails' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /v1/genres:
+    get:
+      tags: [Catalog]
+      operationId: listGenres
+      summary: Every genre
+      security: []
+      description: |
+        Lists the genres that admins have created, by name. A movie's `genres` hold the same objects. The list
+        changes only when an admin changes it; revalidate it with `If-None-Match`.
+      parameters:
+        - $ref: '#/components/parameters/IfNoneMatch'
+      responses:
+        '200':
+          description: The genres.
+          headers:
+            ETag: { $ref: '#/components/headers/ETag' }
+            Cache-Control: { $ref: '#/components/headers/Cache-Control-No-Cache' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GenreList' }
+        '304': { $ref: '#/components/responses/NotModified' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /v1/genres/{genreID}:
+    get:
+      tags: [Catalog]
+      operationId: getGenre
+      summary: A genre
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/GenreID'
+      responses:
+        '200':
+          description: The genre.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Genre' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
         '500': { $ref: '#/components/responses/InternalError' }
@@ -717,7 +758,9 @@ paths:
       tags: [Admin]
       operationId: createMovie
       summary: Add a movie
-      description: Surrounding space is trimmed from every text field. `genres` is optional.
+      description: |
+        Surrounding space is trimmed from every text field. `genre_ids` is optional; an id that no genre has is
+        refused under `genre_ids[i]`.
       security: [{ bearerAuth: [] }]
       requestBody:
         required: true
@@ -737,6 +780,127 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '413': { $ref: '#/components/responses/PayloadTooLarge' }
         '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /v1/admin/movies/{movieID}/genres:
+    put:
+      tags: [Admin]
+      operationId: setMovieGenres
+      summary: Replace the genres of a movie
+      description: |
+        Sets the movie's genres to `genre_ids`, most characteristic first. `[]` removes every genre; a missing
+        `genre_ids` is refused, so an empty body cannot clear them by accident. Cached schedules and seat maps
+        show the change within 10 seconds.
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/MovieID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SetMovieGenresRequest' }
+            example: { genre_ids: [11, 4] }
+      responses:
+        '200':
+          description: The movie with its new genres.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Movie' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /v1/admin/genres:
+    post:
+      tags: [Admin]
+      operationId: createGenre
+      summary: Add a genre
+      description: Surrounding space is trimmed from both fields, and the slug is lower-cased.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/GenreRequest' }
+      responses:
+        '201':
+          description: The genre.
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Genre' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: |
+            `GENRE_SLUG_TAKEN`: another genre has the slug. `GENRE_NAME_TAKEN`: another genre has the name,
+            regardless of case.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /v1/admin/genres/{genreID}:
+    put:
+      tags: [Admin]
+      operationId: updateGenre
+      summary: Change a genre
+      description: |
+        Replaces the slug and name, normalized as on creation. Movies show the new name at once; cached schedules
+        and seat maps within 10 seconds.
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/GenreID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/GenreRequest' }
+      responses:
+        '200':
+          description: The genre.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Genre' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: |
+            `GENRE_SLUG_TAKEN`: another genre has the slug. `GENRE_NAME_TAKEN`: another genre has the name,
+            regardless of case.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    delete:
+      tags: [Admin]
+      operationId: deleteGenre
+      summary: Delete a genre
+      description: Only a genre that no movie has can be deleted; remove it from its movies first.
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/GenreID'
+      responses:
+        '204':
+          description: The genre is deleted.
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: '`GENRE_IN_USE`: a movie has the genre.'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '500': { $ref: '#/components/responses/InternalError' }
   /v1/admin/halls:
     post:
@@ -834,6 +998,11 @@ components:
   parameters:
     MovieID:
       name: movieID
+      in: path
+      required: true
+      schema: { type: integer, format: int64, minimum: 1 }
+    GenreID:
+      name: genreID
       in: path
       required: true
       schema: { type: integer, format: int64, minimum: 1 }
@@ -963,7 +1132,7 @@ components:
         application/problem+json:
           schema: { $ref: '#/components/schemas/Problem' }
     NotFound:
-      description: '`MOVIE_NOT_FOUND`, `SHOWTIME_NOT_FOUND`, or `BOOKING_NOT_FOUND`.'
+      description: '`MOVIE_NOT_FOUND`, `SHOWTIME_NOT_FOUND`, `BOOKING_NOT_FOUND`, or `GENRE_NOT_FOUND`.'
       content:
         application/problem+json:
           schema: { $ref: '#/components/schemas/Problem' }
@@ -1112,17 +1281,60 @@ components:
           items: { $ref: '#/components/schemas/Session' }
 
     Genre:
+      type: object
+      required: [id, slug, name]
+      properties:
+        id: { type: integer, format: int64, description: How requests refer to the genre., example: 11 }
+        slug: { $ref: '#/components/schemas/GenreSlug' }
+        name: { $ref: '#/components/schemas/GenreName' }
+    GenreSlug:
       type: string
-      description: A stable slug for clients to translate and filter on.
-      enum: [action, adventure, animation, comedy, crime, documentary, drama, family, fantasy, history, horror,
-        music, mystery, romance, science_fiction, thriller, war, western]
+      description: Unique. Lowercase letters and digits in groups joined by single underscores.
+      maxLength: 50
+      pattern: '^[a-z0-9]+(_[a-z0-9]+)*$'
+      example: science_fiction
+    GenreName:
+      type: string
+      description: Unique regardless of case.
+      minLength: 1
+      maxLength: 100
+      example: Science fiction
     Genres:
       type: array
       description: Most characteristic first; empty when the movie has none.
       maxItems: 5
-      uniqueItems: true
       items: { $ref: '#/components/schemas/Genre' }
-      example: [horror, comedy]
+      example:
+        - { id: 11, slug: horror, name: Horror }
+        - { id: 4, slug: comedy, name: Comedy }
+    GenreList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          description: Every genre, by name regardless of case.
+          items: { $ref: '#/components/schemas/Genre' }
+    GenreIDs:
+      type: array
+      description: Genre ids, most characteristic first. Each must name an existing genre.
+      maxItems: 5
+      uniqueItems: true
+      items: { type: integer, format: int64, minimum: 1 }
+      example: [11, 4]
+    GenreRequest:
+      type: object
+      required: [slug, name]
+      additionalProperties: false
+      properties:
+        slug: { $ref: '#/components/schemas/GenreSlug' }
+        name: { $ref: '#/components/schemas/GenreName' }
+    SetMovieGenresRequest:
+      type: object
+      required: [genre_ids]
+      additionalProperties: false
+      properties:
+        genre_ids: { $ref: '#/components/schemas/GenreIDs' }
     LanguageCode:
       type: string
       description: A lowercase ISO 639-3 language code.
@@ -1363,7 +1575,7 @@ components:
         duration_min: { type: integer, minimum: 1, maximum: 600 }
         age_rating: { type: string, maxLength: 16 }
         poster_url: { type: string, format: uri, maxLength: 2048, description: An absolute http or https URL. }
-        genres: { $ref: '#/components/schemas/Genres' }
+        genre_ids: { $ref: '#/components/schemas/GenreIDs' }
     CreateHallRequest:
       type: object
       required: [name, rows]

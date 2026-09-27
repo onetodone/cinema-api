@@ -44,6 +44,15 @@ func (m *Migrator) Up(ctx context.Context) ([]*goose.MigrationResult, error) {
 	return results, nil
 }
 
+// UpTo applies the pending migrations up to and including version, and returns the ones it applied.
+func (m *Migrator) UpTo(ctx context.Context, version int64) ([]*goose.MigrationResult, error) {
+	results, err := m.provider.UpTo(ctx, version)
+	if err != nil {
+		return results, fmt.Errorf("migrate up to %d: %w", version, err)
+	}
+	return results, nil
+}
+
 // Down rolls back the most recent migration.
 func (m *Migrator) Down(ctx context.Context) (*goose.MigrationResult, error) {
 	result, err := m.provider.Down(ctx)

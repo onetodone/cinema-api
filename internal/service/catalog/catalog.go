@@ -40,6 +40,8 @@ type Repository interface {
 	ListShowtimes(ctx context.Context, f domain.ShowtimeFilter) ([]domain.Showtime, error)
 	GetShowtime(ctx context.Context, id int64) (domain.Showtime, error)
 	ListShowtimeSeats(ctx context.Context, showtimeID int64) ([]domain.ShowtimeSeat, error)
+	ListGenres(ctx context.Context) ([]domain.Genre, error)
+	GetGenre(ctx context.Context, id int64) (domain.Genre, error)
 }
 
 // Cache keeps seat maps and day schedules for a short time. It is implemented by repository/redis.CatalogCache.
@@ -184,6 +186,17 @@ func (s *Service) Schedule(ctx context.Context, q ScheduleQuery) (Schedule, erro
 		}
 	}
 	return Schedule{Day: start, Showtimes: showtimes}, nil
+}
+
+// ListGenres returns every genre, ordered by name. It is not cached: the list is small, and admins expect their
+// changes to show at once.
+func (s *Service) ListGenres(ctx context.Context) ([]domain.Genre, error) {
+	return s.repo.ListGenres(ctx)
+}
+
+// GetGenre returns one genre, or a GENRE_NOT_FOUND error.
+func (s *Service) GetGenre(ctx context.Context, id int64) (domain.Genre, error) {
+	return s.repo.GetGenre(ctx, id)
 }
 
 // GetShowtime returns one showtime.

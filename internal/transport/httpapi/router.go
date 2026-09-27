@@ -112,6 +112,8 @@ func newMux(d RouterDeps) (*http.ServeMux, []string) {
 
 	handle("GET /v1/movies", public(d.Catalog.ListMovies))
 	handle("GET /v1/movies/{movieID}", public(d.Catalog.GetMovie))
+	handle("GET /v1/genres", public(d.Catalog.ListGenres))
+	handle("GET /v1/genres/{genreID}", public(d.Catalog.GetGenre))
 	handle("GET /v1/showtimes", public(d.Catalog.Schedule))
 	handle("GET /v1/showtimes/{showtimeID}", public(d.Catalog.GetShowtime))
 	handle("GET /v1/showtimes/{showtimeID}/seats", public(d.Catalog.SeatMap))
@@ -125,6 +127,10 @@ func newMux(d RouterDeps) (*http.ServeMux, []string) {
 	handle("POST /v1/bookings/{bookingID}/payments", user(d.Payments.Pay, idempotent(true)))
 
 	handle("POST /v1/admin/movies", admin(d.Admin.CreateMovie))
+	handle("PUT /v1/admin/movies/{movieID}/genres", admin(d.Admin.SetMovieGenres))
+	handle("POST /v1/admin/genres", admin(d.Admin.CreateGenre))
+	handle("PUT /v1/admin/genres/{genreID}", admin(d.Admin.UpdateGenre))
+	handle("DELETE /v1/admin/genres/{genreID}", admin(d.Admin.DeleteGenre))
 	handle("POST /v1/admin/halls", admin(d.Admin.CreateHall))
 	handle("POST /v1/admin/showtimes", admin(d.Admin.CreateShowtime))
 

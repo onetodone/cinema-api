@@ -18,6 +18,16 @@ type Repository interface {
 	// CreateShowtime stores a showtime and its seat inventory in one transaction. It fails with MOVIE_NOT_FOUND,
 	// HALL_NOT_FOUND, or HALL_OVERLAP when another scheduled showtime occupies the hall at an overlapping time.
 	CreateShowtime(ctx context.Context, s domain.NewShowtime) (domain.Showtime, error)
+
+	// CreateGenre and UpdateGenre fail with GENRE_SLUG_TAKEN or GENRE_NAME_TAKEN when another genre has the slug,
+	// or the name regardless of case; UpdateGenre and DeleteGenre with GENRE_NOT_FOUND. DeleteGenre fails with
+	// GENRE_IN_USE while a movie has the genre.
+	CreateGenre(ctx context.Context, g domain.NewGenre) (domain.Genre, error)
+	UpdateGenre(ctx context.Context, id int64, g domain.NewGenre) (domain.Genre, error)
+	DeleteGenre(ctx context.Context, id int64) error
+	// SetMovieGenres replaces the genres of a movie. It fails with MOVIE_NOT_FOUND, or with a
+	// *domain.ValidationError naming the ids that no genre has.
+	SetMovieGenres(ctx context.Context, movieID int64, genreIDs []int64) (domain.Movie, error)
 }
 
 // ScheduleCache is told when a showtime is added, so that the cached schedule of its day lists it at once instead
@@ -59,8 +69,8 @@ func New(repo Repository, loc *time.Location, opts ...Option) *Service {
 	return s
 }
 
-// CreateMovie adds a movie. Surrounding space is trimmed from every text field. Invalid input fails with a
-// *domain.ValidationError listing every bad field.
+// CreateMovie adds a movie with its genres. Surrounding space is trimmed from every text field. Invalid input,
+// including genre ids that no genre has, fails with a *domain.ValidationError listing every bad field.
 func (s *Service) CreateMovie(ctx context.Context, m domain.NewMovie) (domain.Movie, error) {
 	m.Title = strings.TrimSpace(m.Title)
 	m.Description = strings.TrimSpace(m.Description)
@@ -70,6 +80,51 @@ func (s *Service) CreateMovie(ctx context.Context, m domain.NewMovie) (domain.Mo
 		return domain.Movie{}, err
 	}
 	return s.repo.CreateMovie(ctx, m)
+}
+
+// SetMovieGenres replaces the genres of a movie with genreIDs, most characteristic first, and returns the movie.
+// Cached schedules and seat maps show the change within their TTL.
+//
+// Errors: a *domain.ValidationError; MOVIE_NOT_FOUND.
+func (s *Service) SetMovieGenres(ctx context.Context, movieID int64, genreIDs []int64) (domain.Movie, error) {
+	if err := domain.CheckGenreIDs(genreIDs); err != nil {
+		return domain.Movie{}, err
+	}
+	return s.repo.SetMovieGenres(ctx, movieID, genreIDs)
+}
+
+// CreateGenre adds a genre. Surrounding space is trimmed from both fields, and the slug is lower-cased.
+//
+// Errors: a *domain.ValidationError; GENRE_SLUG_TAKEN; GENRE_NAME_TAKEN.
+func (s *Service) CreateGenre(ctx context.Context, g domain.NewGenre) (domain.Genre, error) {
+	g = normalizeGenre(g)
+	if err := g.Validate(); err != nil {
+		return domain.Genre{}, err
+	}
+	return s.repo.CreateGenre(ctx, g)
+}
+
+// UpdateGenre replaces the slug and name of a genre, normalized as by CreateGenre. Movies show the new name at
+// once; cached schedules and seat maps within their TTL.
+//
+// Errors: a *domain.ValidationError; GENRE_NOT_FOUND; GENRE_SLUG_TAKEN; GENRE_NAME_TAKEN.
+func (s *Service) UpdateGenre(ctx context.Context, id int64, g domain.NewGenre) (domain.Genre, error) {
+	g = normalizeGenre(g)
+	if err := g.Validate(); err != nil {
+		return domain.Genre{}, err
+	}
+	return s.repo.UpdateGenre(ctx, id, g)
+}
+
+// DeleteGenre deletes a genre that no movie has.
+//
+// Errors: GENRE_NOT_FOUND; GENRE_IN_USE.
+func (s *Service) DeleteGenre(ctx context.Context, id int64) error {
+	return s.repo.DeleteGenre(ctx, id)
+}
+
+func normalizeGenre(g domain.NewGenre) domain.NewGenre {
+	return domain.NewGenre{Slug: strings.ToLower(strings.TrimSpace(g.Slug)), Name: strings.TrimSpace(g.Name)}
 }
 
 // CreateHall adds a hall with its seats and returns them, in seat map order. Surrounding space is trimmed from the

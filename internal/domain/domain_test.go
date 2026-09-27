@@ -127,7 +127,7 @@ func TestNewMovieValidate(t *testing.T) {
 
 	valid := NewMovie{
 		Title: "Dune", DurationMin: 155, AgeRating: "PG-13", PosterURL: "https://img.example/dune.jpg",
-		Genres: []Genre{GenreScienceFiction, GenreAdventure, GenreDrama, GenreWar, GenreAction},
+		GenreIDs: []int64{15, 2, 7, 17, 1},
 	}
 	if err := valid.Validate(); err != nil {
 		t.Fatalf("valid movie: %v", err)
@@ -154,16 +154,15 @@ func TestNewMovieValidate(t *testing.T) {
 		{name: "long poster", edit: func(m *NewMovie) {
 			m.PosterURL = "https://img.example/" + strings.Repeat("a", MaxPosterURLLength)
 		}, fields: []string{"poster_url"}},
-		{name: "unknown genre", edit: func(m *NewMovie) { m.Genres = []Genre{GenreDrama, "sci-fi"} }, fields: []string{"genres[1]"}},
-		{name: "genre in upper case", edit: func(m *NewMovie) { m.Genres = []Genre{"Drama"} }, fields: []string{"genres[0]"}},
-		{name: "empty genre", edit: func(m *NewMovie) { m.Genres = []Genre{""} }, fields: []string{"genres[0]"}},
+		{name: "zero genre id", edit: func(m *NewMovie) { m.GenreIDs = []int64{7, 0} }, fields: []string{"genre_ids[1]"}},
+		{name: "negative genre id", edit: func(m *NewMovie) { m.GenreIDs = []int64{-7} }, fields: []string{"genre_ids[0]"}},
 		{name: "repeated genre", edit: func(m *NewMovie) {
-			m.Genres = []Genre{GenreDrama, GenreWar, GenreDrama}
-		}, fields: []string{"genres[2]"}},
-		{name: "too many genres", edit: func(m *NewMovie) { m.Genres = append(m.Genres, GenreHistory) }, fields: []string{"genres"}},
+			m.GenreIDs = []int64{7, 17, 7}
+		}, fields: []string{"genre_ids[2]"}},
+		{name: "too many genres", edit: func(m *NewMovie) { m.GenreIDs = append(m.GenreIDs, 10) }, fields: []string{"genre_ids"}},
 		{name: "everything wrong", edit: func(m *NewMovie) {
-			*m = NewMovie{PosterURL: "ftp://x/y", Genres: []Genre{"noir"}}
-		}, fields: []string{"title", "duration_min", "poster_url", "genres[0]"}},
+			*m = NewMovie{PosterURL: "ftp://x/y", GenreIDs: []int64{0}}
+		}, fields: []string{"title", "duration_min", "poster_url", "genre_ids[0]"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

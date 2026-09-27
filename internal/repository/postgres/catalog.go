@@ -21,22 +21,25 @@ func NewCatalog(pool *pgxpool.Pool) *Catalog {
 	return &Catalog{pool: pool}
 }
 
-const movieColumns = `id, title, description, duration_min, age_rating, poster_url, genres::text[], created_at`
+// movieColumns selects a movie aliased m.
+const movieColumns = `m.id, m.title, m.description, m.duration_min, m.age_rating, m.poster_url, ` + movieGenres +
+	`, m.created_at`
 
 func scanMovie(row pgx.Row) (domain.Movie, error) {
 	var (
 		m                    domain.Movie
 		ageRating, posterURL *string
+		genres               genreList
 	)
-	err := row.Scan(&m.ID, &m.Title, &m.Description, &m.DurationMin, &ageRating, &posterURL, &m.Genres, &m.CreatedAt)
-	m.AgeRating, m.PosterURL = deref(ageRating), deref(posterURL)
+	err := row.Scan(&m.ID, &m.Title, &m.Description, &m.DurationMin, &ageRating, &posterURL, &genres, &m.CreatedAt)
+	m.AgeRating, m.PosterURL, m.Genres = deref(ageRating), deref(posterURL), genres.domain()
 	return m, err
 }
 
 // ListMovies returns up to limit movies with an id greater than afterID, ordered by id (keyset pagination).
 func (c *Catalog) ListMovies(ctx context.Context, afterID int64, limit int) ([]domain.Movie, error) {
 	rows, err := c.pool.Query(ctx,
-		`SELECT `+movieColumns+` FROM movies WHERE id > $1 ORDER BY id LIMIT $2`, afterID, limit)
+		`SELECT `+movieColumns+` FROM movies m WHERE m.id > $1 ORDER BY m.id LIMIT $2`, afterID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list movies: %w", err)
 	}
@@ -49,7 +52,11 @@ func (c *Catalog) ListMovies(ctx context.Context, afterID int64, limit int) ([]d
 
 // GetMovie returns one movie or a MOVIE_NOT_FOUND error.
 func (c *Catalog) GetMovie(ctx context.Context, id int64) (domain.Movie, error) {
-	m, err := scanMovie(c.pool.QueryRow(ctx, `SELECT `+movieColumns+` FROM movies WHERE id = $1`, id))
+	return getMovie(ctx, c.pool, id)
+}
+
+func getMovie(ctx context.Context, q querier, id int64) (domain.Movie, error) {
+	m, err := scanMovie(q.QueryRow(ctx, `SELECT `+movieColumns+` FROM movies m WHERE m.id = $1`, id))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.Movie{}, domain.NotFound(domain.CodeMovieNotFound, "movie %d not found", id)
 	}
@@ -62,7 +69,7 @@ func (c *Catalog) GetMovie(ctx context.Context, id int64) (domain.Movie, error) 
 // showtimeSelect joins a showtime with its movie, hall, and live seat counts.
 const showtimeSelect = `
 SELECT s.id, s.starts_at, s.ends_at, s.audio_language, s.subtitle_language, s.base_price_cents, s.status,
-       m.id, m.title, m.duration_min, m.age_rating, m.genres::text[],
+       m.id, m.title, m.duration_min, m.age_rating, ` + movieGenres + `,
        h.id, h.name,
        inv.available, inv.total
 FROM showtimes s
@@ -79,14 +86,15 @@ func scanShowtime(row pgx.Row) (domain.Showtime, error) {
 	var (
 		s                    domain.Showtime
 		subtitles, ageRating *string
+		genres               genreList
 	)
 	err := row.Scan(
 		&s.ID, &s.StartsAt, &s.EndsAt, &s.Language.Audio, &subtitles, &s.BasePriceCents, &s.Status,
-		&s.Movie.ID, &s.Movie.Title, &s.Movie.DurationMin, &ageRating, &s.Movie.Genres,
+		&s.Movie.ID, &s.Movie.Title, &s.Movie.DurationMin, &ageRating, &genres,
 		&s.Hall.ID, &s.Hall.Name,
 		&s.SeatsAvailable, &s.SeatsTotal,
 	)
-	s.Language.Subtitles, s.Movie.AgeRating = deref(subtitles), deref(ageRating)
+	s.Language.Subtitles, s.Movie.AgeRating, s.Movie.Genres = deref(subtitles), deref(ageRating), genres.domain()
 	return s, err
 }
 

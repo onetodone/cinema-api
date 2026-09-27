@@ -119,7 +119,7 @@ func ensureAdmin(ctx context.Context, pool *pgxpool.Pool, cfg config.AuthConfig)
 
 func resetCatalog(ctx context.Context, pool *pgxpool.Pool) error {
 	_, err := pool.Exec(ctx, `
-TRUNCATE payments, booking_seats, showtime_seats, bookings, showtimes, hall_seats, halls, movies
+TRUNCATE payments, booking_seats, showtime_seats, bookings, showtimes, hall_seats, halls, movie_genres, movies
 RESTART IDENTITY`)
 	if err != nil {
 		return fmt.Errorf("reset catalog: %w", err)

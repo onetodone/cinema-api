@@ -3,6 +3,7 @@
 package integration
 
 import (
+	"slices"
 	"testing"
 	"time"
 
@@ -36,7 +37,7 @@ WHERE table_schema = 'public' AND table_name <> 'goose_db_version'`).Scan(&n)
 	if _, err := m.Up(ctx); err != nil {
 		t.Fatalf("up: %v", err)
 	}
-	const wantTables = 10
+	const wantTables = 12
 	if got := tables(); got != wantTables {
 		t.Fatalf("after up: %d tables, want %d", got, wantTables)
 	}
@@ -101,7 +102,7 @@ INSERT INTO showtimes (movie_id, hall_id, starts_at, ends_at, base_price_cents)
 SELECT m.id, h.id, $1::timestamptz, $1::timestamptz + interval '2 hours', 900 FROM movies m, halls h`
 	exec(t, pool, oldShowtime, base)
 
-	if _, err := m.Up(ctx); err != nil {
+	if _, err := m.UpTo(ctx, 3); err != nil {
 		t.Fatalf("up to 3: %v", err)
 	}
 	var (
@@ -122,5 +123,74 @@ SELECT s.audio_language, s.subtitle_language, m.genres::text[] FROM showtimes s 
 	_, err = pool.Exec(ctx, oldShowtime, base.Add(24*time.Hour))
 	if pgCode(err) != "23502" { // not_null_violation: the backfill default is gone
 		t.Errorf("a showtime without audio = %v, want a not-null violation", err)
+	}
+}
+
+// TestGenreCatalogMigrationMovesGenres applies 00004 to movies with genres from the old enum: each keeps its
+// genres, in order, as rows of the new catalog. Down moves them back, except for genres the enum does not know.
+func TestGenreCatalogMigrationMovesGenres(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	pool := newEmptyDB(t)
+
+	m, err := dbmigrate.New(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = m.Close() }()
+	if _, err := m.UpTo(ctx, 3); err != nil {
+		t.Fatalf("up to 3: %v", err)
+	}
+	exec(t, pool, `
+INSERT INTO movies (title, duration_min, genres) VALUES
+    ('Midnight Matinee', 96, '{horror,comedy}'),
+    ('Orbit of Glass', 142, '{science_fiction,thriller,drama}'),
+    ('Untagged', 90, '{}')`)
+
+	if _, err := m.Up(ctx); err != nil {
+		t.Fatalf("up: %v", err)
+	}
+	genresOf := func(title string) []string {
+		t.Helper()
+		var names []string
+		err := pool.QueryRow(ctx, `
+SELECT coalesce(array_agg(g.slug || ':' || g.name ORDER BY mg.position), '{}')
+FROM movie_genres mg
+JOIN genres g ON g.id = mg.genre_id
+JOIN movies m ON m.id = mg.movie_id
+WHERE m.title = $1`, title).Scan(&names)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return names
+	}
+	if got := genresOf("Midnight Matinee"); !slices.Equal(got, []string{"horror:Horror", "comedy:Comedy"}) {
+		t.Errorf("Midnight Matinee = %v", got)
+	}
+	if got := genresOf("Orbit of Glass"); !slices.Equal(got, []string{"science_fiction:Science fiction", "thriller:Thriller", "drama:Drama"}) {
+		t.Errorf("Orbit of Glass = %v", got)
+	}
+	if got := genresOf("Untagged"); len(got) != 0 {
+		t.Errorf("Untagged = %v, want no genres", got)
+	}
+	if n := countRows(t, pool, `SELECT count(*) FROM genres`); n != 18 {
+		t.Errorf("%d genres, want the 18 of the old enum", n)
+	}
+
+	// An admin adds a genre the old enum does not know; it cannot move back.
+	exec(t, pool, `INSERT INTO genres (slug, name) VALUES ('noir', 'Noir')`)
+	exec(t, pool, `
+INSERT INTO movie_genres (movie_id, genre_id, position)
+SELECT m.id, g.id, 3 FROM movies m, genres g WHERE m.title = 'Midnight Matinee' AND g.slug = 'noir'`)
+
+	if _, err := m.DownTo(ctx, 3); err != nil {
+		t.Fatalf("down to 3: %v", err)
+	}
+	var back []string
+	if err := pool.QueryRow(ctx, `SELECT array_agg(array_to_string(genres, ',') ORDER BY id) FROM movies`).Scan(&back); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(back, []string{"horror,comedy", "science_fiction,thriller,drama", ""}) {
+		t.Errorf("genres after down = %q", back)
 	}
 }

@@ -11,14 +11,26 @@ import (
 	"github.com/onetodone/cinema-api/internal/domain"
 )
 
-// CreateMovie inserts a movie and returns it with its generated id.
+// CreateMovie inserts a movie with its genres in one transaction and returns it with its generated id. Genre
+// ids that no genre has fail with a *domain.ValidationError.
 func (c *Catalog) CreateMovie(ctx context.Context, nm domain.NewMovie) (domain.Movie, error) {
-	m, err := scanMovie(c.pool.QueryRow(ctx, `
-INSERT INTO movies (title, description, duration_min, age_rating, poster_url, genres)
-VALUES ($1, $2, $3, $4, $5, $6::text[]::movie_genre[])
-RETURNING `+movieColumns,
-		nm.Title, nm.Description, nm.DurationMin, nullable(nm.AgeRating), nullable(nm.PosterURL),
-		genreNames(nm.Genres)))
+	var m domain.Movie
+	err := pgx.BeginFunc(ctx, c.pool, func(tx pgx.Tx) error {
+		var id int64
+		err := tx.QueryRow(ctx, `
+INSERT INTO movies (title, description, duration_min, age_rating, poster_url)
+VALUES ($1, $2, $3, $4, $5)
+RETURNING id`,
+			nm.Title, nm.Description, nm.DurationMin, nullable(nm.AgeRating), nullable(nm.PosterURL)).Scan(&id)
+		if err != nil {
+			return fmt.Errorf("insert movie: %w", err)
+		}
+		if err := setMovieGenres(ctx, tx, id, nm.GenreIDs); err != nil {
+			return err
+		}
+		m, err = getMovie(ctx, tx, id)
+		return err
+	})
 	if err != nil {
 		return domain.Movie{}, fmt.Errorf("create movie %q: %w", nm.Title, err)
 	}
@@ -114,13 +126,4 @@ WHERE hs.hall_id = $4`,
 		return domain.Showtime{}, fmt.Errorf("create showtime: %w", err)
 	}
 	return created, nil
-}
-
-// genreNames returns the genres as text for a movie_genre[] column. It is never nil, because nil encodes as NULL.
-func genreNames(genres []domain.Genre) []string {
-	names := make([]string, len(genres))
-	for i, g := range genres {
-		names[i] = string(g)
-	}
-	return names
 }

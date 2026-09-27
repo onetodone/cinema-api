@@ -8,28 +8,41 @@ import (
 
 // CreateMovieRequest is the body of POST /v1/admin/movies.
 type CreateMovieRequest struct {
-	Title       string   `json:"title"`
-	Description string   `json:"description"`
-	DurationMin int      `json:"duration_min"`
-	AgeRating   string   `json:"age_rating"`
-	PosterURL   string   `json:"poster_url"`
-	Genres      []string `json:"genres"`
+	Title       string  `json:"title"`
+	Description string  `json:"description"`
+	DurationMin int     `json:"duration_min"`
+	AgeRating   string  `json:"age_rating"`
+	PosterURL   string  `json:"poster_url"`
+	GenreIDs    []int64 `json:"genre_ids"`
 }
 
 // NewMovie maps the request to the domain input.
 func (r CreateMovieRequest) NewMovie() domain.NewMovie {
-	genres := make([]domain.Genre, len(r.Genres))
-	for i, g := range r.Genres {
-		genres[i] = domain.Genre(g)
-	}
 	return domain.NewMovie{
 		Title:       r.Title,
 		Description: r.Description,
 		DurationMin: r.DurationMin,
 		AgeRating:   r.AgeRating,
 		PosterURL:   r.PosterURL,
-		Genres:      genres,
+		GenreIDs:    r.GenreIDs,
 	}
+}
+
+// SetMovieGenresRequest is the body of PUT /v1/admin/movies/{movieID}/genres. GenreIDs is nil when the field is
+// missing or null, which the handler refuses, so that an empty body cannot clear a movie's genres by accident.
+type SetMovieGenresRequest struct {
+	GenreIDs []int64 `json:"genre_ids"`
+}
+
+// GenreRequest is the body of POST /v1/admin/genres and PUT /v1/admin/genres/{genreID}.
+type GenreRequest struct {
+	Slug string `json:"slug"`
+	Name string `json:"name"`
+}
+
+// NewGenre maps the request to the domain input.
+func (r GenreRequest) NewGenre() domain.NewGenre {
+	return domain.NewGenre{Slug: r.Slug, Name: r.Name}
 }
 
 // CreateHallRequest is the body of POST /v1/admin/halls.

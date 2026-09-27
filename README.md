@@ -74,7 +74,7 @@ TOKEN=$(curl -s -c jar -X POST $API/v1/auth/login -H 'Content-Type: application/
 
 # Tomorrow's schedule: every showtime is one language version (audio, optional subtitles) of a movie
 curl -s "$API/v1/showtimes?date=$(date -u -d tomorrow +%F)" |
-  jq -c '.items[:3][] | {title: .movie.title, genres: .movie.genres, audio_language, subtitle_language}'
+  jq -c '.items[:3][] | {title: .movie.title, genres: [.movie.genres[].name], audio_language, subtitle_language}'
 # ... and the seat map of its first showtime
 ST=$(curl -s "$API/v1/showtimes?date=$(date -u -d tomorrow +%F)" | jq '.items[0].id')
 curl -s $API/v1/showtimes/$ST/seats | jq '{summary, first: .seats[0]}'
@@ -322,8 +322,8 @@ sequenceDiagram
 | **Rate limits** | Fixed one-minute windows (`INCR` + `PEXPIRE … NX` in one script) | Requests pass |
 | **Revoked sessions** | `<prefix>:revoked-sid:<session>` for every session that ended early, until its last access token has expired; one `EXISTS` per authenticated request | Ended sessions still cannot refresh; their access tokens work until they expire (≤ 15 min) |
 
-Cached values are JSON of the domain types, and their keys carry a format version (`seatmap:v2:{<showtime>}`,
-`schedule:v2:<day>`). When the types change, the version changes too, so during a rolling deployment old and new
+Cached values are JSON of the domain types, and their keys carry a format version (`seatmap:v3:{<showtime>}`,
+`schedule:v3:<day>`). When the types change, the version changes too, so during a rolling deployment old and new
 replicas never serve each other's entries; an invalidation by one leaves the other's entry to its TTL.
 
 The gate is what keeps a premiere rush from filling the connection pool with transactions that queue on one
@@ -433,6 +433,7 @@ to the contract on `main`, so it never has to be updated by hand.
 | `GET /v1/auth/sessions` · `DELETE /v1/auth/sessions/{sessionID}` | user · owner | The caller's sessions; end one (its access tokens stop at once) |
 | `GET /v1/me` | user | The caller's account |
 | `GET /v1/movies`, `GET /v1/movies/{movieID}` | public | Movies, a movie with its showtimes of the next 14 days |
+| `GET /v1/genres`, `GET /v1/genres/{genreID}` | public | Every genre by name (`ETag`); one genre |
 | `GET /v1/showtimes?date=&movie_id=` | public | The schedule of a day in the cinema's time zone (`ETag`) |
 | `GET /v1/showtimes/{showtimeID}` · `/seats` | public | A showtime; its seat map with each seat's status and price (`ETag`) |
 | `POST /v1/bookings` · `GET /v1/bookings?status=` | user | Hold 1–10 seats for 15 minutes; list own bookings, optionally of some statuses only |
@@ -440,6 +441,8 @@ to the contract on `main`, so it never has to be updated by hand.
 | `GET /v1/payment-methods` | public | The enabled payment providers |
 | `POST /v1/bookings/{bookingID}/payments` | owner | Pay (`Idempotency-Key` required) |
 | `POST /v1/admin/movies` · `halls` · `showtimes` | admin | Manage the catalog |
+| `POST /v1/admin/genres` · `PUT` · `DELETE /v1/admin/genres/{genreID}` | admin | Manage the genres (a genre in use cannot be deleted) |
+| `PUT /v1/admin/movies/{movieID}/genres` | admin | Replace a movie's genres (`{"genre_ids": [...]}`, in order) |
 | `GET /healthz`, `GET /readyz` | public | Liveness; readiness (503 only without PostgreSQL) |
 
 Errors are RFC 9457 problem details with a stable `code`, such as:
@@ -459,8 +462,13 @@ Validation errors list every bad field at once in `errors`. Answers worth retryi
 it. The unique index that refuses the second hold aborts its transaction, so the booking is read right after; if it
 ended in that moment, `booking_id` is left out.
 
-**Genres and languages.** Movies carry `genres`, a list of up to five fixed slugs (`horror`, `science_fiction`,
-…), most characteristic first, which clients translate. Every showtime is one language version: `audio_language`
+**Genres and languages.** Genres are a catalog that admins manage: each has an `id`, a unique `slug`
+(`science_fiction`), and a unique `name`. The migrations start it with 18 common genres. A movie has up to five,
+most characteristic first; responses show them as `{id, slug, name}` objects, and requests name them by `id`
+(`genre_ids`). A genre that a movie has cannot be deleted (`409 GENRE_IN_USE`); a rename shows on every movie at
+once, and in cached schedules and seat maps within their TTL. Two admins replacing one movie's genres at once
+run one after the other (the movie row is locked), and a genre deleted while it is being assigned is either
+refused as in use or reported as unknown, never half-applied. Every showtime is one language version: `audio_language`
 and, when it has subtitles, `subtitle_language`, both lowercase ISO 639-3 codes that a client shows as
 "ENG | SUB: THA". A movie shown dubbed and subtitled is two showtimes. The admin API trims and lower-cases the codes
 and accepts only the current code of a known language (`golang.org/x/text/language`), so `en`, `ENGL`, `xyz`, and
@@ -571,7 +579,9 @@ make load-test          # k6: 500 users race for one seat against a running API
   ownership check, a revocation lifetime without the second leeway, no lookup of the blocking booking, never
   answering 304, an ETag that depends on more than the content, an ignored status filter, one poster for every
   movie, language codes that are not lower-cased, bibliographic codes accepted, a migration that keeps its
-  backfill default, subtitles missing from bookings): each made a test fail.
+  backfill default, subtitles missing from bookings, genre lists replaced without the movie lock, genres assigned
+  without their key-share lock, genres read without their order, a delete of a genre in use not mapped to 409):
+  each made a test fail.
 - **Load test.** Start the API without the per-address auth limit, since setup logs 500 accounts in from one
   address, and with a cheaper password hash:
 

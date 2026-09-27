@@ -2,6 +2,7 @@ package seed
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -111,11 +112,22 @@ func TestRoundUp(t *testing.T) {
 	}
 }
 
-// memStore records what the seeder creates.
+// memStore records what the seeder creates. It starts with the genres in genres.
 type memStore struct {
+	genres    []domain.Genre
 	movies    []domain.NewMovie
 	halls     []string
 	showtimes []domain.NewShowtime
+}
+
+func (m *memStore) ListGenres(context.Context) ([]domain.Genre, error) {
+	return slices.Clone(m.genres), nil
+}
+
+func (m *memStore) CreateGenre(_ context.Context, ng domain.NewGenre) (domain.Genre, error) {
+	g := domain.Genre{ID: int64(100 + len(m.genres)), Slug: ng.Slug, Name: ng.Name}
+	m.genres = append(m.genres, g)
+	return g, nil
 }
 
 func (m *memStore) CreateMovie(_ context.Context, nm domain.NewMovie) (domain.Movie, error) {
@@ -165,7 +177,7 @@ func TestRunCreatesTheWholeCatalog(t *testing.T) {
 		if m.PosterURL != "" {
 			t.Errorf("movie %q got poster %q without a template", m.Title, m.PosterURL)
 		}
-		if len(m.Genres) == 0 {
+		if len(m.GenreIDs) == 0 {
 			t.Errorf("movie %q has no genres", m.Title)
 		}
 	}
@@ -268,6 +280,42 @@ func TestSlug(t *testing.T) {
 	} {
 		if got := Slug(title); got != want {
 			t.Errorf("Slug(%q) = %q, want %q", title, got, want)
+		}
+	}
+}
+
+func TestRunUsesExistingGenresAndCreatesMissingOnes(t *testing.T) {
+	t.Parallel()
+
+	// An admin renamed drama and deleted every other demo genre.
+	store := &memStore{genres: []domain.Genre{{ID: 7, Slug: "drama", Name: "Dramas"}, {ID: 8, Slug: "noir", Name: "Noir"}}}
+	first := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	if _, err := Run(t.Context(), store, Options{Days: 1, FirstDay: first, Location: time.UTC}); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(store.genres) != 2+len(demoGenres)-1 {
+		t.Errorf("%d genres after seeding, want the 2 there and %d created", len(store.genres), len(demoGenres)-1)
+	}
+	bySlug := map[string]domain.Genre{}
+	for _, g := range store.genres {
+		bySlug[g.Slug] = g
+	}
+	if bySlug["drama"].Name != "Dramas" || bySlug["science_fiction"].Name != "Science fiction" {
+		t.Errorf("genres = %v; want drama kept as it was and science_fiction created", store.genres)
+	}
+
+	byID := map[int64]string{}
+	for _, g := range store.genres {
+		byID[g.ID] = g.Slug
+	}
+	for i, m := range store.movies {
+		var slugs []string
+		for _, id := range m.GenreIDs {
+			slugs = append(slugs, byID[id])
+		}
+		if !slices.Equal(slugs, movies[i].genres) {
+			t.Errorf("movie %q has genres %v, want %v in that order", m.Title, slugs, movies[i].genres)
 		}
 	}
 }

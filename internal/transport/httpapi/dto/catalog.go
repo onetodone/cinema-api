@@ -10,13 +10,13 @@ import (
 
 // Movie is a movie in a list or on its own page.
 type Movie struct {
-	ID          int64    `json:"id"`
-	Title       string   `json:"title"`
-	Description string   `json:"description,omitempty"`
-	DurationMin int      `json:"duration_min"`
-	AgeRating   string   `json:"age_rating,omitempty"`
-	PosterURL   string   `json:"poster_url,omitempty"`
-	Genres      []string `json:"genres"`
+	ID          int64   `json:"id"`
+	Title       string  `json:"title"`
+	Description string  `json:"description,omitempty"`
+	DurationMin int     `json:"duration_min"`
+	AgeRating   string  `json:"age_rating,omitempty"`
+	PosterURL   string  `json:"poster_url,omitempty"`
+	Genres      []Genre `json:"genres"`
 }
 
 // MovieList is one page of movies. NextCursor is omitted on the last page.
@@ -33,11 +33,23 @@ type MovieDetails struct {
 
 // MovieRef is the part of a movie shown with a showtime.
 type MovieRef struct {
-	ID          int64    `json:"id"`
-	Title       string   `json:"title"`
-	DurationMin int      `json:"duration_min"`
-	AgeRating   string   `json:"age_rating,omitempty"`
-	Genres      []string `json:"genres"`
+	ID          int64   `json:"id"`
+	Title       string  `json:"title"`
+	DurationMin int     `json:"duration_min"`
+	AgeRating   string  `json:"age_rating,omitempty"`
+	Genres      []Genre `json:"genres"`
+}
+
+// Genre is a genre, alone or as one of a movie's genres.
+type Genre struct {
+	ID   int64  `json:"id"`
+	Slug string `json:"slug"`
+	Name string `json:"name"`
+}
+
+// GenreList lists every genre.
+type GenreList struct {
+	Items []Genre `json:"items"`
 }
 
 // HallRef identifies a hall.
@@ -113,7 +125,7 @@ func NewMovie(m domain.Movie) Movie {
 		DurationMin: m.DurationMin,
 		AgeRating:   m.AgeRating,
 		PosterURL:   m.PosterURL,
-		Genres:      genreNames(m.Genres),
+		Genres:      newGenres(m.Genres),
 	}
 }
 
@@ -195,9 +207,19 @@ func NewSeatMap(sm catalog.SeatMap, currency string) SeatMap {
 	}
 }
 
+// NewGenre maps a domain genre.
+func NewGenre(g domain.Genre) Genre {
+	return Genre{ID: g.ID, Slug: g.Slug, Name: g.Name}
+}
+
+// NewGenreList maps every genre.
+func NewGenreList(genres []domain.Genre) GenreList {
+	return GenreList{Items: newGenres(genres)}
+}
+
 func newMovieRef(m domain.MovieSummary) MovieRef {
 	return MovieRef{
-		ID: m.ID, Title: m.Title, DurationMin: m.DurationMin, AgeRating: m.AgeRating, Genres: genreNames(m.Genres),
+		ID: m.ID, Title: m.Title, DurationMin: m.DurationMin, AgeRating: m.AgeRating, Genres: newGenres(m.Genres),
 	}
 }
 
@@ -205,11 +227,11 @@ func newLanguage(lv domain.LanguageVersion) Language {
 	return Language{AudioLanguage: lv.Audio, SubtitleLanguage: lv.Subtitles}
 }
 
-// genreNames maps genres to their names. The result is never nil, so it encodes as [] rather than null.
-func genreNames(genres []domain.Genre) []string {
-	names := make([]string, len(genres))
+// newGenres maps a list of genres. The result is never nil, so it encodes as [] rather than null.
+func newGenres(genres []domain.Genre) []Genre {
+	out := make([]Genre, len(genres))
 	for i, g := range genres {
-		names[i] = string(g)
+		out[i] = NewGenre(g)
 	}
-	return names
+	return out
 }

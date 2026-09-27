@@ -27,6 +27,7 @@ type stubCatalog struct {
 	sched    catalog.Schedule
 	showtime domain.Showtime
 	seatMap  catalog.SeatMap
+	genres   []domain.Genre
 	err      error
 }
 
@@ -52,6 +53,22 @@ func (s *stubCatalog) SeatMap(context.Context, int64) (catalog.SeatMap, error) {
 	return s.seatMap, s.err
 }
 
+func (s *stubCatalog) ListGenres(context.Context) ([]domain.Genre, error) {
+	return s.genres, s.err
+}
+
+func (s *stubCatalog) GetGenre(_ context.Context, id int64) (domain.Genre, error) {
+	for _, g := range s.genres {
+		if g.ID == id {
+			return g, nil
+		}
+	}
+	if s.err != nil {
+		return domain.Genre{}, s.err
+	}
+	return domain.Genre{}, domain.NotFound(domain.CodeGenreNotFound, "genre %d not found", id)
+}
+
 func serveCatalog(t *testing.T, svc CatalogService, target string) *httptest.ResponseRecorder {
 	t.Helper()
 	return serveCatalogWith(t, svc, target, nil)
@@ -64,6 +81,8 @@ func serveCatalogWith(t *testing.T, svc CatalogService, target string, header ht
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/movies", h.ListMovies)
 	mux.HandleFunc("GET /v1/movies/{movieID}", h.GetMovie)
+	mux.HandleFunc("GET /v1/genres", h.ListGenres)
+	mux.HandleFunc("GET /v1/genres/{genreID}", h.GetGenre)
 	mux.HandleFunc("GET /v1/showtimes", h.Schedule)
 	mux.HandleFunc("GET /v1/showtimes/{showtimeID}", h.GetShowtime)
 	mux.HandleFunc("GET /v1/showtimes/{showtimeID}/seats", h.SeatMap)
@@ -101,11 +120,27 @@ func assertProblem(t *testing.T, rec *httptest.ResponseRecorder, status int, cod
 	return p
 }
 
+// Genres of the sample data.
+var (
+	genreSciFi     = domain.Genre{ID: 15, Slug: "science_fiction", Name: "Science fiction"}
+	genreAdventure = domain.Genre{ID: 2, Slug: "adventure", Name: "Adventure"}
+	genreDrama     = domain.Genre{ID: 7, Slug: "drama", Name: "Drama"}
+)
+
+// genresJSON is how genres decode from a response into map[string]any.
+func genresJSON(genres ...domain.Genre) []any {
+	out := make([]any, len(genres))
+	for i, g := range genres {
+		out[i] = map[string]any{"id": float64(g.ID), "slug": g.Slug, "name": g.Name}
+	}
+	return out
+}
+
 var sampleShowtime = domain.Showtime{
 	ID: 11,
 	Movie: domain.MovieSummary{
 		ID: 1, Title: "Dune", DurationMin: 155, AgeRating: "PG-13",
-		Genres: []domain.Genre{domain.GenreScienceFiction, domain.GenreAdventure},
+		Genres: []domain.Genre{genreSciFi, genreAdventure},
 	},
 	Hall:           domain.Hall{ID: 2, Name: "Hall 2"},
 	StartsAt:       time.Date(2026, 10, 1, 19, 0, 0, 0, time.UTC),
@@ -186,7 +221,7 @@ func TestGetMovie(t *testing.T) {
 	t.Parallel()
 
 	svc := &stubCatalog{details: catalog.MovieDetails{
-		Movie:    domain.Movie{ID: 1, Title: "Dune", DurationMin: 155, Genres: []domain.Genre{domain.GenreDrama}},
+		Movie:    domain.Movie{ID: 1, Title: "Dune", DurationMin: 155, Genres: []domain.Genre{genreDrama}},
 		Upcoming: []domain.Showtime{sampleShowtime},
 	}}
 	rec := serveCatalog(t, svc, "/v1/movies/1")
@@ -195,7 +230,7 @@ func TestGetMovie(t *testing.T) {
 	}
 
 	body := decode[map[string]any](t, rec)
-	if body["title"] != "Dune" || !reflect.DeepEqual(body["genres"], []any{"drama"}) {
+	if body["title"] != "Dune" || !reflect.DeepEqual(body["genres"], genresJSON(genreDrama)) {
 		t.Errorf("title, genres = %v, %v", body["title"], body["genres"])
 	}
 	upcoming, _ := body["upcoming_showtimes"].([]any)
@@ -262,7 +297,7 @@ func TestSchedule(t *testing.T) {
 			t.Errorf("%s = %v, want %v", k, item[k], v)
 		}
 	}
-	if movie, _ := item["movie"].(map[string]any); !reflect.DeepEqual(movie["genres"], []any{"science_fiction", "adventure"}) {
+	if movie, _ := item["movie"].(map[string]any); !reflect.DeepEqual(movie["genres"], genresJSON(genreSciFi, genreAdventure)) {
 		t.Errorf("movie = %v, want its genres", item["movie"])
 	}
 }
@@ -424,4 +459,51 @@ func TestPolledReadsAnswerNotModified(t *testing.T) {
 	if rec.Header().Get("ETag") != "" {
 		t.Errorf("a problem carries ETag %q", rec.Header().Get("ETag"))
 	}
+}
+
+func TestListGenres(t *testing.T) {
+	t.Parallel()
+
+	svc := &stubCatalog{genres: []domain.Genre{genreAdventure, genreDrama, genreSciFi}}
+	rec := serveCatalog(t, svc, "/v1/genres")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	if got := strings.TrimSpace(rec.Body.String()); got != `{"items":[{"id":2,"slug":"adventure","name":"Adventure"},`+
+		`{"id":7,"slug":"drama","name":"Drama"},{"id":15,"slug":"science_fiction","name":"Science fiction"}]}` {
+		t.Errorf("body = %s", got)
+	}
+
+	// Clients revalidate the list; a changed list gets a new tag.
+	etag := rec.Header().Get("ETag")
+	again := serveCatalogWith(t, svc, "/v1/genres", http.Header{"If-None-Match": {etag}})
+	if etag == "" || again.Code != http.StatusNotModified {
+		t.Errorf("ETag %q, then %d; want a tag and 304", etag, again.Code)
+	}
+	renamed := &stubCatalog{genres: []domain.Genre{genreAdventure, {ID: 7, Slug: "drama", Name: "Dramas"}, genreSciFi}}
+	if changed := serveCatalogWith(t, renamed, "/v1/genres", http.Header{"If-None-Match": {etag}}); changed.Code != http.StatusOK {
+		t.Errorf("after a rename: %d, want 200", changed.Code)
+	}
+
+	// No genres: an empty list, not null.
+	if got := strings.TrimSpace(serveCatalog(t, &stubCatalog{}, "/v1/genres").Body.String()); got != `{"items":[]}` {
+		t.Errorf("empty list = %s", got)
+	}
+	assertProblem(t, serveCatalog(t, &stubCatalog{err: errors.New("db down")}, "/v1/genres"),
+		http.StatusInternalServerError, problem.CodeInternal)
+}
+
+func TestGetGenre(t *testing.T) {
+	t.Parallel()
+
+	svc := &stubCatalog{genres: []domain.Genre{genreDrama, genreSciFi}}
+	rec := serveCatalog(t, svc, "/v1/genres/15")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	if got := strings.TrimSpace(rec.Body.String()); got != `{"id":15,"slug":"science_fiction","name":"Science fiction"}` {
+		t.Errorf("body = %s", got)
+	}
+	assertProblem(t, serveCatalog(t, svc, "/v1/genres/99"), http.StatusNotFound, domain.CodeGenreNotFound)
+	assertProblem(t, serveCatalog(t, svc, "/v1/genres/drama"), http.StatusBadRequest, problem.CodeValidationFailed)
 }

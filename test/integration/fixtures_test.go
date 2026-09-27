@@ -5,6 +5,7 @@ package integration
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 	"time"
 	"uuid"
@@ -43,6 +44,30 @@ func newFixture(t *testing.T) *fixture {
 		{Label: "A", Seats: 3, Type: domain.SeatStandard},
 	}))(t).Hall
 	return f
+}
+
+// genres returns the genres with the given slugs, in that order, from the catalog the migrations create.
+func (f *fixture) genres(t *testing.T, slugs ...string) []domain.Genre {
+	t.Helper()
+	all := must(f.catalog.ListGenres(t.Context()))(t)
+	out := make([]domain.Genre, 0, len(slugs))
+	for _, slug := range slugs {
+		i := slices.IndexFunc(all, func(g domain.Genre) bool { return g.Slug == slug })
+		if i < 0 {
+			t.Fatalf("no genre %q", slug)
+		}
+		out = append(out, all[i])
+	}
+	return out
+}
+
+// genreIDs returns the ids of genres, in order.
+func genreIDs(genres []domain.Genre) []int64 {
+	ids := make([]int64, len(genres))
+	for i, g := range genres {
+		ids[i] = g.ID
+	}
+	return ids
 }
 
 // showtime schedules movie m in hall h at start, failing the test on error.

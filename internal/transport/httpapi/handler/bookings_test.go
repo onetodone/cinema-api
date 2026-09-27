@@ -24,7 +24,7 @@ var sampleBooking = domain.Booking{
 	Showtime: domain.ShowtimeRef{
 		ID: 11,
 		Movie: domain.MovieSummary{
-			ID: 1, Title: "Dune", DurationMin: 155, AgeRating: "PG-13", Genres: []domain.Genre{domain.GenreScienceFiction},
+			ID: 1, Title: "Dune", DurationMin: 155, AgeRating: "PG-13", Genres: []domain.Genre{genreSciFi},
 		},
 		Hall:     domain.Hall{ID: 2, Name: "Hall 2"},
 		StartsAt: time.Date(2030, 1, 10, 19, 0, 0, 0, time.FixedZone("GST", 4*3600)),
@@ -135,7 +135,7 @@ func TestCreateBooking(t *testing.T) {
 	if _, subtitled := showtime["subtitle_language"]; showtime["audio_language"] != "tha" || subtitled {
 		t.Errorf("showtime = %v, want audio_language tha and no subtitle_language", showtime)
 	}
-	if movie, _ := showtime["movie"].(map[string]any); !reflect.DeepEqual(movie["genres"], []any{"science_fiction"}) {
+	if movie, _ := showtime["movie"].(map[string]any); !reflect.DeepEqual(movie["genres"], genresJSON(genreSciFi)) {
 		t.Errorf("movie = %v, want its genres", showtime["movie"])
 	}
 	seats, _ := body["seats"].([]any)

@@ -33,7 +33,7 @@ func NewBookings(pool *pgxpool.Pool) *Bookings {
 const bookingSelect = `
 SELECT b.id, b.user_id, b.status, b.total_cents, b.expires_at, b.paid_at, b.created_at, b.updated_at,
        s.id, s.starts_at, s.audio_language, s.subtitle_language, s.status,
-       m.id, m.title, m.duration_min, m.age_rating, m.genres::text[],
+       m.id, m.title, m.duration_min, m.age_rating, ` + movieGenres + `,
        h.id, h.name
 FROM bookings b
 JOIN showtimes s ON s.id = b.showtime_id
@@ -45,14 +45,16 @@ func scanBooking(row pgx.Row) (domain.Booking, error) {
 		b                    domain.Booking
 		paidAt               *time.Time
 		subtitles, ageRating *string
+		genres               genreList
 	)
 	err := row.Scan(
 		&b.ID, &b.UserID, &b.Status, &b.TotalCents, &b.ExpiresAt, &paidAt, &b.CreatedAt, &b.UpdatedAt,
 		&b.Showtime.ID, &b.Showtime.StartsAt, &b.Showtime.Language.Audio, &subtitles, &b.Showtime.Status,
 		&b.Showtime.Movie.ID, &b.Showtime.Movie.Title, &b.Showtime.Movie.DurationMin, &ageRating,
-		&b.Showtime.Movie.Genres,
+		&genres,
 		&b.Showtime.Hall.ID, &b.Showtime.Hall.Name,
 	)
+	b.Showtime.Movie.Genres = genres.domain()
 	if paidAt != nil {
 		b.PaidAt = *paidAt
 	}
@@ -170,18 +172,19 @@ func (s showtimeStore) GetForBooking(ctx context.Context, id int64) (domain.Show
 	var (
 		st                   domain.ShowtimeRef
 		subtitles, ageRating *string
+		genres               genreList
 		started              bool
 	)
 	err := s.q.QueryRow(ctx, `
 SELECT s.id, s.starts_at, s.audio_language, s.subtitle_language, s.status, s.starts_at <= now(),
-       m.id, m.title, m.duration_min, m.age_rating, m.genres::text[],
+       m.id, m.title, m.duration_min, m.age_rating, `+movieGenres+`,
        h.id, h.name
 FROM showtimes s
 JOIN movies m ON m.id = s.movie_id
 JOIN halls  h ON h.id = s.hall_id
 WHERE s.id = $1`, id).Scan(
 		&st.ID, &st.StartsAt, &st.Language.Audio, &subtitles, &st.Status, &started,
-		&st.Movie.ID, &st.Movie.Title, &st.Movie.DurationMin, &ageRating, &st.Movie.Genres,
+		&st.Movie.ID, &st.Movie.Title, &st.Movie.DurationMin, &ageRating, &genres,
 		&st.Hall.ID, &st.Hall.Name,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -190,7 +193,7 @@ WHERE s.id = $1`, id).Scan(
 	if err != nil {
 		return domain.ShowtimeRef{}, false, fmt.Errorf("get showtime %d for booking: %w", id, err)
 	}
-	st.Language.Subtitles, st.Movie.AgeRating = deref(subtitles), deref(ageRating)
+	st.Language.Subtitles, st.Movie.AgeRating, st.Movie.Genres = deref(subtitles), deref(ageRating), genres.domain()
 	return st, started, nil
 }
 

@@ -13,6 +13,7 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 
+	"github.com/onetodone/cinema-api/internal/domain"
 	"github.com/onetodone/cinema-api/internal/repository/postgres"
 	"github.com/onetodone/cinema-api/internal/service/auth"
 )
@@ -214,18 +215,29 @@ func TestAdminAPIGenresAndLanguages(t *testing.T) {
 	adminToken := api.signInAdmin(f)
 	customer := api.signUp("ann@example.com")
 
+	genres := f.genres(t, "science_fiction", "thriller")
+	drama := f.genres(t, "drama")[0]
 	invalid := api.do(http.MethodPost, "/v1/admin/movies", adminToken, map[string]any{
-		"title": "Noir", "duration_min": 90, "genres": []string{"drama", "noir", "drama"},
+		"title": "Noir", "duration_min": 90, "genre_ids": []int64{drama.ID, 0, drama.ID},
 	})
-	if fields := errorFields(invalid); invalid.status != http.StatusBadRequest || !slices.Equal(fields, []string{"genres[1]", "genres[2]"}) {
-		t.Errorf("invalid genres = %d %v, want 400 on genres[1] and genres[2]", invalid.status, invalid.body)
+	if fields := errorFields(invalid); invalid.status != http.StatusBadRequest || !slices.Equal(fields, []string{"genre_ids[1]", "genre_ids[2]"}) {
+		t.Errorf("invalid genres = %d %v, want 400 on genre_ids[1] and genre_ids[2]", invalid.status, invalid.body)
+	}
+	unknown := api.do(http.MethodPost, "/v1/admin/movies", adminToken, map[string]any{
+		"title": "Noir", "duration_min": 90, "genre_ids": []int64{drama.ID, 999_999},
+	})
+	if fields := errorFields(unknown); unknown.status != http.StatusBadRequest || !slices.Equal(fields, []string{"genre_ids[1]"}) {
+		t.Errorf("unknown genre = %d %v, want 400 on genre_ids[1]", unknown.status, unknown.body)
+	}
+	if n := countRows(t, f.pool, `SELECT count(*) FROM movies WHERE title = 'Noir'`); n != 0 {
+		t.Errorf("%d movies stored by refused requests", n)
 	}
 
 	movie := api.do(http.MethodPost, "/v1/admin/movies", adminToken, map[string]any{
-		"title": "Orbit of Glass", "duration_min": 142, "genres": []string{"science_fiction", "thriller"},
+		"title": "Orbit of Glass", "duration_min": 142, "genre_ids": genreIDs(genres),
 	})
 	movieID, _ := movie.body["id"].(float64)
-	wantGenres := []any{"science_fiction", "thriller"}
+	wantGenres := genresJSON(genres...)
 	if movie.status != http.StatusCreated || !reflect.DeepEqual(movie.body["genres"], wantGenres) {
 		t.Fatalf("create movie = %d %v", movie.status, movie.body)
 	}
@@ -310,6 +322,15 @@ func TestAdminAPIGenresAndLanguages(t *testing.T) {
 	read := api.do(http.MethodGet, book.header.Get("Location"), customer, nil)
 	readShowtime, _ := read.body["showtime"].(map[string]any)
 	hasVersion("read booking", readShowtime, "eng", "tha")
+}
+
+// genresJSON is how genres decode from a response into map[string]any.
+func genresJSON(genres ...domain.Genre) []any {
+	out := make([]any, len(genres))
+	for i, g := range genres {
+		out[i] = map[string]any{"id": float64(g.ID), "slug": g.Slug, "name": g.Name}
+	}
+	return out
 }
 
 // errorFields returns the fields a 400 VALIDATION_FAILED names, in order.

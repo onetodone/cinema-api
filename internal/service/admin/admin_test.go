@@ -16,6 +16,10 @@ type recordingRepo struct {
 	movie    *domain.NewMovie
 	hall     *domain.NewHall
 	showtime *domain.NewShowtime
+	genre    *domain.NewGenre
+	genreID  int64
+	movieID  int64
+	genreIDs []int64
 	err      error
 	calls    int
 }
@@ -45,6 +49,39 @@ func (r *recordingRepo) CreateShowtime(_ context.Context, s domain.NewShowtime) 
 		return domain.Showtime{}, r.err
 	}
 	return domain.Showtime{ID: 11, StartsAt: s.StartsAt, EndsAt: s.StartsAt.Add(2 * time.Hour)}, nil
+}
+
+func (r *recordingRepo) CreateGenre(_ context.Context, g domain.NewGenre) (domain.Genre, error) {
+	r.calls++
+	r.genre = &g
+	if r.err != nil {
+		return domain.Genre{}, r.err
+	}
+	return domain.Genre{ID: 19, Slug: g.Slug, Name: g.Name}, nil
+}
+
+func (r *recordingRepo) UpdateGenre(_ context.Context, id int64, g domain.NewGenre) (domain.Genre, error) {
+	r.calls++
+	r.genre, r.genreID = &g, id
+	if r.err != nil {
+		return domain.Genre{}, r.err
+	}
+	return domain.Genre{ID: id, Slug: g.Slug, Name: g.Name}, nil
+}
+
+func (r *recordingRepo) DeleteGenre(_ context.Context, id int64) error {
+	r.calls++
+	r.genreID = id
+	return r.err
+}
+
+func (r *recordingRepo) SetMovieGenres(_ context.Context, movieID int64, genreIDs []int64) (domain.Movie, error) {
+	r.calls++
+	r.movieID, r.genreIDs = movieID, genreIDs
+	if r.err != nil {
+		return domain.Movie{}, r.err
+	}
+	return domain.Movie{ID: movieID}, nil
 }
 
 // recordingCache remembers the days whose schedules were invalidated.
@@ -78,7 +115,7 @@ func TestCreateMovieTrimsAndStores(t *testing.T) {
 		DurationMin: 155,
 		AgeRating:   " PG-13 ",
 		PosterURL:   " https://img.example/dune.jpg ",
-		Genres:      []domain.Genre{domain.GenreScienceFiction, domain.GenreAdventure},
+		GenreIDs:    []int64{15, 2},
 	})
 	if err != nil {
 		t.Fatalf("CreateMovie: %v", err)
@@ -89,7 +126,7 @@ func TestCreateMovieTrimsAndStores(t *testing.T) {
 	want := domain.NewMovie{
 		Title: "Dune", Description: "Sand.", DurationMin: 155, AgeRating: "PG-13",
 		PosterURL: "https://img.example/dune.jpg",
-		Genres:    []domain.Genre{domain.GenreScienceFiction, domain.GenreAdventure},
+		GenreIDs:  []int64{15, 2},
 	}
 	if !reflect.DeepEqual(*repo.movie, want) {
 		t.Errorf("stored %+v, want %+v", *repo.movie, want)
@@ -259,5 +296,76 @@ func TestCreateShowtimeLeavesTheCacheAloneOnFailure(t *testing.T) {
 	}
 	if len(cache.days) != 0 {
 		t.Errorf("invalidated %v after a failed create", cache.days)
+	}
+}
+
+func TestGenresAreNormalizedBeforeStoring(t *testing.T) {
+	t.Parallel()
+
+	repo := &recordingRepo{}
+	svc := newService(repo)
+	g, err := svc.CreateGenre(t.Context(), domain.NewGenre{Slug: " Film_Noir ", Name: "\tFilm noir "})
+	if err != nil {
+		t.Fatalf("CreateGenre: %v", err)
+	}
+	want := domain.NewGenre{Slug: "film_noir", Name: "Film noir"}
+	if *repo.genre != want || g.ID != 19 {
+		t.Errorf("stored %+v, got %+v; want %+v with the repository's id", *repo.genre, g, want)
+	}
+
+	if _, err := svc.UpdateGenre(t.Context(), 4, domain.NewGenre{Slug: "NOIR", Name: " Noir"}); err != nil {
+		t.Fatalf("UpdateGenre: %v", err)
+	}
+	if want := (domain.NewGenre{Slug: "noir", Name: "Noir"}); *repo.genre != want || repo.genreID != 4 {
+		t.Errorf("updated genre %d to %+v, want 4 to %+v", repo.genreID, *repo.genre, want)
+	}
+
+	if err := svc.DeleteGenre(t.Context(), 5); err != nil || repo.genreID != 5 {
+		t.Errorf("DeleteGenre = %v, deleted %d; want nil and 5", err, repo.genreID)
+	}
+}
+
+func TestInvalidGenresNeverReachTheRepository(t *testing.T) {
+	t.Parallel()
+
+	repo := &recordingRepo{}
+	svc := newService(repo)
+	check := func(what string, err error, fields ...string) {
+		t.Helper()
+		var ve *domain.ValidationError
+		if !errors.As(err, &ve) || len(ve.Fields) != len(fields) {
+			t.Fatalf("%s: error = %v, want a validation error for %v", what, err, fields)
+		}
+		for i, f := range fields {
+			if ve.Fields[i].Field != f {
+				t.Errorf("%s: field %d = %q, want %q", what, i, ve.Fields[i].Field, f)
+			}
+		}
+	}
+
+	_, err := svc.CreateGenre(t.Context(), domain.NewGenre{Slug: "  ", Name: " "})
+	check("empty genre", err, "slug", "name")
+	_, err = svc.UpdateGenre(t.Context(), 4, domain.NewGenre{Slug: "sci-fi", Name: "Sci-fi"})
+	check("dashed slug", err, "slug")
+	_, err = svc.SetMovieGenres(t.Context(), 7, []int64{3, 3})
+	check("repeated genre", err, "genre_ids[1]")
+	if repo.calls != 0 {
+		t.Errorf("%d invalid inputs reached the repository", repo.calls)
+	}
+}
+
+func TestSetMovieGenres(t *testing.T) {
+	t.Parallel()
+
+	repo := &recordingRepo{}
+	m, err := newService(repo).SetMovieGenres(t.Context(), 7, []int64{3, 1})
+	if err != nil || m.ID != 7 {
+		t.Fatalf("SetMovieGenres = %+v, %v", m, err)
+	}
+	if repo.movieID != 7 || !slices.Equal(repo.genreIDs, []int64{3, 1}) {
+		t.Errorf("stored movie %d with %v, want 7 with [3 1] in order", repo.movieID, repo.genreIDs)
+	}
+	if _, err := newService(repo).SetMovieGenres(t.Context(), 7, nil); err != nil {
+		t.Errorf("clearing the genres: %v", err)
 	}
 }

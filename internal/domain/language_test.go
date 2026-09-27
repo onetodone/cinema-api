@@ -35,24 +35,3 @@ func TestCheckLanguage(t *testing.T) {
 		}
 	}
 }
-
-func TestGenres(t *testing.T) {
-	t.Parallel()
-
-	all := Genres()
-	if len(all) != 18 {
-		t.Fatalf("%d genres, want 18", len(all))
-	}
-	for i, g := range all {
-		if !g.Valid() {
-			t.Errorf("%q is listed but not valid", g)
-		}
-		if i > 0 && all[i-1] >= g {
-			t.Errorf("genres are not in alphabetical order at %q", g)
-		}
-	}
-	all[0] = "noir" // the list is a copy
-	if Genre("noir").Valid() || Genres()[0] != GenreAction {
-		t.Error("changing the returned list changed the vocabulary")
-	}
-}

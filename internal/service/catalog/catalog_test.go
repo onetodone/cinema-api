@@ -14,6 +14,7 @@ type fakeRepo struct {
 	movies    []domain.Movie
 	showtimes map[int64]domain.Showtime
 	seats     map[int64][]domain.ShowtimeSeat
+	genres    []domain.Genre
 	listed    []domain.ShowtimeFilter
 	err       error
 }
@@ -64,6 +65,19 @@ func (f *fakeRepo) GetShowtime(_ context.Context, id int64) (domain.Showtime, er
 
 func (f *fakeRepo) ListShowtimeSeats(_ context.Context, showtimeID int64) ([]domain.ShowtimeSeat, error) {
 	return f.seats[showtimeID], nil
+}
+
+func (f *fakeRepo) ListGenres(context.Context) ([]domain.Genre, error) {
+	return f.genres, f.err
+}
+
+func (f *fakeRepo) GetGenre(_ context.Context, id int64) (domain.Genre, error) {
+	for _, g := range f.genres {
+		if g.ID == id {
+			return g, nil
+		}
+	}
+	return domain.Genre{}, domain.NotFound(domain.CodeGenreNotFound, "genre %d not found", id)
 }
 
 func movies(n int) []domain.Movie {

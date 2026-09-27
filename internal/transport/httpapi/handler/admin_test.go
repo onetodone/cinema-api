@@ -2,10 +2,14 @@ package handler
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"slices"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,6 +22,10 @@ type stubAdmin struct {
 	movie    domain.NewMovie
 	hall     domain.NewHall
 	showtime domain.NewShowtime
+	genre    domain.NewGenre
+	genreID  int64
+	movieID  int64
+	genreIDs []int64
 	calls    int
 	err      error
 }
@@ -28,7 +36,51 @@ func (s *stubAdmin) CreateMovie(_ context.Context, m domain.NewMovie) (domain.Mo
 	if s.err != nil {
 		return domain.Movie{}, s.err
 	}
-	return domain.Movie{ID: 42, Title: m.Title, DurationMin: m.DurationMin, AgeRating: m.AgeRating, Genres: m.Genres}, nil
+	return domain.Movie{
+		ID: 42, Title: m.Title, DurationMin: m.DurationMin, AgeRating: m.AgeRating, Genres: stubGenres(m.GenreIDs),
+	}, nil
+}
+
+// stubGenres makes up a genre for each id.
+func stubGenres(ids []int64) []domain.Genre {
+	var genres []domain.Genre // nil for none, as a mapper must cope with
+	for _, id := range ids {
+		genres = append(genres, domain.Genre{ID: id, Slug: "g" + strconv.FormatInt(id, 10), Name: "G" + strconv.FormatInt(id, 10)})
+	}
+	return genres
+}
+
+func (s *stubAdmin) SetMovieGenres(_ context.Context, movieID int64, genreIDs []int64) (domain.Movie, error) {
+	s.calls++
+	s.movieID, s.genreIDs = movieID, genreIDs
+	if s.err != nil {
+		return domain.Movie{}, s.err
+	}
+	return domain.Movie{ID: movieID, Title: "Dune", DurationMin: 155, Genres: stubGenres(genreIDs)}, nil
+}
+
+func (s *stubAdmin) CreateGenre(_ context.Context, g domain.NewGenre) (domain.Genre, error) {
+	s.calls++
+	s.genre = g
+	if s.err != nil {
+		return domain.Genre{}, s.err
+	}
+	return domain.Genre{ID: 19, Slug: g.Slug, Name: g.Name}, nil
+}
+
+func (s *stubAdmin) UpdateGenre(_ context.Context, id int64, g domain.NewGenre) (domain.Genre, error) {
+	s.calls++
+	s.genreID, s.genre = id, g
+	if s.err != nil {
+		return domain.Genre{}, s.err
+	}
+	return domain.Genre{ID: id, Slug: g.Slug, Name: g.Name}, nil
+}
+
+func (s *stubAdmin) DeleteGenre(_ context.Context, id int64) error {
+	s.calls++
+	s.genreID = id
+	return s.err
 }
 
 func (s *stubAdmin) CreateHall(_ context.Context, h domain.NewHall) (domain.HallLayout, error) {
@@ -66,13 +118,32 @@ func newAdminHandler(svc AdminService) *Admin {
 	return NewAdmin(svc, "EUR", slog.New(slog.DiscardHandler))
 }
 
+// serveAdmin sends a request, with a JSON body unless body is empty, through the routes that have path parameters.
+func serveAdmin(t *testing.T, svc AdminService, method, target, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	h := newAdminHandler(svc)
+	mux := http.NewServeMux()
+	mux.HandleFunc("PUT /v1/admin/movies/{movieID}/genres", h.SetMovieGenres)
+	mux.HandleFunc("POST /v1/admin/genres", h.CreateGenre)
+	mux.HandleFunc("PUT /v1/admin/genres/{genreID}", h.UpdateGenre)
+	mux.HandleFunc("DELETE /v1/admin/genres/{genreID}", h.DeleteGenre)
+
+	req := httptest.NewRequestWithContext(t.Context(), method, target, strings.NewReader(body))
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	return rec
+}
+
 func TestCreateMovie(t *testing.T) {
 	t.Parallel()
 
 	svc := &stubAdmin{}
 	rec := postJSON(t, newAdminHandler(svc).CreateMovie, "/v1/admin/movies",
 		`{"title":"Dune","description":"Sand.","duration_min":155,"age_rating":"PG-13","poster_url":"https://x/y.jpg",
-		  "genres":["science_fiction","adventure"]}`)
+		  "genre_ids":[15,2]}`)
 
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
@@ -82,13 +153,13 @@ func TestCreateMovie(t *testing.T) {
 	}
 	want := domain.NewMovie{
 		Title: "Dune", Description: "Sand.", DurationMin: 155, AgeRating: "PG-13", PosterURL: "https://x/y.jpg",
-		Genres: []domain.Genre{domain.GenreScienceFiction, domain.GenreAdventure},
+		GenreIDs: []int64{15, 2},
 	}
 	if !reflect.DeepEqual(svc.movie, want) {
 		t.Errorf("service got %+v, want %+v", svc.movie, want)
 	}
 	body := decode[map[string]any](t, rec)
-	if body["id"] != 42.0 || body["title"] != "Dune" || !reflect.DeepEqual(body["genres"], []any{"science_fiction", "adventure"}) {
+	if body["id"] != 42.0 || body["title"] != "Dune" || !reflect.DeepEqual(body["genres"], genresJSON(stubGenres([]int64{15, 2})...)) {
 		t.Errorf("body = %v", body)
 	}
 }
@@ -269,6 +340,121 @@ func TestCreateShowtimeErrors(t *testing.T) {
 					t.Error("an unreadable start time reached the service")
 				}
 			}
+		})
+	}
+}
+
+func TestSetMovieGenres(t *testing.T) {
+	t.Parallel()
+
+	svc := &stubAdmin{}
+	rec := serveAdmin(t, svc, http.MethodPut, "/v1/admin/movies/42/genres", `{"genre_ids":[7,3]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	if svc.movieID != 42 || !slices.Equal(svc.genreIDs, []int64{7, 3}) {
+		t.Errorf("service got movie %d with %v, want 42 with [7 3]", svc.movieID, svc.genreIDs)
+	}
+	body := decode[map[string]any](t, rec)
+	if body["id"] != 42.0 || !reflect.DeepEqual(body["genres"], genresJSON(stubGenres([]int64{7, 3})...)) {
+		t.Errorf("body = %v", body)
+	}
+
+	// [] clears the genres; the answer lists none.
+	rec = serveAdmin(t, svc, http.MethodPut, "/v1/admin/movies/42/genres", `{"genre_ids":[]}`)
+	if rec.Code != http.StatusOK || svc.genreIDs == nil || len(svc.genreIDs) != 0 {
+		t.Errorf("clearing: %d, service got %#v; want 200 and an empty list", rec.Code, svc.genreIDs)
+	}
+	if body := decode[map[string]any](t, rec); !reflect.DeepEqual(body["genres"], []any{}) {
+		t.Errorf("genres = %#v, want []", body["genres"])
+	}
+}
+
+func TestSetMovieGenresErrors(t *testing.T) {
+	t.Parallel()
+
+	svc := &stubAdmin{}
+	for _, body := range []string{`{}`, `{"genre_ids":null}`} {
+		p := assertProblem(t, serveAdmin(t, svc, http.MethodPut, "/v1/admin/movies/42/genres", body),
+			http.StatusBadRequest, problem.CodeValidationFailed)
+		if len(p.Errors) != 1 || p.Errors[0].Field != "genre_ids" {
+			t.Errorf("%s: errors = %+v, want genre_ids", body, p.Errors)
+		}
+	}
+	assertProblem(t, serveAdmin(t, svc, http.MethodPut, "/v1/admin/movies/x/genres", `{"genre_ids":[]}`),
+		http.StatusBadRequest, problem.CodeValidationFailed)
+	assertProblem(t, serveAdmin(t, svc, http.MethodPut, "/v1/admin/movies/42/genres", `{"genre_ids":["drama"]}`),
+		http.StatusBadRequest, problem.CodeValidationFailed)
+	if svc.calls != 0 {
+		t.Errorf("%d bad requests reached the service", svc.calls)
+	}
+
+	notFound := &stubAdmin{err: domain.NotFound(domain.CodeMovieNotFound, "movie 42 not found")}
+	assertProblem(t, serveAdmin(t, notFound, http.MethodPut, "/v1/admin/movies/42/genres", `{"genre_ids":[1]}`),
+		http.StatusNotFound, domain.CodeMovieNotFound)
+	var v domain.Violations
+	v.Add("genre_ids[0]", "no genre has the id 99")
+	p := assertProblem(t, serveAdmin(t, &stubAdmin{err: v.Err()}, http.MethodPut, "/v1/admin/movies/42/genres", `{"genre_ids":[99]}`),
+		http.StatusBadRequest, problem.CodeValidationFailed)
+	if len(p.Errors) != 1 || p.Errors[0].Field != "genre_ids[0]" {
+		t.Errorf("errors = %+v", p.Errors)
+	}
+}
+
+func TestGenreCRUD(t *testing.T) {
+	t.Parallel()
+
+	svc := &stubAdmin{}
+	rec := serveAdmin(t, svc, http.MethodPost, "/v1/admin/genres", `{"slug":"film_noir","name":"Film noir"}`)
+	if rec.Code != http.StatusCreated || rec.Header().Get("Location") != "/v1/genres/19" {
+		t.Fatalf("create: %d, Location %q, body %s", rec.Code, rec.Header().Get("Location"), rec.Body.String())
+	}
+	if svc.genre != (domain.NewGenre{Slug: "film_noir", Name: "Film noir"}) {
+		t.Errorf("service got %+v", svc.genre)
+	}
+	if got := strings.TrimSpace(rec.Body.String()); got != `{"id":19,"slug":"film_noir","name":"Film noir"}` {
+		t.Errorf("create body = %s", got)
+	}
+
+	rec = serveAdmin(t, svc, http.MethodPut, "/v1/admin/genres/19", `{"slug":"noir","name":"Noir"}`)
+	if rec.Code != http.StatusOK || svc.genreID != 19 || svc.genre != (domain.NewGenre{Slug: "noir", Name: "Noir"}) {
+		t.Errorf("update: %d, service got %d %+v", rec.Code, svc.genreID, svc.genre)
+	}
+
+	rec = serveAdmin(t, svc, http.MethodDelete, "/v1/admin/genres/19", "")
+	if rec.Code != http.StatusNoContent || rec.Body.Len() != 0 || svc.genreID != 19 {
+		t.Errorf("delete: %d with %q, service got %d", rec.Code, rec.Body.String(), svc.genreID)
+	}
+}
+
+func TestGenreCRUDErrors(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name, method, target, body string
+		err                        error
+		status                     int
+		code                       string
+	}{
+		{"unknown field", http.MethodPost, "/v1/admin/genres", `{"slug":"noir","title":"Noir"}`, nil, http.StatusBadRequest, problem.CodeMalformedBody},
+		{"slug taken", http.MethodPost, "/v1/admin/genres", `{"slug":"drama","name":"Drama 2"}`,
+			domain.Conflict(domain.CodeGenreSlugTaken, "taken"), http.StatusConflict, domain.CodeGenreSlugTaken},
+		{"name taken", http.MethodPut, "/v1/admin/genres/3", `{"slug":"dramas","name":"drama"}`,
+			domain.Conflict(domain.CodeGenreNameTaken, "taken"), http.StatusConflict, domain.CodeGenreNameTaken},
+		{"update unknown", http.MethodPut, "/v1/admin/genres/99", `{"slug":"x","name":"X"}`,
+			domain.NotFound(domain.CodeGenreNotFound, "no"), http.StatusNotFound, domain.CodeGenreNotFound},
+		{"update bad id", http.MethodPut, "/v1/admin/genres/0", `{"slug":"x","name":"X"}`, nil, http.StatusBadRequest, problem.CodeValidationFailed},
+		{"delete in use", http.MethodDelete, "/v1/admin/genres/3", "",
+			domain.Conflict(domain.CodeGenreInUse, "in use"), http.StatusConflict, domain.CodeGenreInUse},
+		{"delete unknown", http.MethodDelete, "/v1/admin/genres/99", "",
+			domain.NotFound(domain.CodeGenreNotFound, "no"), http.StatusNotFound, domain.CodeGenreNotFound},
+		{"delete bad id", http.MethodDelete, "/v1/admin/genres/drama", "", nil, http.StatusBadRequest, problem.CodeValidationFailed},
+		{"server failure", http.MethodDelete, "/v1/admin/genres/3", "", errors.New("db down"), http.StatusInternalServerError, problem.CodeInternal},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assertProblem(t, serveAdmin(t, &stubAdmin{err: tt.err}, tt.method, tt.target, tt.body), tt.status, tt.code)
 		})
 	}
 }

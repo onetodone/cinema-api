@@ -147,8 +147,8 @@ func TestGenresAndLanguagesRoundTrip(t *testing.T) {
 	f := newFixture(t)
 	ctx := t.Context()
 
-	genres := []domain.Genre{domain.GenreScienceFiction, domain.GenreAdventure, domain.GenreDrama}
-	movie := must(f.catalog.CreateMovie(ctx, domain.NewMovie{Title: "Dune: Part Two", DurationMin: 166, Genres: genres}))(t)
+	genres := f.genres(t, "science_fiction", "adventure", "drama")
+	movie := must(f.catalog.CreateMovie(ctx, domain.NewMovie{Title: "Dune: Part Two", DurationMin: 166, GenreIDs: genreIDs(genres)}))(t)
 	if !slices.Equal(movie.Genres, genres) {
 		t.Errorf("created genres = %v, want %v in that order", movie.Genres, genres)
 	}
@@ -180,24 +180,6 @@ func TestGenresAndLanguagesRoundTrip(t *testing.T) {
 	}
 	if n := countRows(t, f.pool, `SELECT count(*) FROM showtimes WHERE subtitle_language IS NULL`); n != 1 {
 		t.Errorf("%d showtimes store NULL subtitles, want the one without them", n)
-	}
-}
-
-// TestGenreEnumMatchesTheDomain keeps the movie_genre enum and domain.Genres() equal, in the same order.
-func TestGenreEnumMatchesTheDomain(t *testing.T) {
-	t.Parallel()
-	pool := newDB(t)
-
-	var inDB []string
-	if err := pool.QueryRow(t.Context(), `SELECT enum_range(NULL::movie_genre)::text[]`).Scan(&inDB); err != nil {
-		t.Fatal(err)
-	}
-	var inDomain []string
-	for _, g := range domain.Genres() {
-		inDomain = append(inDomain, string(g))
-	}
-	if !slices.Equal(inDB, inDomain) {
-		t.Errorf("movie_genre = %v\ndomain     = %v", inDB, inDomain)
 	}
 }
 

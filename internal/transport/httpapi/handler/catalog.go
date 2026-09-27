@@ -18,6 +18,8 @@ type CatalogService interface {
 	Schedule(ctx context.Context, q catalog.ScheduleQuery) (catalog.Schedule, error)
 	GetShowtime(ctx context.Context, id int64) (domain.Showtime, error)
 	SeatMap(ctx context.Context, showtimeID int64) (catalog.SeatMap, error)
+	ListGenres(ctx context.Context) ([]domain.Genre, error)
+	GetGenre(ctx context.Context, id int64) (domain.Genre, error)
 }
 
 // Catalog serves the public browsing endpoints.
@@ -62,6 +64,33 @@ func (h *Catalog) GetMovie(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	render.JSON(w, http.StatusOK, dto.NewMovieDetails(details, h.currency))
+}
+
+// ListGenres handles GET /v1/genres: every genre, ordered by name. Clients revalidate it with If-None-Match (see
+// render.ValidatedJSON), so an admin's change shows at once.
+func (h *Catalog) ListGenres(w http.ResponseWriter, r *http.Request) {
+	genres, err := h.svc.ListGenres(r.Context())
+	if err != nil {
+		writeError(h.logger, w, r, err)
+		return
+	}
+	render.ValidatedJSON(w, r, dto.NewGenreList(genres))
+}
+
+// GetGenre handles GET /v1/genres/{genreID}.
+func (h *Catalog) GetGenre(w http.ResponseWriter, r *http.Request) {
+	var p params
+	id := p.pathID(r, "genreID")
+	if !p.ok(w, r) {
+		return
+	}
+
+	g, err := h.svc.GetGenre(r.Context(), id)
+	if err != nil {
+		writeError(h.logger, w, r, err)
+		return
+	}
+	render.JSON(w, http.StatusOK, dto.NewGenre(g))
 }
 
 // Schedule handles GET /v1/showtimes?date=YYYY-MM-DD&movie_id=. Without a date it lists today. Clients poll it

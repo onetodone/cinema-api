@@ -21,9 +21,9 @@ type Movie struct {
 	Title       string
 	Description string
 	DurationMin int
-	AgeRating   string // empty when unknown
-	PosterURL   string // empty when unknown
-	Genres      []Genre
+	AgeRating   string  // empty when unknown
+	PosterURL   string  // empty when unknown
+	Genres      []Genre // most characteristic first; never nil
 	CreatedAt   time.Time
 }
 
@@ -34,7 +34,7 @@ type NewMovie struct {
 	DurationMin int
 	AgeRating   string
 	PosterURL   string
-	Genres      []Genre // most characteristic first; may be empty
+	GenreIDs    []int64 // most characteristic first; may be empty
 }
 
 // Movie field limits.
@@ -67,7 +67,7 @@ func (m NewMovie) Validate() error {
 	if m.PosterURL != "" {
 		v.Check("poster_url", checkWebURL(m.PosterURL, MaxPosterURLLength))
 	}
-	checkGenres(&v, m.Genres)
+	checkGenreIDs(&v, m.GenreIDs)
 	return v.Err()
 }
 

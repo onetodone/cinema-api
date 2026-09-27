@@ -48,6 +48,14 @@ func (emptyCatalog) SeatMap(context.Context, int64) (catalog.SeatMap, error) {
 	return catalog.SeatMap{}, nil
 }
 
+func (emptyCatalog) ListGenres(context.Context) ([]domain.Genre, error) {
+	return nil, nil
+}
+
+func (emptyCatalog) GetGenre(_ context.Context, id int64) (domain.Genre, error) {
+	return domain.Genre{ID: id}, nil
+}
+
 // oneUser knows a single account and accepts any password for it.
 type oneUser struct{ user domain.User }
 
@@ -140,6 +148,20 @@ func (echoAdmin) CreateShowtime(_ context.Context, ns domain.NewShowtime) (domai
 	return domain.Showtime{ID: 1, StartsAt: ns.StartsAt, EndsAt: ns.StartsAt.Add(time.Hour)}, nil
 }
 
+func (echoAdmin) SetMovieGenres(_ context.Context, movieID int64, _ []int64) (domain.Movie, error) {
+	return domain.Movie{ID: movieID}, nil
+}
+
+func (echoAdmin) CreateGenre(_ context.Context, g domain.NewGenre) (domain.Genre, error) {
+	return domain.Genre{ID: 1, Slug: g.Slug, Name: g.Name}, nil
+}
+
+func (echoAdmin) UpdateGenre(_ context.Context, id int64, g domain.NewGenre) (domain.Genre, error) {
+	return domain.Genre{ID: id, Slug: g.Slug, Name: g.Name}, nil
+}
+
+func (echoAdmin) DeleteGenre(context.Context, int64) error { return nil }
+
 var testTokens = func() *auth.Tokens {
 	t, err := auth.NewTokens(strings.Repeat("k", auth.MinSecretBytes), time.Hour)
 	if err != nil {
@@ -212,7 +234,7 @@ func TestRouterServesRegisteredRoutes(t *testing.T) {
 	router := newTestRouter()
 	for _, path := range []string{
 		"/healthz", "/readyz",
-		"/v1/movies", "/v1/movies/1",
+		"/v1/movies", "/v1/movies/1", "/v1/genres", "/v1/genres/1",
 		"/v1/showtimes", "/v1/showtimes/1", "/v1/showtimes/1/seats",
 		"/v1/payment-methods",
 	} {
@@ -297,6 +319,8 @@ func TestRouterEnforcesAccessLevels(t *testing.T) {
 	credentials := `{"email":"ann@example.com","password":"correct horse"}`
 	movie := `{"title":"Dune","duration_min":155}`
 	hall := `{"name":"Hall 9","rows":[{"label":"A","seats":5}]}`
+	genre := `{"slug":"noir","name":"Noir"}`
+	genreIDs := `{"genre_ids":[1,2]}`
 	showtime := `{"movie_id":1,"hall_id":1,"starts_at":"2030-01-01T19:00:00Z","base_price_cents":900}`
 	seats := `{"showtime_id":1,"seat_ids":[1,2]}`
 	bookingPath := "/v1/bookings/" + uuid.NewV7().String()
@@ -327,6 +351,8 @@ func TestRouterEnforcesAccessLevels(t *testing.T) {
 		{name: "session revoke needs a token", method: http.MethodDelete, path: sessionPath, status: http.StatusUnauthorized},
 		{name: "session revoke for a customer", method: http.MethodDelete, path: sessionPath, token: customer, status: http.StatusNoContent},
 		{name: "catalog is public", method: http.MethodGet, path: "/v1/movies", status: http.StatusOK},
+		{name: "genres are public", method: http.MethodGet, path: "/v1/genres", status: http.StatusOK},
+		{name: "a genre is public", method: http.MethodGet, path: "/v1/genres/1", status: http.StatusOK},
 		{name: "me needs a token", method: http.MethodGet, path: "/v1/me", status: http.StatusUnauthorized},
 		{name: "me rejects a forged token", method: http.MethodGet, path: "/v1/me", token: "forged", status: http.StatusUnauthorized},
 		{name: "me for a customer", method: http.MethodGet, path: "/v1/me", token: customer, status: http.StatusOK},
@@ -354,6 +380,18 @@ func TestRouterEnforcesAccessLevels(t *testing.T) {
 		{name: "showtime needs a token", method: http.MethodPost, path: "/v1/admin/showtimes", body: showtime, status: http.StatusUnauthorized},
 		{name: "showtime refuses customers", method: http.MethodPost, path: "/v1/admin/showtimes", token: customer, body: showtime, status: http.StatusForbidden},
 		{name: "showtime for an admin", method: http.MethodPost, path: "/v1/admin/showtimes", token: admin, body: showtime, status: http.StatusCreated},
+		{name: "movie genres need a token", method: http.MethodPut, path: "/v1/admin/movies/1/genres", body: genreIDs, status: http.StatusUnauthorized},
+		{name: "movie genres refuse customers", method: http.MethodPut, path: "/v1/admin/movies/1/genres", token: customer, body: genreIDs, status: http.StatusForbidden},
+		{name: "movie genres for an admin", method: http.MethodPut, path: "/v1/admin/movies/1/genres", token: admin, body: genreIDs, status: http.StatusOK},
+		{name: "genre create needs a token", method: http.MethodPost, path: "/v1/admin/genres", body: genre, status: http.StatusUnauthorized},
+		{name: "genre create refuses customers", method: http.MethodPost, path: "/v1/admin/genres", token: customer, body: genre, status: http.StatusForbidden},
+		{name: "genre create for an admin", method: http.MethodPost, path: "/v1/admin/genres", token: admin, body: genre, status: http.StatusCreated},
+		{name: "genre update needs a token", method: http.MethodPut, path: "/v1/admin/genres/1", body: genre, status: http.StatusUnauthorized},
+		{name: "genre update refuses customers", method: http.MethodPut, path: "/v1/admin/genres/1", token: customer, body: genre, status: http.StatusForbidden},
+		{name: "genre update for an admin", method: http.MethodPut, path: "/v1/admin/genres/1", token: admin, body: genre, status: http.StatusOK},
+		{name: "genre delete needs a token", method: http.MethodDelete, path: "/v1/admin/genres/1", status: http.StatusUnauthorized},
+		{name: "genre delete refuses customers", method: http.MethodDelete, path: "/v1/admin/genres/1", token: customer, status: http.StatusForbidden},
+		{name: "genre delete for an admin", method: http.MethodDelete, path: "/v1/admin/genres/1", token: admin, status: http.StatusNoContent},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

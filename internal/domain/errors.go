@@ -33,6 +33,10 @@ const (
 	CodeShowtimeNotFound = "SHOWTIME_NOT_FOUND"
 	CodeHallOverlap      = "HALL_OVERLAP"
 	CodeHallNameTaken    = "HALL_NAME_TAKEN"
+	CodeGenreNotFound    = "GENRE_NOT_FOUND"
+	CodeGenreSlugTaken   = "GENRE_SLUG_TAKEN"
+	CodeGenreNameTaken   = "GENRE_NAME_TAKEN"
+	CodeGenreInUse       = "GENRE_IN_USE"
 
 	CodeUserNotFound       = "USER_NOT_FOUND"
 	CodeEmailTaken         = "EMAIL_TAKEN"

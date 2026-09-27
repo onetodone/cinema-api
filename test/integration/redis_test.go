@@ -112,7 +112,7 @@ func TestCatalogCache(t *testing.T) {
 	loc := time.FixedZone("GST", 4*3600)
 	want := catalog.SeatMap{
 		Showtime: domain.Showtime{
-			ID: 5, Movie: domain.MovieSummary{ID: 1, Title: "Dune", Genres: []domain.Genre{domain.GenreScienceFiction}},
+			ID: 5, Movie: domain.MovieSummary{ID: 1, Title: "Dune", Genres: []domain.Genre{{ID: 15, Slug: "science_fiction", Name: "Science fiction"}}},
 			Hall: domain.Hall{ID: 2, Name: "Hall 1"}, StartsAt: time.Date(2030, 1, 1, 19, 0, 0, 0, loc),
 			Language:       domain.LanguageVersion{Audio: "eng", Subtitles: "tha"},
 			BasePriceCents: 900, Status: domain.ShowtimeScheduled,
@@ -129,7 +129,7 @@ func TestCatalogCache(t *testing.T) {
 		!slices.Equal(got.Seats, want.Seats) || got.Summary != want.Summary {
 		t.Fatalf("cached seat map = %+v, %t, %v; want %+v", got, ok, err, want)
 	}
-	if ttl := pttl(t, env, env.prefix+":seatmap:v2:{5}"); ttl <= 59*time.Second {
+	if ttl := pttl(t, env, env.prefix+":seatmap:v3:{5}"); ttl <= 59*time.Second {
 		t.Errorf("seat map TTL = %s, want about 1m", ttl)
 	}
 
@@ -139,7 +139,7 @@ func TestCatalogCache(t *testing.T) {
 	if list, ok, err := cache.Schedule(ctx, "2030-01-01"); err != nil || !ok || len(list) != 1 || list[0].ID != 5 {
 		t.Errorf("cached schedule = %+v, %t, %v", list, ok, err)
 	}
-	if ttl := pttl(t, env, env.prefix+":schedule:v2:2030-01-01"); ttl <= 29*time.Second || ttl > 30*time.Second {
+	if ttl := pttl(t, env, env.prefix+":schedule:v3:2030-01-01"); ttl <= 29*time.Second || ttl > 30*time.Second {
 		t.Errorf("schedule TTL = %s, want about 30s", ttl)
 	}
 
@@ -160,7 +160,7 @@ func TestCatalogCache(t *testing.T) {
 	}
 
 	// An entry that does not decode, such as one written by an older release, is a miss.
-	if err := env.client.Set(ctx, env.prefix+":seatmap:v2:{9}", "{not json", time.Minute).Err(); err != nil {
+	if err := env.client.Set(ctx, env.prefix+":seatmap:v3:{9}", "{not json", time.Minute).Err(); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok, err := cache.SeatMap(ctx, 9); ok || err != nil {
@@ -172,7 +172,7 @@ func TestCatalogCache(t *testing.T) {
 	if err := off.SetSeatMap(ctx, 10, want); err != nil {
 		t.Fatal(err)
 	}
-	if n := env.client.Exists(ctx, env.prefix+":seatmap:v2:{10}").Val(); n != 0 {
+	if n := env.client.Exists(ctx, env.prefix+":seatmap:v3:{10}").Val(); n != 0 {
 		t.Error("a cache with TTL 0 wrote an entry")
 	}
 }
