@@ -1,13 +1,15 @@
 // Package redis implements the Redis side of the application: the seat hold gate, the seat map and schedule
-// caches, the idempotency records, and the rate limiters.
+// caches, the idempotency records, the rate limiters, and the revocation list of ended sessions.
 //
 // Redis is an accelerator here, never the source of truth. Any operation may fail; it then returns an error, its
 // caller carries on without Redis (fail open), and the failure is counted in cinema_redis_fail_open_total.
 // PostgreSQL alone decides who owns a seat, so a Redis outage makes the system slower and less shielded from
-// floods, but never incorrect.
+// floods, but never incorrect. PostgreSQL also decides which sessions may refresh; without the revocation list,
+// only the access tokens of sessions that ended keep working until they expire (JWT_TTL).
 //
 // The adapters implement ports declared by the packages that use them: booking.HoldGate and
-// booking.SeatMapCache, catalog.Cache, and the idempotency and rate limit stores of the HTTP middleware.
+// booking.SeatMapCache, catalog.Cache, auth.RevocationList, and the idempotency store, rate limiters, and
+// revocation list of the HTTP middleware.
 package redis
 
 import (

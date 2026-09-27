@@ -173,8 +173,8 @@ type AuthConfig struct {
 	// derived from it. Only the API needs it, so it is checked where tokens are built; here it is only rejected
 	// when it is set but too short.
 	JWTSecret string `env:"JWT_SECRET"`
-	// JWTTTL is the lifetime of an access token. Clients refresh before it ends; a token of a session that was
-	// ended stays valid until then.
+	// JWTTTL is the lifetime of an access token. Clients refresh before it ends. A token of a session that was
+	// ended is refused through the revocation list, and stays valid until then only while Redis is down.
 	JWTTTL time.Duration `env:"JWT_TTL" envDefault:"15m"`
 	// RefreshTTL is how long a session lasts after its last rotation: it ends when its client stays away longer.
 	RefreshTTL time.Duration `env:"REFRESH_TOKEN_TTL" envDefault:"168h"`

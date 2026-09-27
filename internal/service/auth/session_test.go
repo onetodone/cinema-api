@@ -183,6 +183,42 @@ func (m *memSessions) DeleteAllOfUser(_ context.Context, userID uuid.UUID) ([]uu
 	return ended, nil
 }
 
+func (m *memSessions) ListOfUser(_ context.Context, userID uuid.UUID) ([]domain.Session, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.err != nil {
+		return nil, m.err
+	}
+	var own []domain.Session
+	for _, row := range m.rows {
+		if row.session.UserID == userID && row.session.ExpiresAt.After(m.clock.now) {
+			own = append(own, row.session)
+		}
+	}
+	// ORDER BY last_used_at DESC, id DESC
+	slices.SortFunc(own, func(a, b domain.Session) int {
+		if c := b.LastUsedAt.Compare(a.LastUsedAt); c != 0 {
+			return c
+		}
+		return bytes.Compare(b.ID[:], a.ID[:])
+	})
+	return own, nil
+}
+
+func (m *memSessions) DeleteOfUser(_ context.Context, userID, id uuid.UUID) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.err != nil {
+		return false, m.err
+	}
+	row, ok := m.rows[id]
+	if !ok || row.session.UserID != userID {
+		return false, nil
+	}
+	delete(m.rows, id)
+	return true, nil
+}
+
 func (m *memSessions) row(id uuid.UUID) (memSession, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -199,6 +235,46 @@ func (m *memSessions) count() int {
 	return len(m.rows)
 }
 
+// memRevocations records what the session use cases put on the revocation list.
+type memRevocations struct {
+	mu      sync.Mutex
+	revoked map[uuid.UUID]time.Duration // session id → ttl
+	err     error                       // returned by Revoke when set, after recording nothing
+	// ctxErrs records whether the context of each call was already done.
+	ctxErrs []error
+}
+
+func (m *memRevocations) Revoke(ctx context.Context, ttl time.Duration, sessionIDs ...uuid.UUID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ctxErrs = append(m.ctxErrs, ctx.Err())
+	if m.err != nil {
+		return m.err
+	}
+	for _, id := range sessionIDs {
+		m.revoked[id] = ttl
+	}
+	return nil
+}
+
+// has reports whether every one of ids is on the list.
+func (m *memRevocations) has(ids ...uuid.UUID) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, id := range ids {
+		if _, ok := m.revoked[id]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func (m *memRevocations) count() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.revoked)
+}
+
 var testSessionConfig = SessionConfig{
 	IdleTTL:    24 * time.Hour,
 	MaxAge:     72 * time.Hour,
@@ -208,13 +284,14 @@ var testSessionConfig = SessionConfig{
 
 // sessionEnv is a Sessions over fakes, with one registered account.
 type sessionEnv struct {
-	clock  *clock
-	users  *memUsers
-	repo   *memSessions
-	tokens *Tokens
-	svc    *Sessions
-	ann    domain.User
-	logs   *bytes.Buffer
+	clock   *clock
+	users   *memUsers
+	repo    *memSessions
+	revoked *memRevocations
+	tokens  *Tokens
+	svc     *Sessions
+	ann     domain.User
+	logs    *bytes.Buffer
 }
 
 func newSessionEnv(t *testing.T, cfg SessionConfig) *sessionEnv {
@@ -228,12 +305,13 @@ func newSessionEnv(t *testing.T, cfg SessionConfig) *sessionEnv {
 	}
 	logs := &bytes.Buffer{}
 	repo := newMemSessions(c, users)
+	revoked := &memRevocations{revoked: map[uuid.UUID]time.Duration{}}
 	tokens := newTokens(t, c)
-	svc, err := NewSessions(accounts, repo, tokens, cfg, slog.New(slog.NewTextHandler(logs, nil)))
+	svc, err := NewSessions(accounts, repo, tokens, cfg, slog.New(slog.NewTextHandler(logs, nil)), WithRevocations(revoked))
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &sessionEnv{clock: c, users: users, repo: repo, tokens: tokens, svc: svc, ann: ann, logs: logs}
+	return &sessionEnv{clock: c, users: users, repo: repo, revoked: revoked, tokens: tokens, svc: svc, ann: ann, logs: logs}
 }
 
 var annClient = Client{UserAgent: "Firefox/140", IP: netip.MustParseAddr("192.0.2.10")}
@@ -398,6 +476,9 @@ func TestLoginEvictsTheLeastRecentlyUsedSessions(t *testing.T) {
 	if !strings.Contains(e.logs.String(), "per-user limit") {
 		t.Errorf("the eviction was not logged: %s", e.logs.String())
 	}
+	if fourth.Evicted != 1 || !e.revoked.has(grants[1].Session.ID) || e.revoked.count() != 1 {
+		t.Errorf("evicted %d, revoked %v; want the evicted session revoked, and only it", fourth.Evicted, e.revoked.revoked)
+	}
 }
 
 // TestRefreshRotationTable walks one session through every row of the rotation table.
@@ -451,9 +532,15 @@ func TestRefreshRotationTable(t *testing.T) {
 	}
 
 	// The previous token after the grace window: reuse detected, the session is revoked.
+	if e.revoked.count() != 0 {
+		t.Fatalf("refreshes revoked sessions: %v", e.revoked.revoked)
+	}
 	e.wantRefused(t, t1Token, RefreshReuseDetected)
 	if _, ok := e.repo.row(login.Session.ID); ok {
 		t.Fatal("the session survived the reuse of a rotated token")
+	}
+	if !e.revoked.has(login.Session.ID) {
+		t.Error("the access tokens of the session were not revoked")
 	}
 	if !strings.Contains(e.logs.String(), "reuse detected") || !strings.Contains(e.logs.String(), login.Session.ID.String()) {
 		t.Errorf("the reuse was not logged with the session: %s", e.logs.String())
@@ -475,6 +562,9 @@ func TestRefreshOfAnExpiredSession(t *testing.T) {
 	e.wantRefused(t, g.Refresh.String(), RefreshExpired)
 	if e.repo.count() != 0 {
 		t.Error("the expired session was not deleted")
+	}
+	if e.revoked.count() != 0 {
+		t.Error("an expired session was revoked: its access tokens expired long before it")
 	}
 
 	// A failed delete does not change the answer.
@@ -583,6 +673,9 @@ func TestRefreshDatabaseFailures(t *testing.T) {
 	if _, result, err := e.refresh(t, g.Refresh.String()); err == nil || code(err) != "" || result != "" {
 		t.Errorf("reuse with a failing delete = %q, %v; want an internal error", result, err)
 	}
+	if e.revoked.count() != 0 {
+		t.Error("a session that could not be deleted was revoked: every token it refreshes would be refused")
+	}
 	e.repo.deleteErr = nil
 	e.wantRefused(t, g.Refresh.String(), RefreshReuseDetected)
 	e.wantRefused(t, next.Refresh.String(), RefreshInvalid)
@@ -596,21 +689,24 @@ func TestLogout(t *testing.T) {
 
 	// With the current token.
 	g := e.login(t)
-	if err := e.svc.Logout(ctx, g.Refresh.String()); err != nil {
-		t.Fatal(err)
+	if ended, err := e.svc.Logout(ctx, g.Refresh.String()); err != nil || !ended {
+		t.Fatalf("logout = %t, %v; want the session ended", ended, err)
 	}
 	if e.repo.count() != 0 {
 		t.Fatal("logout with the current token kept the session")
 	}
-	if err := e.svc.Logout(ctx, g.Refresh.String()); err != nil {
-		t.Errorf("a second logout = %v, want no error", err)
+	if !e.revoked.has(g.Session.ID) {
+		t.Error("logout left the session's access tokens valid")
+	}
+	if ended, err := e.svc.Logout(ctx, g.Refresh.String()); err != nil || ended {
+		t.Errorf("a second logout = %t, %v; want nothing ended and no error", ended, err)
 	}
 
 	// With the previous token, whose owner rotated it a moment ago in another tab.
 	g = e.login(t)
 	e.mustRefresh(t, g.Refresh.String(), RefreshRotated)
-	if err := e.svc.Logout(ctx, g.Refresh.String()); err != nil || e.repo.count() != 0 {
-		t.Fatalf("logout with the previous token = %v, %d sessions left", err, e.repo.count())
+	if ended, err := e.svc.Logout(ctx, g.Refresh.String()); err != nil || !ended || e.repo.count() != 0 {
+		t.Fatalf("logout with the previous token = %t, %v, %d sessions left", ended, err, e.repo.count())
 	}
 
 	// With a token two generations old, or garbage: nothing happens.
@@ -618,14 +714,18 @@ func TestLogout(t *testing.T) {
 	next := e.mustRefresh(t, g.Refresh.String(), RefreshRotated)
 	e.clock.now = e.clock.now.Add(time.Minute)
 	e.mustRefresh(t, next.Refresh.String(), RefreshRotated)
+	revoked := e.revoked.count()
 	for _, token := range []string{g.Refresh.String(), "garbage", ""} {
-		if err := e.svc.Logout(ctx, token); err != nil || e.repo.count() != 1 {
-			t.Errorf("logout with %q = %v, %d sessions left; want nothing ended", token, err, e.repo.count())
+		if ended, err := e.svc.Logout(ctx, token); err != nil || ended || e.repo.count() != 1 {
+			t.Errorf("logout with %q = %t, %v, %d sessions left; want nothing ended", token, ended, err, e.repo.count())
 		}
+	}
+	if e.revoked.count() != revoked {
+		t.Error("a logout that ended nothing revoked a session")
 	}
 
 	e.repo.err = errors.New("connection refused")
-	if err := e.svc.Logout(ctx, g.Refresh.String()); err == nil {
+	if _, err := e.svc.Logout(ctx, g.Refresh.String()); err == nil {
 		t.Error("logout with the database down reported success")
 	}
 }
@@ -644,8 +744,8 @@ func TestLogoutAll(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := e.svc.LogoutAll(t.Context(), e.ann.ID); err != nil {
-		t.Fatal(err)
+	if ended, err := e.svc.LogoutAll(t.Context(), e.ann.ID); err != nil || ended != 2 {
+		t.Fatalf("logout-all = %d, %v; want Ann's 2 sessions ended", ended, err)
 	}
 	for _, g := range []Grant{a, b} {
 		e.wantRefused(t, g.Refresh.String(), RefreshInvalid)
@@ -653,9 +753,167 @@ func TestLogoutAll(t *testing.T) {
 	if _, ok := e.repo.row(bobs.Session.ID); !ok || bobs.User.ID != bob.ID {
 		t.Error("logging Ann out everywhere ended Bob's session")
 	}
+	if !e.revoked.has(a.Session.ID, b.Session.ID) || e.revoked.has(bobs.Session.ID) {
+		t.Errorf("revoked %v, want exactly Ann's sessions", e.revoked.revoked)
+	}
+	if ended, err := e.svc.LogoutAll(t.Context(), e.ann.ID); err != nil || ended != 0 {
+		t.Errorf("a second logout-all = %d, %v; want nothing ended", ended, err)
+	}
 
 	e.repo.err = errors.New("connection refused")
-	if err := e.svc.LogoutAll(t.Context(), e.ann.ID); err == nil {
+	if _, err := e.svc.LogoutAll(t.Context(), e.ann.ID); err == nil {
 		t.Error("logout-all with the database down reported success")
+	}
+}
+
+func TestListSessions(t *testing.T) {
+	t.Parallel()
+
+	e := newSessionEnv(t, testSessionConfig)
+	var grants []Grant
+	for range 3 {
+		grants = append(grants, e.login(t))
+		e.clock.now = e.clock.now.Add(time.Minute)
+	}
+	bob, err := e.svc.accounts.Register(t.Context(), "bob@example.com", "correct horse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bobs, err := e.svc.Login(t.Context(), "bob@example.com", "correct horse", annClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The first session refreshes, so it is the most recently used one.
+	e.mustRefresh(t, grants[0].Refresh.String(), RefreshRotated)
+
+	sessions, err := e.svc.List(t.Context(), e.ann.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []uuid.UUID
+	for _, s := range sessions {
+		got = append(got, s.ID)
+		if s.UserID != e.ann.ID {
+			t.Errorf("the list holds session %s of user %s", s.ID, s.UserID)
+		}
+	}
+	want := []uuid.UUID{grants[0].Session.ID, grants[2].Session.ID, grants[1].Session.ID}
+	if !slices.Equal(got, want) {
+		t.Errorf("sessions = %v, want %v (most recently used first)", got, want)
+	}
+	if sessions[0].UserAgent != annClient.UserAgent || sessions[0].IP != annClient.IP || sessions[0].Generation != 1 {
+		t.Errorf("first session = %+v, want the client and the rotation", sessions[0])
+	}
+
+	if sessions, err := e.svc.List(t.Context(), bob.ID); err != nil || len(sessions) != 1 || sessions[0].ID != bobs.Session.ID {
+		t.Errorf("Bob's sessions = %v, %v; want his one", sessions, err)
+	}
+
+	// Sessions that have expired are not listed, although the sweeper has not deleted them yet.
+	e.clock.now = grants[2].Session.ExpiresAt
+	if sessions, err := e.svc.List(t.Context(), e.ann.ID); err != nil || len(sessions) != 1 || sessions[0].ID != grants[0].Session.ID {
+		t.Errorf("after two sessions expired: %v, %v; want only the refreshed one", sessions, err)
+	}
+
+	e.repo.err = errors.New("connection refused")
+	if _, err := e.svc.List(t.Context(), e.ann.ID); err == nil {
+		t.Error("listing with the database down reported success")
+	}
+}
+
+func TestRevokeSession(t *testing.T) {
+	t.Parallel()
+
+	e := newSessionEnv(t, testSessionConfig)
+	a, b := e.login(t), e.login(t)
+	if _, err := e.svc.accounts.Register(t.Context(), "bob@example.com", "correct horse"); err != nil {
+		t.Fatal(err)
+	}
+	bobs, err := e.svc.Login(t.Context(), "bob@example.com", "correct horse", annClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := e.svc.Revoke(t.Context(), e.ann.ID, b.Session.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := e.repo.row(b.Session.ID); ok {
+		t.Error("the revoked session is still there")
+	}
+	e.wantRefused(t, b.Refresh.String(), RefreshInvalid)
+	if ttl := e.revoked.revoked[b.Session.ID]; ttl != time.Hour+time.Minute {
+		t.Errorf("revoked for %s, want the token lifetime of 1h plus 1m", ttl)
+	}
+	if _, ok := e.repo.row(a.Session.ID); !ok {
+		t.Error("revoking one session ended another")
+	}
+
+	// Gone already, never there, or another user's: all the same to the caller.
+	for name, id := range map[string]uuid.UUID{
+		"revoked twice": b.Session.ID, "unknown": uuid.NewV7(), "Bob's": bobs.Session.ID,
+	} {
+		err := e.svc.Revoke(t.Context(), e.ann.ID, id)
+		if code(err) != domain.CodeSessionNotFound || !errors.Is(err, domain.ErrNotFound) {
+			t.Errorf("%s session: %v, want SESSION_NOT_FOUND", name, err)
+		}
+	}
+	if _, ok := e.repo.row(bobs.Session.ID); !ok || e.revoked.has(bobs.Session.ID) {
+		t.Error("Ann ended Bob's session")
+	}
+
+	e.repo.err = errors.New("connection refused")
+	if err := e.svc.Revoke(t.Context(), e.ann.ID, a.Session.ID); err == nil || code(err) != "" {
+		t.Errorf("revoke with the database down = %v, want an internal error", err)
+	}
+	if e.revoked.has(a.Session.ID) {
+		t.Error("a session that was not deleted was revoked")
+	}
+}
+
+// TestRevocationsOutliveTheRequest: a client that hangs up after its session was deleted must not leave the
+// session's access tokens valid, and a revocation list that fails must not fail the request.
+func TestRevocationsOutliveTheRequest(t *testing.T) {
+	t.Parallel()
+
+	e := newSessionEnv(t, testSessionConfig)
+	g := e.login(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel() // the in-memory repository ignores the context; the revocation list must not see it canceled
+	if ended, err := e.svc.Logout(ctx, g.Refresh.String()); err != nil || !ended {
+		t.Fatalf("logout = %t, %v", ended, err)
+	}
+	if !e.revoked.has(g.Session.ID) || e.revoked.ctxErrs[0] != nil {
+		t.Errorf("revocation context error %v, want a context that the hang-up does not cancel", e.revoked.ctxErrs)
+	}
+
+	e.revoked.err = errors.New("redis: connection refused")
+	g = e.login(t)
+	if ended, err := e.svc.Logout(t.Context(), g.Refresh.String()); err != nil || !ended {
+		t.Errorf("logout with a failing revocation list = %t, %v; want the session ended without error", ended, err)
+	}
+	if err := e.svc.Revoke(t.Context(), e.ann.ID, e.login(t).Session.ID); err != nil {
+		t.Errorf("revoke with a failing revocation list = %v, want no error", err)
+	}
+}
+
+func TestSessionsWithoutRevocationList(t *testing.T) {
+	t.Parallel()
+
+	c := &clock{now: t0}
+	users := newMemUsers()
+	accounts := newService(t, users)
+	if _, err := accounts.Register(t.Context(), "ann@example.com", "correct horse"); err != nil {
+		t.Fatal(err)
+	}
+	svc, err := NewSessions(accounts, newMemSessions(c, users), newTokens(t, c), testSessionConfig, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := svc.Login(t.Context(), "ann@example.com", "correct horse", annClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ended, err := svc.Logout(t.Context(), g.Refresh.String()); err != nil || !ended {
+		t.Errorf("logout without a revocation list = %t, %v", ended, err)
 	}
 }

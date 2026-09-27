@@ -54,8 +54,11 @@ type stubSessions struct {
 	token           string
 	client          auth.Client
 	userID          uuid.UUID
+	sessionID       uuid.UUID
 	grant           auth.Grant
 	result          auth.RefreshResult
+	ended           int // sessions a logout or logout-all ends
+	sessions        []domain.Session
 	err             error
 }
 
@@ -71,15 +74,27 @@ func (s *stubSessions) Refresh(_ context.Context, token string, c auth.Client) (
 	return s.grant, s.result, s.err
 }
 
-func (s *stubSessions) Logout(_ context.Context, token string) error {
+func (s *stubSessions) Logout(_ context.Context, token string) (bool, error) {
 	s.calls++
 	s.token = token
-	return s.err
+	return s.ended > 0, s.err
 }
 
-func (s *stubSessions) LogoutAll(_ context.Context, userID uuid.UUID) error {
+func (s *stubSessions) LogoutAll(_ context.Context, userID uuid.UUID) (int, error) {
 	s.calls++
 	s.userID = userID
+	return s.ended, s.err
+}
+
+func (s *stubSessions) List(_ context.Context, userID uuid.UUID) ([]domain.Session, error) {
+	s.calls++
+	s.userID = userID
+	return s.sessions, s.err
+}
+
+func (s *stubSessions) Revoke(_ context.Context, userID, sessionID uuid.UUID) error {
+	s.calls++
+	s.userID, s.sessionID = userID, sessionID
 	return s.err
 }
 
@@ -121,6 +136,22 @@ func postWithCookie(t *testing.T, h http.HandlerFunc, target, body, token string
 
 func newAuthHandler(svc AuthService, sessions SessionService) *Auth {
 	return NewAuth(svc, sessions, AuthConfig{Cookie: testCookie}, newTestMetrics(), slog.New(slog.DiscardHandler))
+}
+
+// revocations returns how many revoked sessions m counted for reason.
+func revocations(m *metrics.Metrics, reason string) float64 {
+	return testutil.ToFloat64(m.SessionRevocations.WithLabelValues(reason))
+}
+
+// sampleSessionID is the session of the access token that asSampleSession puts in a request.
+var sampleSessionID = uuid.MustParse("0199a1f0-7c1e-7d2a-9b3e-5f0c2d1e4a77")
+
+// asSampleSession returns a request made with an access token of sampleUser's session sampleSessionID.
+func asSampleSession(t *testing.T, method, target string) *http.Request {
+	t.Helper()
+	req := httptest.NewRequestWithContext(t.Context(), method, target, nil)
+	return req.WithContext(principal.NewContext(req.Context(),
+		domain.Principal{UserID: sampleUser.ID, Role: domain.RoleCustomer, SessionID: sampleSessionID}))
 }
 
 // refreshCookie returns the refresh token cookie that rec sets, or fails the test.
@@ -267,6 +298,21 @@ func TestLogin(t *testing.T) {
 	}
 }
 
+func TestLoginCountsEvictedSessions(t *testing.T) {
+	t.Parallel()
+
+	m := newTestMetrics()
+	g := sampleGrant()
+	g.Evicted = 2
+	h := NewAuth(&stubAuth{}, &stubSessions{grant: g}, AuthConfig{Cookie: testCookie}, m, slog.New(slog.DiscardHandler))
+	if rec := postJSON(t, h.Login, "/v1/auth/login", `{"email":"ann@example.com","password":"correct horse"}`); rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if got := revocations(m, metrics.RevocationEvicted); got != 2 {
+		t.Errorf("evicted sessions counted = %v, want 2", got)
+	}
+}
+
 func TestLoginErrors(t *testing.T) {
 	t.Parallel()
 
@@ -381,6 +427,13 @@ func TestRefreshFailures(t *testing.T) {
 			if tt.wantCounted != "" && (counted != 1 || testutil.ToFloat64(m.AuthRefreshes.WithLabelValues(tt.wantCounted)) != 1) {
 				t.Errorf("counted %v refreshes, want one %s", counted, tt.wantCounted)
 			}
+			wantRevoked := 0.0
+			if tt.result == auth.RefreshReuseDetected {
+				wantRevoked = 1
+			}
+			if got := revocations(m, metrics.RevocationReuse); got != wantRevoked {
+				t.Errorf("sessions revoked for reuse = %v, want %v", got, wantRevoked)
+			}
 		})
 	}
 }
@@ -422,8 +475,10 @@ func TestCookieRoutesRequireJSON(t *testing.T) {
 func TestLogout(t *testing.T) {
 	t.Parallel()
 
-	sessions := &stubSessions{}
-	rec := postWithCookie(t, newAuthHandler(&stubAuth{}, sessions).Logout, "/v1/auth/logout", `{}`, "the-token")
+	m := newTestMetrics()
+	sessions := &stubSessions{ended: 1}
+	h := NewAuth(&stubAuth{}, sessions, AuthConfig{Cookie: testCookie}, m, slog.New(slog.DiscardHandler))
+	rec := postWithCookie(t, h.Logout, "/v1/auth/logout", `{}`, "the-token")
 	if rec.Code != http.StatusNoContent || rec.Body.Len() != 0 {
 		t.Fatalf("status = %d, body %q", rec.Code, rec.Body.String())
 	}
@@ -431,6 +486,18 @@ func TestLogout(t *testing.T) {
 		t.Errorf("service got %q, want the cookie's token", sessions.token)
 	}
 	wantCookieCleared(t, rec)
+	if got := revocations(m, metrics.RevocationLogout); got != 1 {
+		t.Errorf("logouts counted = %v, want 1", got)
+	}
+
+	// A token that ends no session (an old one, or one whose session is gone) is not a revocation.
+	sessions.ended = 0
+	if rec := postWithCookie(t, h.Logout, "/v1/auth/logout", `{}`, "the-token"); rec.Code != http.StatusNoContent {
+		t.Errorf("second logout = %d, want 204", rec.Code)
+	}
+	if got := revocations(m, metrics.RevocationLogout); got != 1 {
+		t.Errorf("logouts counted = %v after one that ended nothing, want still 1", got)
+	}
 
 	// Without a cookie there is nothing to end, and the answer is the same.
 	sessions = &stubSessions{}
@@ -450,14 +517,18 @@ func TestLogout(t *testing.T) {
 func TestLogoutAll(t *testing.T) {
 	t.Parallel()
 
-	sessions := &stubSessions{}
-	h := newAuthHandler(&stubAuth{}, sessions)
+	m := newTestMetrics()
+	sessions := &stubSessions{ended: 3}
+	h := NewAuth(&stubAuth{}, sessions, AuthConfig{Cookie: testCookie}, m, slog.New(slog.DiscardHandler))
 	rec := httptest.NewRecorder()
 	h.LogoutAll(rec, asSampleUser(t, http.MethodPost, "/v1/auth/logout-all", ""))
 	if rec.Code != http.StatusNoContent || sessions.userID != sampleUser.ID {
 		t.Fatalf("logout-all = %d for user %s, want 204 for %s", rec.Code, sessions.userID, sampleUser.ID)
 	}
 	wantCookieCleared(t, rec)
+	if got := revocations(m, metrics.RevocationLogoutAll); got != 3 {
+		t.Errorf("sessions ended by logout-all counted = %v, want 3", got)
+	}
 
 	rec = httptest.NewRecorder()
 	newAuthHandler(&stubAuth{}, &stubSessions{err: errors.New("connection refused")}).
@@ -466,6 +537,125 @@ func TestLogoutAll(t *testing.T) {
 
 	rec = httptest.NewRecorder()
 	h.LogoutAll(rec, httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/auth/logout-all", nil))
+	assertProblem(t, rec, http.StatusInternalServerError, problem.CodeInternal) // routed without Authenticate
+}
+
+func TestListSessions(t *testing.T) {
+	t.Parallel()
+
+	gst := time.FixedZone("GST", 4*3600)
+	other := uuid.MustParse("0199a1f0-0000-7000-8000-000000000002")
+	sessions := &stubSessions{sessions: []domain.Session{
+		{
+			ID: sampleSessionID, UserID: sampleUser.ID, UserAgent: "Firefox/140", IP: netip.MustParseAddr("2001:db8::7"),
+			Generation: 4,
+			CreatedAt:  time.Date(2026, 9, 20, 12, 0, 0, 0, gst),
+			LastUsedAt: time.Date(2026, 9, 27, 12, 0, 0, 0, gst),
+			ExpiresAt:  time.Date(2026, 10, 4, 12, 0, 0, 0, gst),
+		},
+		{
+			ID: other, UserID: sampleUser.ID, // no user agent, no address
+			CreatedAt:  time.Date(2026, 9, 1, 8, 0, 0, 0, time.UTC),
+			LastUsedAt: time.Date(2026, 9, 1, 8, 0, 0, 0, time.UTC),
+			ExpiresAt:  time.Date(2026, 9, 8, 8, 0, 0, 0, time.UTC),
+		},
+	}}
+	rec := httptest.NewRecorder()
+	newAuthHandler(&stubAuth{}, sessions).ListSessions(rec, asSampleSession(t, http.MethodGet, "/v1/auth/sessions"))
+
+	if rec.Code != http.StatusOK || sessions.userID != sampleUser.ID {
+		t.Fatalf("status = %d for user %s, body %s", rec.Code, sessions.userID, rec.Body.String())
+	}
+	want := `{"items":[` +
+		`{"id":"` + sampleSessionID.String() + `","current":true,"created_at":"2026-09-20T08:00:00Z",` +
+		`"last_used_at":"2026-09-27T08:00:00Z","expires_at":"2026-10-04T08:00:00Z","user_agent":"Firefox/140","ip":"2001:db8::7"},` +
+		`{"id":"` + other.String() + `","current":false,"created_at":"2026-09-01T08:00:00Z",` +
+		`"last_used_at":"2026-09-01T08:00:00Z","expires_at":"2026-09-08T08:00:00Z","user_agent":""}]}`
+	if got := strings.TrimSpace(rec.Body.String()); got != want {
+		t.Errorf("body =\n%s\nwant\n%s", got, want)
+	}
+
+	// No sessions: an empty list, not null.
+	rec = httptest.NewRecorder()
+	newAuthHandler(&stubAuth{}, &stubSessions{}).ListSessions(rec, asSampleSession(t, http.MethodGet, "/v1/auth/sessions"))
+	if got := strings.TrimSpace(rec.Body.String()); rec.Code != http.StatusOK || got != `{"items":[]}` {
+		t.Errorf("empty list = %d %s", rec.Code, got)
+	}
+
+	rec = httptest.NewRecorder()
+	newAuthHandler(&stubAuth{}, &stubSessions{err: errors.New("connection refused")}).
+		ListSessions(rec, asSampleSession(t, http.MethodGet, "/v1/auth/sessions"))
+	assertProblem(t, rec, http.StatusInternalServerError, problem.CodeInternal)
+
+	rec = httptest.NewRecorder()
+	newAuthHandler(&stubAuth{}, &stubSessions{}).ListSessions(rec,
+		httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/v1/auth/sessions", nil))
+	assertProblem(t, rec, http.StatusInternalServerError, problem.CodeInternal) // routed without Authenticate
+}
+
+func TestDeleteSession(t *testing.T) {
+	t.Parallel()
+
+	deleteReq := func(t *testing.T, id string) *http.Request {
+		t.Helper()
+		req := asSampleSession(t, http.MethodDelete, "/v1/auth/sessions/"+id)
+		req.SetPathValue("sessionID", id)
+		return req
+	}
+	m := newTestMetrics()
+	sessions := &stubSessions{}
+	h := NewAuth(&stubAuth{}, sessions, AuthConfig{Cookie: testCookie}, m, slog.New(slog.DiscardHandler))
+
+	// Another session of the caller: the caller's cookie belongs to its own session and stays.
+	other := uuid.NewV7()
+	rec := httptest.NewRecorder()
+	h.DeleteSession(rec, deleteReq(t, other.String()))
+	if rec.Code != http.StatusNoContent || rec.Body.Len() != 0 {
+		t.Fatalf("status = %d, body %q", rec.Code, rec.Body.String())
+	}
+	if sessions.userID != sampleUser.ID || sessions.sessionID != other {
+		t.Errorf("service revoked session %s of user %s, want %s of %s", sessions.sessionID, sessions.userID, other, sampleUser.ID)
+	}
+	if rec.Header().Get("Set-Cookie") != "" {
+		t.Errorf("Set-Cookie = %q, want the caller's cookie left alone", rec.Header().Get("Set-Cookie"))
+	}
+
+	// The caller's own session: like a logout, the cookie goes too.
+	rec = httptest.NewRecorder()
+	h.DeleteSession(rec, deleteReq(t, sampleSessionID.String()))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	wantCookieCleared(t, rec)
+	if got := revocations(m, metrics.RevocationDeleted); got != 2 {
+		t.Errorf("deleted sessions counted = %v, want 2", got)
+	}
+
+	sessions.err = domain.SessionNotFound(other)
+	rec = httptest.NewRecorder()
+	h.DeleteSession(rec, deleteReq(t, other.String()))
+	assertProblem(t, rec, http.StatusNotFound, domain.CodeSessionNotFound)
+	if rec.Header().Get("Set-Cookie") != "" || revocations(m, metrics.RevocationDeleted) != 2 {
+		t.Error("a session that was not found touched the cookie or was counted")
+	}
+
+	sessions.err, sessions.calls = errors.New("connection refused"), 0
+	rec = httptest.NewRecorder()
+	h.DeleteSession(rec, deleteReq(t, other.String()))
+	assertProblem(t, rec, http.StatusInternalServerError, problem.CodeInternal)
+
+	sessions.calls = 0
+	rec = httptest.NewRecorder()
+	h.DeleteSession(rec, deleteReq(t, "not-a-uuid"))
+	assertProblem(t, rec, http.StatusBadRequest, problem.CodeValidationFailed)
+	if !strings.Contains(rec.Body.String(), `"field":"sessionID"`) || sessions.calls != 0 {
+		t.Errorf("a malformed id = %s with %d service calls, want sessionID named and no call", rec.Body.String(), sessions.calls)
+	}
+
+	rec = httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodDelete, "/v1/auth/sessions/"+other.String(), nil)
+	req.SetPathValue("sessionID", other.String())
+	h.DeleteSession(rec, req)
 	assertProblem(t, rec, http.StatusInternalServerError, problem.CodeInternal) // routed without Authenticate
 }
 

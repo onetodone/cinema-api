@@ -110,7 +110,7 @@ WHERE s.id = $1`, id, grace).Scan(
 		&s.Expired, &s.InGrace,
 		&s.User.Email, &s.User.Role, &s.User.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return auth.StoredSession{}, domain.NotFound(domain.CodeSessionNotFound, "session %s not found", id)
+		return auth.StoredSession{}, domain.SessionNotFound(id)
 	}
 	if err != nil {
 		return auth.StoredSession{}, fmt.Errorf("get session %s: %w", id, err)
@@ -186,6 +186,33 @@ func (r *Sessions) DeleteAllOfUser(ctx context.Context, userID uuid.UUID) ([]uui
 		return nil, fmt.Errorf("delete the sessions of user %s: %w", userID, err)
 	}
 	return ended, nil
+}
+
+// ListOfUser returns the live sessions of a user, most recently used first. The user's sessions are at most
+// AUTH_MAX_SESSIONS_PER_USER, so the list needs no pages.
+func (r *Sessions) ListOfUser(ctx context.Context, userID uuid.UUID) ([]domain.Session, error) {
+	rows, err := r.pool.Query(ctx, `
+SELECT `+sessionColumns+`
+FROM sessions
+WHERE user_id = $1 AND expires_at > now()
+ORDER BY last_used_at DESC, id DESC`, userID)
+	if err != nil {
+		return nil, fmt.Errorf("list the sessions of user %s: %w", userID, err)
+	}
+	sessions, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (domain.Session, error) { return scanSession(row) })
+	if err != nil {
+		return nil, fmt.Errorf("list the sessions of user %s: %w", userID, err)
+	}
+	return sessions, nil
+}
+
+// DeleteOfUser deletes a session if it belongs to the user.
+func (r *Sessions) DeleteOfUser(ctx context.Context, userID, id uuid.UUID) (bool, error) {
+	tag, err := r.pool.Exec(ctx, `DELETE FROM sessions WHERE id = $1 AND user_id = $2`, id, userID)
+	if err != nil {
+		return false, fmt.Errorf("delete session %s: %w", id, err)
+	}
+	return tag.RowsAffected() == 1, nil
 }
 
 // DeleteExpired deletes up to limit expired sessions, oldest first, and returns how many it deleted. Sessions

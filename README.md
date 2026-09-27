@@ -14,13 +14,14 @@ The project is small on purpose. It shows how to solve a handful of hard backend
 - **Transactions.** Short transactions, no network call while a lock is held, deadlock retries as a safety net,
   and a three-step payment that stays consistent when the provider answers late or never.
 - **Caching.** Redis as a fail-open accelerator: a hold gate that turns losers away in about 0.1 ms, cached seat
-  maps that are cleared on every change, idempotency records, and rate limits. With Redis down, everything
-  still works and stays correct, only slower.
+  maps that are cleared on every change, idempotency records, rate limits, and a list of revoked sessions. With
+  Redis down, everything still works and stays correct, only slower.
 - **Background processing.** A worker expires unpaid bookings, settles stuck payments, and sweeps expired
   sessions. Any number of them can run next to each other, thanks to `SKIP LOCKED`.
 - **Sessions.** Browser-grade login: a short-lived access token, and a refresh token in an `HttpOnly` cookie that
   rotates on every use. Twenty tabs refreshing at once through two API replicas all keep their session, and a
-  stolen token that is used after its owner has moved on revokes the session.
+  stolen token that is used after its owner has moved on revokes the session. Users list their sessions and end
+  any of them; the access tokens of an ended session stop working at once, on every replica.
 
 Contents: [Quick start](#quick-start) · [How double-selling is prevented](#how-double-selling-is-prevented) ·
 [Flows](#flows) · [Redis](#redis-an-accelerator-never-the-source-of-truth) ·
@@ -84,16 +85,29 @@ curl -s -X POST $API/v1/bookings/$BOOKING/payments -H "Authorization: Bearer $TO
 Book again without paying: after `BOOKING_HOLD_TTL` (`make run-api BOOKING_HOLD_TTL=30s` for a demo) the worker
 expires the booking, and the seats show `available` again.
 
-The access token lasts 15 minutes. Refresh it with the cookie, which rotates on every refresh, and log out:
+The access token lasts 15 minutes. Refresh it with the cookie, which rotates on every refresh, manage the sessions,
+and log out:
 
 ```sh
 cp jar jar.old
 TOKEN=$(curl -s -b jar -c jar -X POST $API/v1/auth/refresh -H 'Content-Type: application/json' -d '{}' \
   | jq -r .access_token)
-# The previous cookie still gets the current token for 30 seconds (tabs that refreshed at once)...
+# The previous cookie still gets the current token for 30 seconds (tabs that refreshed at once)
 curl -s -b jar.old -X POST $API/v1/auth/refresh -H 'Content-Type: application/json' -d '{}' | jq .user.email
-# ...after that it revokes the session: 401 REFRESH_INVALID, and the current cookie stops working too
+
+# A second login, as from a phone. List the sessions, then end the phone's: its access token stops at once
+PHONE=$(curl -s -A Phone -X POST $API/v1/auth/login -H 'Content-Type: application/json' \
+  -d '{"email":"ann@example.com","password":"correct horse"}' | jq -r .access_token)
+curl -s $API/v1/auth/sessions -H "Authorization: Bearer $TOKEN" | jq -c '.items[] | {current, user_agent, ip}'
+PHONE_ID=$(curl -s $API/v1/auth/sessions -H "Authorization: Bearer $TOKEN" \
+  | jq -r 'first(.items[] | select(.user_agent == "Phone") | .id)')
+curl -s -o /dev/null -w '%{http_code}\n' -X DELETE $API/v1/auth/sessions/$PHONE_ID -H "Authorization: Bearer $TOKEN"
+curl -s $API/v1/me -H "Authorization: Bearer $PHONE" | jq .code
+
+# After 30 seconds the previous cookie revokes the session: 401 REFRESH_INVALID; the current cookie and the
+# session's access token stop working too
 sleep 31; curl -s -b jar.old -X POST $API/v1/auth/refresh -H 'Content-Type: application/json' -d '{}' | jq .code
+curl -s $API/v1/me -H "Authorization: Bearer $TOKEN" | jq .code
 # Log in again, and out: 204, the session is gone and the cookie deleted
 curl -s -c jar -o /dev/null -X POST $API/v1/auth/login -H 'Content-Type: application/json' \
   -d '{"email":"ann@example.com","password":"correct horse"}'
@@ -291,6 +305,7 @@ sequenceDiagram
 | **Schedule cache** | JSON per local day, 10 s TTL, deleted when an admin adds a showtime to the day | Read from PostgreSQL |
 | **Idempotency** | `Idempotency-Key` records (hash of owner and response), 24 h, claimed atomically by Lua | The partial unique indexes still prevent a duplicate booking or charge |
 | **Rate limits** | Fixed one-minute windows (`INCR` + `PEXPIRE … NX` in one script) | Requests pass |
+| **Revoked sessions** | `<prefix>:revoked-sid:<session>` for every session that ended early, until its last access token has expired; one `EXISTS` per authenticated request | Ended sessions still cannot refresh; their access tokens work until they expire (≤ 15 min) |
 
 The gate is what keeps a premiere rush from filling the connection pool with transactions that queue on one
 row lock: in the 200-goroutine test, the gate turns 199 losers away before they take a connection, and the race
@@ -350,10 +365,31 @@ The trade: within those 30 seconds, whoever holds the previous token also gets t
 tolerating concurrent tabs and lost answers. After them, presenting a used token can only mean a copy, and ends the
 session for everybody who holds it.
 
+**Ending sessions.** `POST /v1/auth/logout` ends the session of the cookie (current or previous token) and deletes
+the cookie; it needs no access token and always answers 204. `POST /v1/auth/logout-all` (bearer) ends every session
+of the user. `GET /v1/auth/sessions` lists the user's sessions (user agent, address, last login or refresh, the
+caller's own marked `current`), and `DELETE /v1/auth/sessions/{id}` ends one of them, such as a lost phone's; a
+session of another user is `404 SESSION_NOT_FOUND`, like one that does not exist.
+
+A session that ended can no longer refresh, but access tokens are stateless JWTs that would work until they
+expire. So every session that ends early (logout, logout-all, deleted, reuse detected, evicted over the cap) is also
+put on a **revocation list** in Redis, `<prefix>:revoked-sid:<session id>`, and the auth middleware looks up the
+`sid` of every access token there after checking its signature: a revoked session's token gets `401 INVALID_TOKEN`
+at once, on every replica.
+
+- The entry is written **after** the session row is deleted. Written first, a delete that then failed would leave a
+  live session whose every refreshed token is refused.
+- It lives `JWT_TTL` + 1 minute: the 30 s verification leeway, and 30 s more for replicas whose clocks disagree by
+  up to the leeway, or a refresh that was in flight when the session ended and issued one last token. After that,
+  every token of the session has expired anyway, so the list holds only the sessions ended in the last 16 minutes.
+- It **fails open**, like everything in Redis: while Redis is down, an ended session still cannot refresh
+  (PostgreSQL decides that), and its access tokens work until they expire, within 15 minutes.
+- Why not look the session up in PostgreSQL on every request? That would hold without Redis too, but it would put
+  the database on the path of every authenticated request, bookings included, for a fact that matters for 15
+  minutes at most. The list costs one `EXISTS` round trip to Redis per request.
+
 Also:
 
-- `POST /v1/auth/logout` ends the session of the cookie (current or previous token) and deletes the cookie. It
-  needs no access token and always answers 204. `POST /v1/auth/logout-all` (bearer) ends every session of the user.
 - Refresh and logout accept only a JSON body (`{}`), so a cross-site form cannot trigger them; `SameSite=Strict`
   and the absence of CORS close the rest.
 - A session ends 7 days after its last refresh (`REFRESH_TOKEN_TTL`), and 30 days after its login at the latest
@@ -375,6 +411,7 @@ to the contract on `main`, so it never has to be updated by hand.
 | `POST /v1/auth/register`, `POST /v1/auth/login` | public | Account; a session: access token (JWT, 15 min) and refresh cookie |
 | `POST /v1/auth/refresh`, `POST /v1/auth/logout` | refresh cookie | New tokens, rotating the refresh token; end the session |
 | `POST /v1/auth/logout-all` | user | End every session of the caller |
+| `GET /v1/auth/sessions` · `DELETE /v1/auth/sessions/{sessionID}` | user · owner | The caller's sessions; end one (its access tokens stop at once) |
 | `GET /v1/me` | user | The caller's account |
 | `GET /v1/movies`, `GET /v1/movies/{movieID}` | public | Movies, a movie with its showtimes of the next 14 days |
 | `GET /v1/showtimes?date=&movie_id=` | public | The schedule of a day in the cinema's time zone |
@@ -435,7 +472,7 @@ All settings are environment variables, validated at startup (every problem is r
 | `DATABASE_URL` | (required) | PostgreSQL 18 |
 | `REDIS_ADDR` | `localhost:6379` | Redis 8; may be down |
 | `JWT_SECRET` | (API only) | HS256 key, at least 32 bytes; also the root of the keys that seal refresh secrets |
-| `JWT_TTL` | `15m` | Access token lifetime |
+| `JWT_TTL` | `15m` | Access token lifetime; revocation entries of ended sessions last this plus 1 minute |
 | `REFRESH_TOKEN_TTL` · `SESSION_MAX_AGE` | `168h` · `720h` | A session ends 7 days after its last refresh, 30 days after its login at the latest |
 | `REFRESH_GRACE` | `30s` | How long the previous refresh token still gets the current one |
 | `AUTH_COOKIE_SECURE` · `AUTH_COOKIE_PATH` | `true` · `/v1/auth` | The refresh cookie; `false` only for development over plain HTTP |
@@ -469,6 +506,7 @@ All settings are environment variables, validated at startup (every problem is r
 | `cinema_payments_reconciled_total{result}` | Stuck payments the worker settled as paid or failed, or could not settle |
 | `cinema_auth_refresh_total{result}` | rotated, reissued, grace, reuse_detected, expired, invalid |
 | `cinema_sessions_swept_total` | Expired sessions deleted by the worker |
+| `cinema_session_revocations_total{reason}` | Sessions ended early: logout, logout_all, deleted, reuse, evicted |
 | `cinema_cache_requests_total{cache,result}` | Hits, misses, and errors of the seat map and schedule caches |
 | `cinema_redis_fail_open_total{op}` | Redis failures the system carried on without |
 | `cinema_rate_limit_rejections_total{limit}`, `cinema_idempotency_requests_total{result}` | Request guards |
@@ -491,7 +529,8 @@ make load-test          # k6: 500 users race for one seat against a running API
   within seconds.
 - **Mutation checks** were run by hand on the key guards (random lock order, no `SKIP LOCKED`, expiring
   `processing` bookings, ignoring the payment deadline, no cache invalidation, a rotation without its
-  compare-and-set, a login without the user lock, no grace window): each made a test fail.
+  compare-and-set, a login without the user lock, no grace window, no revocation check, a revocation before the
+  ownership check, a revocation lifetime without the second leeway): each made a test fail.
 - **Load test.** Start the API without the per-address auth limit, since setup logs 500 accounts in from one
   address, and with a cheaper password hash:
 
@@ -520,7 +559,7 @@ internal/
     catalog/            movies, schedule, seat maps (cache-aside, singleflight)
     auth/  admin/
   repository/postgres/  pgx and hand-written SQL, unit of work, lock order, retries
-  repository/redis/     hold gate, caches, idempotency, rate limits (Lua scripts embedded)
+  repository/redis/     hold gate, caches, idempotency, rate limits, revocation list (Lua scripts embedded)
   payment/              provider contract and registry; local/ test provider; paymenttest/ contract tests
   transport/httpapi/    net/http router, middleware, handlers, problem details
   worker/               expirer, reconciler, and session sweeper loops
@@ -546,8 +585,9 @@ the services declare, so services never import pgx, go-redis, or Prometheus, and
   every change. Bookings always check PostgreSQL.
 - **Expiry lags by up to one worker pause** (5 s ± 20%). Payment rejects an expired hold by itself, so the lag
   only delays when seats return to sale.
-- **Ending a session does not stop its access tokens at once.** Logout, logout-all, and a detected reuse stop
-  refreshes immediately, but access tokens are stateless JWTs and stay valid until they expire (`JWT_TTL`, 15 min).
+- **Revocation is immediate only while Redis is up.** An ended session can never refresh again, but its access
+  tokens are refused at once only through the revocation list; while Redis is down they work until they expire
+  (`JWT_TTL`, 15 min). Every authenticated request pays one Redis round trip for the check.
 - **The grace window is a window for thieves too.** Within 30 s of a rotation, the previous refresh token gets the
   current one; only one previous generation is remembered, so an older token is refused but revokes nothing.
 - **Registration reveals whether an address exists** (`409 EMAIL_TAKEN`); the per-address limit slows enumeration.

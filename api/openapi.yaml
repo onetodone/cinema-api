@@ -40,6 +40,12 @@ info:
       that. Every failed refresh is `401 REFRESH_INVALID` and deletes the cookie; the client logs in again.
     - A session lasts 7 days after its last refresh, and 30 days after its login at most. A user has at most 20
       sessions; a login beyond that ends the least recently used one.
+    - `GET /v1/auth/sessions` lists the caller's sessions, and `DELETE /v1/auth/sessions/{sessionID}` ends one of
+      them, such as the session of a lost phone.
+    - A session that ends before it expires (logout, logout from every session, deleted by its user, a reused
+      refresh token, or evicted by a login over the limit) can no longer refresh, and its access tokens stop working
+      at once: they get `401 INVALID_TOKEN`. Should the API lose its Redis, such tokens keep working until they
+      expire, within 15 minutes.
     - The routes that the cookie authenticates accept only a JSON body (`{}`), so cross-site forms cannot reach
       them. Every access token names its session (`sid`); a token without one is `401 INVALID_TOKEN`.
 servers:
@@ -215,7 +221,7 @@ paths:
         after the access token has expired, and it answers 204 whatever the cookie holds, or without one, so it can
         be repeated. The body must be the JSON object `{}`.
 
-        Access tokens of the session stay valid until they expire.
+        The access tokens of the session stop working at once.
       requestBody:
         required: true
         content:
@@ -237,14 +243,63 @@ paths:
       summary: Log out of every session
       security: [{ bearerAuth: [] }]
       description: |
-        Ends every session of the caller, on every device, and deletes this client's cookie. Access tokens of the
-        sessions stay valid until they expire.
+        Ends every session of the caller, on every device, and deletes this client's cookie. The access tokens of
+        the sessions, this one's included, stop working at once.
       responses:
         '204':
           description: Every session of the caller is over.
           headers:
             Set-Cookie: { $ref: '#/components/headers/Clear-Refresh-Cookie' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /v1/auth/sessions:
+    get:
+      tags: [Auth]
+      operationId: listSessions
+      summary: List the caller's sessions
+      security: [{ bearerAuth: [] }]
+      description: |
+        Every session of the caller that has not expired, most recently used first: at most 20, so the list has no
+        pages. A session is used when it logs in or refreshes; requests made with its access tokens do not count.
+        The session of the access token that asks is marked `current`.
+      responses:
+        '200':
+          description: The sessions.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/InternalError' }
+  /v1/auth/sessions/{sessionID}:
+    delete:
+      tags: [Auth]
+      operationId: deleteSession
+      summary: End a session
+      security: [{ bearerAuth: [] }]
+      description: |
+        Ends one of the caller's sessions, such as the session of a lost phone. It can no longer refresh, and its
+        access tokens stop working at once. Ending the caller's own session also deletes this client's cookie, as a
+        logout would.
+      parameters:
+        - $ref: '#/components/parameters/SessionID'
+      responses:
+        '204':
+          description: The session is over.
+          headers:
+            Set-Cookie:
+              description: Only when the caller ended its own session; deletes the refresh token cookie.
+              schema:
+                type: string
+                example: 'cinema_refresh=; Path=/v1/auth; Max-Age=0; HttpOnly; Secure; SameSite=Strict'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: |
+            `SESSION_NOT_FOUND`: the caller has no such session. A session of another user, and one that has
+            already ended, get the same answer.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
         '500': { $ref: '#/components/responses/InternalError' }
   /v1/me:
     get:
@@ -741,6 +796,12 @@ components:
       in: path
       required: true
       schema: { type: string, format: uuid }
+    SessionID:
+      name: sessionID
+      in: path
+      required: true
+      description: The `id` of a session from `GET /v1/auth/sessions`.
+      schema: { type: string, format: uuid }
     Limit:
       name: limit
       in: query
@@ -816,7 +877,9 @@ components:
               - { field: name, message: is required }
               - { field: 'rows[1].seats', message: must be between 1 and 100 }
     Unauthorized:
-      description: '`UNAUTHENTICATED` (no bearer token), `INVALID_TOKEN`, or `TOKEN_EXPIRED`.'
+      description: |
+        `UNAUTHENTICATED` (no bearer token), `INVALID_TOKEN` (also when the token's session has ended), or
+        `TOKEN_EXPIRED`.
       headers:
         WWW-Authenticate: { $ref: '#/components/headers/WWW-Authenticate' }
       content:
@@ -941,6 +1004,36 @@ components:
       additionalProperties: false
       maxProperties: 0
       example: {}
+    Session:
+      type: object
+      description: A browser or device that is logged in.
+      required: [id, current, created_at, last_used_at, expires_at, user_agent]
+      properties:
+        id: { type: string, format: uuid, description: 'Stable for the session''s life; the `sid` of its access tokens.' }
+        current: { type: boolean, description: Whether this is the session of the access token that asked. }
+        created_at: { type: string, format: date-time, description: The login. }
+        last_used_at: { type: string, format: date-time, description: The last login or refresh. }
+        expires_at:
+          type: string
+          format: date-time
+          description: When the session ends unless it refreshes before; every refresh moves it, up to 30 days after the login.
+        user_agent:
+          type: string
+          maxLength: 512
+          description: The `User-Agent` of the last login or refresh; empty if the client sent none.
+          example: Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0
+        ip:
+          type: string
+          description: The client address of the last login or refresh, IPv4 or IPv6. Absent when unknown.
+          example: 198.51.100.7
+    SessionList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          description: Most recently used first.
+          items: { $ref: '#/components/schemas/Session' }
 
     Movie:
       type: object

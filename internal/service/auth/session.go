@@ -38,7 +38,25 @@ type SessionRepository interface {
 	DeleteByToken(ctx context.Context, id uuid.UUID, tokenHash []byte) (bool, error)
 	// DeleteAllOfUser deletes every session of a user and returns their ids.
 	DeleteAllOfUser(ctx context.Context, userID uuid.UUID) ([]uuid.UUID, error)
+	// ListOfUser returns the sessions of a user that have not expired, most recently used first.
+	ListOfUser(ctx context.Context, userID uuid.UUID) ([]domain.Session, error)
+	// DeleteOfUser deletes the session id if it belongs to the user, and reports whether it did.
+	DeleteOfUser(ctx context.Context, userID, id uuid.UUID) (bool, error)
 }
+
+// RevocationList tells every API replica which sessions have ended, so that their access tokens stop working at
+// once instead of when they expire: the auth middleware looks up the session of every access token there. It is
+// implemented by repository/redis.Revocations. It may fail; the tokens of the sessions then work until they expire,
+// while the sessions themselves are gone and cannot refresh.
+type RevocationList interface {
+	// Revoke puts the sessions on the list for ttl.
+	Revoke(ctx context.Context, ttl time.Duration, sessionIDs ...uuid.UUID) error
+}
+
+// noRevocations is the revocation list of Sessions without one: access tokens live until they expire.
+type noRevocations struct{}
+
+func (noRevocations) Revoke(context.Context, time.Duration, ...uuid.UUID) error { return nil }
 
 // NewSession is a session to store at login.
 type NewSession struct {
@@ -101,6 +119,8 @@ type Grant struct {
 	Session domain.Session
 	Access  AccessToken
 	Refresh domain.RefreshToken
+	// Evicted is how many sessions of the user a login ended because the user had more than allowed.
+	Evicted int
 }
 
 // RefreshResult tells how a refresh was answered.
@@ -116,23 +136,41 @@ const (
 	RefreshInvalid       RefreshResult = "invalid"        // malformed, unknown, or of an older generation
 )
 
-// Sessions runs logins, refreshes, and logouts. A login starts a server-side session; the client gets a
-// short-lived access token and a refresh token, and trades the refresh token for new tokens until the session
-// ends. Every refresh rotates the refresh token, so a stolen token is useful only until its owner refreshes next,
-// and a token presented again after the grace window gives the theft away: the session is revoked.
+// Sessions runs logins, refreshes, and logouts, and lets users see and end their sessions. A login starts a
+// server-side session; the client gets a short-lived access token and a refresh token, and trades the refresh
+// token for new tokens until the session ends. Every refresh rotates the refresh token, so a stolen token is
+// useful only until its owner refreshes next, and a token presented again after the grace window gives the theft
+// away: the session is revoked.
+//
+// Every session that ends before it expires (logout, logout from everywhere, revoked by its user, a reused refresh
+// token, evicted over the per-user limit) also goes on the revocation list, so that its access tokens stop working
+// at once.
 type Sessions struct {
-	accounts *Service
-	repo     SessionRepository
-	tokens   *Tokens
-	sealer   sealer
-	cfg      SessionConfig
-	logger   *slog.Logger
+	accounts    *Service
+	repo        SessionRepository
+	tokens      *Tokens
+	sealer      sealer
+	cfg         SessionConfig
+	revocations RevocationList
+	// revocationTTL is how long a revoked session stays on the revocation list: until every access token it issued
+	// has expired.
+	revocationTTL time.Duration
+	logger        *slog.Logger
+}
+
+// SessionOption customizes Sessions.
+type SessionOption func(*Sessions)
+
+// WithRevocations puts every session that ends before it expires on the revocation list, so that its access
+// tokens stop working at once. Without it, they work until they expire.
+func WithRevocations(r RevocationList) SessionOption {
+	return func(s *Sessions) { s.revocations = r }
 }
 
 // NewSessions returns the session use cases. The keys that seal refresh secrets for the grace window are derived
 // from the signing key of tokens.
 func NewSessions(accounts *Service, repo SessionRepository, tokens *Tokens, cfg SessionConfig,
-	logger *slog.Logger,
+	logger *slog.Logger, opts ...SessionOption,
 ) (*Sessions, error) {
 	switch {
 	case cfg.IdleTTL <= 0 || cfg.Grace <= 0:
@@ -143,14 +181,23 @@ func NewSessions(accounts *Service, repo SessionRepository, tokens *Tokens, cfg 
 	case cfg.MaxPerUser < 1:
 		return nil, fmt.Errorf("sessions per user must be at least 1, got %d", cfg.MaxPerUser)
 	}
-	return &Sessions{
-		accounts: accounts,
-		repo:     repo,
-		tokens:   tokens,
-		sealer:   sealer{secret: tokens.key},
-		cfg:      cfg,
-		logger:   logger,
-	}, nil
+	s := &Sessions{
+		accounts:    accounts,
+		repo:        repo,
+		tokens:      tokens,
+		sealer:      sealer{secret: tokens.key},
+		cfg:         cfg,
+		revocations: noRevocations{},
+		// A token passes verification until its lifetime and the clock leeway are over. The second leeway covers
+		// replicas whose clocks disagree by up to the leeway, and a refresh that was in flight when the session
+		// ended and issued a token a moment later.
+		revocationTTL: tokens.ttl + 2*clockLeeway,
+		logger:        logger,
+	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s, nil
 }
 
 // Login checks the credentials and starts a session for the client. If the user then has more sessions than
@@ -178,10 +225,16 @@ func (s *Sessions) Login(ctx context.Context, email, password string, c Client) 
 		return Grant{}, fmt.Errorf("start a session for user %s: %w", u.ID, err)
 	}
 	if len(evicted) > 0 {
+		s.revokeTokens(ctx, evicted...)
 		s.logger.InfoContext(ctx, "least recently used sessions ended over the per-user limit",
 			slog.String("user_id", u.ID.String()), slog.Int("sessions", len(evicted)))
 	}
-	return s.grant(u, session, token)
+	g, err := s.grant(u, session, token)
+	if err != nil {
+		return Grant{}, err
+	}
+	g.Evicted = len(evicted)
+	return g, nil
 }
 
 // Refresh trades a refresh token for an access token and the session's current refresh token. With the current
@@ -253,6 +306,7 @@ func (s *Sessions) Refresh(ctx context.Context, raw string, c Client) (Grant, Re
 			if err := s.repo.Delete(ctx, stored.ID); err != nil {
 				return Grant{}, "", fmt.Errorf("revoke session %s after a reused refresh token: %w", stored.ID, err)
 			}
+			s.revokeTokens(ctx, stored.ID)
 			log.WarnContext(ctx, "refresh token reuse detected; session revoked", slog.Int("generation", stored.Generation))
 			return Grant{}, RefreshReuseDetected, errRefreshInvalid
 		}
@@ -307,32 +361,71 @@ func (s *Sessions) graceGrant(stored StoredSession) (Grant, error) {
 	return s.grant(stored.User, stored.Session, current)
 }
 
-// Logout ends the session of a refresh token, whether it is the current or the previous one. Anything else,
-// including a malformed or unknown token, changes nothing and is no error, so that logging out can always be
-// repeated.
-func (s *Sessions) Logout(ctx context.Context, raw string) error {
+// Logout ends the session of a refresh token, whether it is the current or the previous one, and reports whether
+// it ended one. Anything else, including a malformed or unknown token, changes nothing and is no error, so that
+// logging out can always be repeated.
+func (s *Sessions) Logout(ctx context.Context, raw string) (ended bool, err error) {
 	token, ok := domain.ParseRefreshToken(raw)
 	if !ok {
-		return nil
+		return false, nil
 	}
-	deleted, err := s.repo.DeleteByToken(ctx, token.SessionID, token.Hash())
+	ended, err = s.repo.DeleteByToken(ctx, token.SessionID, token.Hash())
 	if err != nil {
-		return fmt.Errorf("end session %s: %w", token.SessionID, err)
+		return false, fmt.Errorf("end session %s: %w", token.SessionID, err)
 	}
-	if deleted {
+	if ended {
+		s.revokeTokens(ctx, token.SessionID)
 		s.logger.InfoContext(ctx, "session ended by logout", slog.String("session_id", token.SessionID.String()))
 	}
+	return ended, nil
+}
+
+// LogoutAll ends every session of the user and returns how many there were.
+func (s *Sessions) LogoutAll(ctx context.Context, userID uuid.UUID) (int, error) {
+	ended, err := s.repo.DeleteAllOfUser(ctx, userID)
+	if err != nil {
+		return 0, fmt.Errorf("end the sessions of user %s: %w", userID, err)
+	}
+	s.revokeTokens(ctx, ended...)
+	s.logger.InfoContext(ctx, "all sessions of the user ended", slog.Int("sessions", len(ended)))
+	return len(ended), nil
+}
+
+// List returns the sessions of the user that have not expired, most recently used first. A session is used when
+// it logs in or refreshes, not on every request its access tokens make.
+func (s *Sessions) List(ctx context.Context, userID uuid.UUID) ([]domain.Session, error) {
+	sessions, err := s.repo.ListOfUser(ctx, userID)
+	if err != nil {
+		return nil, fmt.Errorf("list the sessions of user %s: %w", userID, err)
+	}
+	return sessions, nil
+}
+
+// Revoke ends a session of the user, such as one on a lost phone. A session of another user is SESSION_NOT_FOUND,
+// like one that does not exist, so that session ids reveal nothing.
+func (s *Sessions) Revoke(ctx context.Context, userID, sessionID uuid.UUID) error {
+	ended, err := s.repo.DeleteOfUser(ctx, userID, sessionID)
+	if err != nil {
+		return fmt.Errorf("revoke session %s: %w", sessionID, err)
+	}
+	if !ended {
+		return domain.SessionNotFound(sessionID)
+	}
+	s.revokeTokens(ctx, sessionID)
+	s.logger.InfoContext(ctx, "session revoked by its user", slog.String("session_id", sessionID.String()))
 	return nil
 }
 
-// LogoutAll ends every session of the user.
-func (s *Sessions) LogoutAll(ctx context.Context, userID uuid.UUID) error {
-	ended, err := s.repo.DeleteAllOfUser(ctx, userID)
-	if err != nil {
-		return fmt.Errorf("end the sessions of user %s: %w", userID, err)
+// revokeTokens puts sessions that have just been deleted on the revocation list, so that their access tokens stop
+// working at once. It runs only after the delete: a session revoked but not deleted would lock its user out, since
+// every token it refreshed would be refused. It cannot fail the request: the sessions are over either way, and
+// without the list their tokens expire within their lifetime. The list records its own failures.
+func (s *Sessions) revokeTokens(ctx context.Context, sessionIDs ...uuid.UUID) {
+	if len(sessionIDs) == 0 {
+		return
 	}
-	s.logger.InfoContext(ctx, "all sessions of the user ended", slog.Int("sessions", len(ended)))
-	return nil
+	// The client may hang up now; the sessions have ended, so their tokens must stop all the same.
+	_ = s.revocations.Revoke(context.WithoutCancel(ctx), s.revocationTTL, sessionIDs...)
 }
 
 // grant issues an access token for the session and bundles it with the refresh token.

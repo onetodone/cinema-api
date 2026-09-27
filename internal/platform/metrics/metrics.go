@@ -28,6 +28,8 @@ const (
 	OpCacheInvalidate = "cache_invalidate"
 	OpIdempotency     = "idempotency"
 	OpRateLimit       = "rate_limit"
+	OpRevocationWrite = "revocation_write" // putting ended sessions on the revocation list
+	OpRevocationCheck = "revocation_check" // looking up the session of an access token on the list
 )
 
 // Caches, the cache label of CacheRequests.
@@ -105,6 +107,16 @@ const (
 	RefreshInvalid       = "invalid"        // no, a malformed, an unknown, or an older token
 )
 
+// Why sessions ended before their time, the reason label of SessionRevocations. Every revoked session is also put
+// on the revocation list, so its access tokens stop working at once.
+const (
+	RevocationLogout    = "logout"     // POST /v1/auth/logout
+	RevocationLogoutAll = "logout_all" // POST /v1/auth/logout-all, once per session
+	RevocationDeleted   = "deleted"    // DELETE /v1/auth/sessions/{sessionID}
+	RevocationReuse     = "reuse"      // a refresh presented a rotated token after the grace window
+	RevocationEvicted   = "evicted"    // a login ended the least recently used session over the per-user limit
+)
+
 // RouteUnmatched is the route label of requests that matched no route.
 const RouteUnmatched = "unmatched"
 
@@ -134,6 +146,9 @@ type Metrics struct {
 	AuthRefreshes *prometheus.CounterVec
 	// SessionsSwept counts expired sessions the worker deleted.
 	SessionsSwept prometheus.Counter
+	// SessionRevocations counts sessions that ended before they expired, by reason. Sessions that expire are not
+	// revoked; the worker sweeps them.
+	SessionRevocations *prometheus.CounterVec
 
 	// HoldGateRejections counts booking requests that the Redis hold gate turned away because another booking
 	// holds or claims one of their seats. They never reached PostgreSQL.
@@ -186,6 +201,10 @@ func New(reg prometheus.Registerer) *Metrics {
 			Namespace: namespace, Name: "sessions_swept_total",
 			Help: "Expired sessions deleted by the worker.",
 		}),
+		SessionRevocations: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace, Name: "session_revocations_total",
+			Help: "Sessions ended before they expired, by reason; their access tokens are revoked too.",
+		}, []string{"reason"}),
 		HoldGateRejections: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace, Name: "hold_gate_rejections_total",
 			Help: "Booking requests rejected by the Redis hold gate before reaching PostgreSQL.",
@@ -209,7 +228,8 @@ func New(reg prometheus.Registerer) *Metrics {
 	}
 	reg.MustRegister(
 		m.HTTPRequestDuration, m.BookingAttempts, m.TxRetries, m.BookingsExpired, m.Payments, m.PaymentsReconciled,
-		m.AuthRefreshes, m.SessionsSwept, m.HoldGateRejections, m.RedisFailOpen, m.CacheRequests, m.RateLimitRejections, m.IdempotencyRequests,
+		m.AuthRefreshes, m.SessionsSwept, m.SessionRevocations,
+		m.HoldGateRejections, m.RedisFailOpen, m.CacheRequests, m.RateLimitRejections, m.IdempotencyRequests,
 	)
 
 	for _, result := range []string{
@@ -228,9 +248,15 @@ func New(reg prometheus.Registerer) *Metrics {
 	} {
 		m.AuthRefreshes.WithLabelValues(result)
 	}
+	for _, reason := range []string{
+		RevocationLogout, RevocationLogoutAll, RevocationDeleted, RevocationReuse, RevocationEvicted,
+	} {
+		m.SessionRevocations.WithLabelValues(reason)
+	}
 
 	for _, op := range []string{
 		OpHoldAcquire, OpHoldExtend, OpHoldRelease, OpCacheGet, OpCacheSet, OpCacheInvalidate, OpIdempotency, OpRateLimit,
+		OpRevocationWrite, OpRevocationCheck,
 	} {
 		m.RedisFailOpen.WithLabelValues(op)
 	}

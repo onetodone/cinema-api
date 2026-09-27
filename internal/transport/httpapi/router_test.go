@@ -75,8 +75,10 @@ func (s issuingSessions) Refresh(_ context.Context, token string, _ auth.Client)
 	return g, auth.RefreshRotated, err
 }
 
-func (issuingSessions) Logout(context.Context, string) error       { return nil }
-func (issuingSessions) LogoutAll(context.Context, uuid.UUID) error { return nil }
+func (issuingSessions) Logout(context.Context, string) (bool, error)              { return true, nil }
+func (issuingSessions) LogoutAll(context.Context, uuid.UUID) (int, error)         { return 1, nil }
+func (issuingSessions) List(context.Context, uuid.UUID) ([]domain.Session, error) { return nil, nil }
+func (issuingSessions) Revoke(context.Context, uuid.UUID, uuid.UUID) error        { return nil }
 
 func (s issuingSessions) grant() (auth.Grant, error) {
 	id := uuid.NewV7()
@@ -300,6 +302,7 @@ func TestRouterEnforcesAccessLevels(t *testing.T) {
 	bookingPath := "/v1/bookings/" + uuid.NewV7().String()
 	pay := `{"payment_method":"local","payment_token":"tok_success"}`
 	refreshCookie := handler.RefreshCookieName + "=" + domain.NewRefreshToken(uuid.NewV7()).String()
+	sessionPath := "/v1/auth/sessions/" + uuid.NewV7().String()
 
 	tests := []struct {
 		name   string
@@ -319,6 +322,10 @@ func TestRouterEnforcesAccessLevels(t *testing.T) {
 		{name: "logout is public", method: http.MethodPost, path: "/v1/auth/logout", body: `{}`, status: http.StatusNoContent},
 		{name: "logout-all needs a token", method: http.MethodPost, path: "/v1/auth/logout-all", status: http.StatusUnauthorized},
 		{name: "logout-all for a customer", method: http.MethodPost, path: "/v1/auth/logout-all", token: customer, status: http.StatusNoContent},
+		{name: "sessions need a token", method: http.MethodGet, path: "/v1/auth/sessions", status: http.StatusUnauthorized},
+		{name: "sessions for a customer", method: http.MethodGet, path: "/v1/auth/sessions", token: customer, status: http.StatusOK},
+		{name: "session revoke needs a token", method: http.MethodDelete, path: sessionPath, status: http.StatusUnauthorized},
+		{name: "session revoke for a customer", method: http.MethodDelete, path: sessionPath, token: customer, status: http.StatusNoContent},
 		{name: "catalog is public", method: http.MethodGet, path: "/v1/movies", status: http.StatusOK},
 		{name: "me needs a token", method: http.MethodGet, path: "/v1/me", status: http.StatusUnauthorized},
 		{name: "me rejects a forged token", method: http.MethodGet, path: "/v1/me", token: "forged", status: http.StatusUnauthorized},
@@ -367,6 +374,52 @@ func TestRouterEnforcesAccessLevels(t *testing.T) {
 				t.Error("401 without a WWW-Authenticate challenge")
 			}
 		})
+	}
+}
+
+// revokedSessions is a revocation list of the sessions it holds.
+type revokedSessions map[uuid.UUID]bool
+
+func (r revokedSessions) Revoked(_ context.Context, sessionID uuid.UUID) (bool, error) {
+	return r[sessionID], nil
+}
+
+func TestRouterRefusesTokensOfRevokedSessions(t *testing.T) {
+	t.Parallel()
+
+	issue := func(role domain.Role, sessionID uuid.UUID) string {
+		tok, err := testTokens.Issue(domain.Principal{UserID: uuid.NewV7(), Role: role, SessionID: sessionID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return tok.Token
+	}
+	revoked := uuid.NewV7()
+	deps := testRouterDeps()
+	deps.Revocations = revokedSessions{revoked: true}
+	router := NewRouter(deps)
+	customer, admin := issue(domain.RoleCustomer, revoked), issue(domain.RoleAdmin, revoked)
+
+	for _, tt := range []struct{ method, path, token, body string }{
+		{method: http.MethodGet, path: "/v1/me", token: customer},
+		{method: http.MethodGet, path: "/v1/bookings", token: customer},
+		{method: http.MethodGet, path: "/v1/auth/sessions", token: customer},
+		{method: http.MethodPost, path: "/v1/auth/logout-all", token: customer},
+		{method: http.MethodPost, path: "/v1/admin/movies", token: admin, body: `{"title":"Dune","duration_min":155}`},
+	} {
+		rec := serveAs(t, router, tt.method, tt.path, tt.token, tt.body)
+		var p problem.Problem
+		_ = json.Unmarshal(rec.Body.Bytes(), &p)
+		if rec.Code != http.StatusUnauthorized || p.Code != domain.CodeInvalidToken || rec.Header().Get("WWW-Authenticate") == "" {
+			t.Errorf("%s %s with a token of a revoked session = %d %s, want 401 INVALID_TOKEN", tt.method, tt.path, rec.Code, rec.Body.String())
+		}
+	}
+	if rec := serveAs(t, router, http.MethodGet, "/v1/me", issue(domain.RoleCustomer, uuid.NewV7()), ""); rec.Code != http.StatusOK {
+		t.Errorf("a token of another session = %d, want 200", rec.Code)
+	}
+	// Public routes do not look at bearer tokens at all.
+	if rec := serveAs(t, router, http.MethodGet, "/v1/movies", customer, ""); rec.Code != http.StatusOK {
+		t.Errorf("a public route with a token of a revoked session = %d, want 200", rec.Code)
 	}
 }
 

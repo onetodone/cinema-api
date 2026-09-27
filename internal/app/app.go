@@ -63,24 +63,6 @@ func NewAPI(ctx context.Context, cfg config.Config, logger *slog.Logger) (*API, 
 		db.Close()
 		return nil, fmt.Errorf("BCRYPT_COST: %w", err)
 	}
-	sessions, err := auth.NewSessions(authSvc, postgres.NewSessions(db), tokens, auth.SessionConfig{
-		IdleTTL:    cfg.Auth.RefreshTTL,
-		MaxAge:     cfg.Auth.SessionMaxAge,
-		Grace:      cfg.Auth.RefreshGrace,
-		MaxPerUser: cfg.Auth.MaxSessionsPerUser,
-	}, logger)
-	if err != nil {
-		db.Close()
-		return nil, fmt.Errorf("session settings: %w", err)
-	}
-	if !cfg.Auth.CookieSecure {
-		logger.WarnContext(ctx, "the refresh token cookie is not Secure (AUTH_COOKIE_SECURE=false); "+
-			"browsers send it over plain HTTP, which is only acceptable in development")
-	}
-
-	rdb := newRedis(ctx, cfg.Redis, appName, logger)
-
-	health := handler.NewHealth(logger, readinessTimeout, healthChecks(db, rdb)...)
 
 	providers, err := newPaymentProviders(cfg.Payment)
 	if err != nil {
@@ -89,12 +71,33 @@ func NewAPI(ctx context.Context, cfg config.Config, logger *slog.Logger) (*API, 
 	}
 	logPaymentMethods(logger, providers)
 
+	rdb := newRedis(ctx, cfg.Redis, appName, logger)
+
+	health := handler.NewHealth(logger, readinessTimeout, healthChecks(db, rdb)...)
+
 	m, metricsHandler := newMetrics()
 	for _, method := range providers.Methods() {
 		m.InitPayments(method.ID)
 	}
 	store := redisrepo.New(rdb, cfg.Redis.KeyPrefix, m, logger)
 	catalogCache := store.CatalogCache(cfg.Cache.SeatMapTTL, cfg.Cache.ScheduleTTL)
+	revocations := store.Revocations()
+
+	sessions, err := auth.NewSessions(authSvc, postgres.NewSessions(db), tokens, auth.SessionConfig{
+		IdleTTL:    cfg.Auth.RefreshTTL,
+		MaxAge:     cfg.Auth.SessionMaxAge,
+		Grace:      cfg.Auth.RefreshGrace,
+		MaxPerUser: cfg.Auth.MaxSessionsPerUser,
+	}, logger, auth.WithRevocations(revocations))
+	if err != nil {
+		db.Close()
+		_ = rdb.Close()
+		return nil, fmt.Errorf("session settings: %w", err)
+	}
+	if !cfg.Auth.CookieSecure {
+		logger.WarnContext(ctx, "the refresh token cookie is not Secure (AUTH_COOKIE_SECURE=false); "+
+			"browsers send it over plain HTTP, which is only acceptable in development")
+	}
 
 	catalogRepo := postgres.NewCatalog(db)
 	catalogSvc := catalog.New(catalogRepo, cfg.Cinema.Location, catalog.WithCache(catalogCache))
@@ -122,6 +125,7 @@ func NewAPI(ctx context.Context, cfg config.Config, logger *slog.Logger) (*API, 
 		LoginEmailLimiter: rateLimiter(store, "login-email", cfg.RateLimit.LoginEmailPerMin),
 		RefreshLimiter:    rateLimiter(store, "refresh", cfg.RateLimit.RefreshPerMin),
 		TrustedProxies:    cfg.HTTP.TrustedProxies,
+		Revocations:       revocations,
 	})
 
 	return &API{

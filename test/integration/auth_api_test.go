@@ -110,12 +110,12 @@ func newTestTokens(t *testing.T) *auth.Tokens {
 
 // newAuthHandler returns the account and session handlers over pool, wired as internal/app wires them.
 func newAuthHandler(t *testing.T, pool *pgxpool.Pool, tokens *auth.Tokens, cfg auth.SessionConfig,
-	cookie handler.RefreshCookie, trusted []netip.Prefix, m *metrics.Metrics,
+	cookie handler.RefreshCookie, trusted []netip.Prefix, m *metrics.Metrics, opts ...auth.SessionOption,
 ) *handler.Auth {
 	t.Helper()
 	logger := slog.New(slog.DiscardHandler)
 	accounts := must(auth.New(postgres.NewUsers(pool), bcrypt.MinCost))(t)
-	sessions := must(auth.NewSessions(accounts, postgres.NewSessions(pool), tokens, cfg, logger))(t)
+	sessions := must(auth.NewSessions(accounts, postgres.NewSessions(pool), tokens, cfg, logger, opts...))(t)
 	return handler.NewAuth(accounts, sessions, handler.AuthConfig{Cookie: cookie, TrustedProxies: trusted}, m, logger)
 }
 

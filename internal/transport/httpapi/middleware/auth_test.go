@@ -2,11 +2,14 @@ package middleware
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 	"uuid"
 
@@ -16,8 +19,16 @@ import (
 )
 
 var (
-	customer = domain.Principal{UserID: uuid.MustParse("01920000-0000-7000-8000-000000000001"), Role: domain.RoleCustomer}
-	admin    = domain.Principal{UserID: uuid.MustParse("01920000-0000-7000-8000-000000000002"), Role: domain.RoleAdmin}
+	customer = domain.Principal{
+		UserID:    uuid.MustParse("01920000-0000-7000-8000-000000000001"),
+		Role:      domain.RoleCustomer,
+		SessionID: uuid.MustParse("01920000-0000-7000-8000-0000000000c1"),
+	}
+	admin = domain.Principal{
+		UserID:    uuid.MustParse("01920000-0000-7000-8000-000000000002"),
+		Role:      domain.RoleAdmin,
+		SessionID: uuid.MustParse("01920000-0000-7000-8000-0000000000a1"),
+	}
 )
 
 // stubVerifier accepts the tokens it knows and rejects everything else like auth.Tokens would.
@@ -36,6 +47,21 @@ func (s stubVerifier) Verify(token string) (domain.Principal, error) {
 }
 
 var verifier = stubVerifier{"customer-token": customer, "admin-token": admin}
+
+// stubRevocations lists revoked sessions and records every lookup; with err set, every lookup fails.
+type stubRevocations struct {
+	revoked map[uuid.UUID]bool
+	err     error
+	asked   []uuid.UUID
+}
+
+func (s *stubRevocations) Revoked(_ context.Context, sessionID uuid.UUID) (bool, error) {
+	s.asked = append(s.asked, sessionID)
+	if s.err != nil {
+		return false, s.err
+	}
+	return s.revoked[sessionID], nil
+}
 
 // whoAmI answers 200 with the principal it finds in the context.
 var whoAmI = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -73,7 +99,7 @@ func problemCode(t *testing.T, rec *httptest.ResponseRecorder) string {
 func TestAuthenticateAcceptsValidBearerToken(t *testing.T) {
 	t.Parallel()
 
-	h := Authenticate(verifier, slog.New(slog.DiscardHandler))(whoAmI)
+	h := Authenticate(verifier, nil, slog.New(slog.DiscardHandler))(whoAmI)
 	for _, header := range []string{"Bearer customer-token", "bearer customer-token", "BEARER  customer-token "} {
 		rec := request(t, h, header)
 		if rec.Code != http.StatusOK || rec.Body.String() != customer.UserID.String()+" customer" {
@@ -106,7 +132,7 @@ func TestAuthenticateRejects(t *testing.T) {
 	}
 
 	var logs bytes.Buffer
-	h := Authenticate(verifier, newJSONLogger(t, &logs))(whoAmI)
+	h := Authenticate(verifier, nil, newJSONLogger(t, &logs))(whoAmI)
 	for _, tt := range tests {
 		rec := request(t, h, tt.header)
 		if rec.Code != http.StatusUnauthorized {
@@ -126,12 +152,50 @@ func TestAuthenticateRejects(t *testing.T) {
 	}
 }
 
+func TestAuthenticateRejectsTokensOfRevokedSessions(t *testing.T) {
+	t.Parallel()
+
+	var logs bytes.Buffer
+	list := &stubRevocations{revoked: map[uuid.UUID]bool{customer.SessionID: true}}
+	h := Authenticate(verifier, list, newJSONLogger(t, &logs))(whoAmI)
+
+	rec := request(t, h, "Bearer customer-token")
+	if rec.Code != http.StatusUnauthorized || problemCode(t, rec) != domain.CodeInvalidToken {
+		t.Fatalf("token of a revoked session: got %d %s, want 401 INVALID_TOKEN", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("WWW-Authenticate"); got != invalidTokenChallenge {
+		t.Errorf("WWW-Authenticate = %q, want %q", got, invalidTokenChallenge)
+	}
+	if !bytes.Contains(logs.Bytes(), []byte(customer.SessionID.String())) {
+		t.Errorf("the rejection was not logged with the session: %s", logs.String())
+	}
+
+	if rec := request(t, h, "Bearer admin-token"); rec.Code != http.StatusOK {
+		t.Errorf("token of a live session: status = %d, want 200", rec.Code)
+	}
+	// A token that fails verification is not looked up: its sid proves nothing.
+	request(t, h, "Bearer forged")
+	if want := []uuid.UUID{customer.SessionID, admin.SessionID}; !slices.Equal(list.asked, want) {
+		t.Errorf("looked up %v, want %v", list.asked, want)
+	}
+}
+
+func TestAuthenticateFailsOpenWhenTheRevocationListFails(t *testing.T) {
+	t.Parallel()
+
+	list := &stubRevocations{revoked: map[uuid.UUID]bool{customer.SessionID: true}, err: errors.New("redis: connection refused")}
+	h := Authenticate(verifier, list, slog.New(slog.DiscardHandler))(whoAmI)
+	if rec := request(t, h, "Bearer customer-token"); rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200: without the list, a token works until it expires", rec.Code)
+	}
+}
+
 func TestAuthenticateTagsLogsWithUserID(t *testing.T) {
 	t.Parallel()
 
 	var logs bytes.Buffer
 	logger := newJSONLogger(t, &logs)
-	h := Authenticate(verifier, logger)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+	h := Authenticate(verifier, nil, logger)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 		logger.InfoContext(r.Context(), "inside handler")
 	}))
 	request(t, h, "Bearer customer-token")
@@ -145,7 +209,7 @@ func TestRequireRole(t *testing.T) {
 	t.Parallel()
 
 	logger := slog.New(slog.DiscardHandler)
-	adminOnly := Chain(whoAmI, Authenticate(verifier, logger), RequireRole(domain.RoleAdmin))
+	adminOnly := Chain(whoAmI, Authenticate(verifier, nil, logger), RequireRole(domain.RoleAdmin))
 
 	rec := request(t, adminOnly, "Bearer admin-token")
 	if rec.Code != http.StatusOK {
@@ -165,7 +229,7 @@ func TestRequireRole(t *testing.T) {
 		t.Errorf("anonymous: status = %d, want 401 before any role check", rec.Code)
 	}
 
-	anyRole := Chain(whoAmI, Authenticate(verifier, logger), RequireRole(domain.RoleCustomer, domain.RoleAdmin))
+	anyRole := Chain(whoAmI, Authenticate(verifier, nil, logger), RequireRole(domain.RoleCustomer, domain.RoleAdmin))
 	if rec := request(t, anyRole, "Bearer customer-token"); rec.Code != http.StatusOK {
 		t.Errorf("customer on a route for customers and admins: status = %d, want 200", rec.Code)
 	}

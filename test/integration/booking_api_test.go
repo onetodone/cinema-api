@@ -37,7 +37,7 @@ type apiOptions struct {
 }
 
 // newAPIServer serves the complete router over the fixture's database and the test Redis, wired as internal/app
-// wires it, without rate limits.
+// wires it (hold gate, caches, idempotency, revocation list), without rate limits.
 func newAPIServer(t *testing.T, f *fixture) apiClient {
 	t.Helper()
 	return newAPIServerWith(t, f, apiOptions{})
@@ -61,6 +61,7 @@ func newAPIServerWith(t *testing.T, f *fixture, opts apiOptions) apiClient {
 	}
 	providers, _ := testProviders(t)
 	cache := env.store.CatalogCache(testSeatMapTTL, testScheduleTTL)
+	revocations := env.store.Revocations()
 	bookingSvc := newBookingService(f.pool, 3*time.Second, providers, env.metrics, logger, withRedis(env)...)
 	limiter := func(name string, perMinute int) middleware.RateLimiter {
 		if perMinute == 0 {
@@ -69,12 +70,15 @@ func newAPIServerWith(t *testing.T, f *fixture, opts apiOptions) apiClient {
 		return env.store.RateLimiter(name, perMinute, time.Minute)
 	}
 
+	authHandler := newAuthHandler(t, f.pool, tokens, sessions, cookie, opts.trusted, env.metrics,
+		auth.WithRevocations(revocations))
+
 	router := httpapi.NewRouter(httpapi.RouterDeps{
 		Logger:   logger,
 		Tokens:   tokens,
 		Health:   handler.NewHealth(logger, time.Second),
 		Catalog:  handler.NewCatalog(catalog.New(f.catalog, time.UTC, catalog.WithCache(cache)), "USD", logger),
-		Auth:     newAuthHandler(t, f.pool, tokens, sessions, cookie, opts.trusted, env.metrics),
+		Auth:     authHandler,
 		Bookings: handler.NewBookings(bookingSvc, "USD", env.metrics, logger),
 		Payments: handler.NewPayments(bookingSvc, providers, "USD", env.metrics, logger),
 		Admin:    handler.NewAdmin(admin.New(f.catalog, time.UTC, admin.WithScheduleCache(cache)), "USD", logger),
@@ -86,6 +90,7 @@ func newAPIServerWith(t *testing.T, f *fixture, opts apiOptions) apiClient {
 		LoginEmailLimiter: limiter("login-email", opts.limits.LoginEmailPerMin),
 		RefreshLimiter:    limiter("refresh", opts.limits.RefreshPerMin),
 		TrustedProxies:    opts.trusted,
+		Revocations:       revocations,
 	})
 	srv := httptest.NewServer(router)
 	t.Cleanup(srv.Close)

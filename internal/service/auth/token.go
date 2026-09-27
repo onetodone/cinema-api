@@ -41,8 +41,8 @@ type AccessToken struct {
 
 // Tokens issues and verifies stateless access tokens (JWT, HS256). A token carries the user id, the role, and the
 // session that issued it, so verifying it needs no database access. The price is that a role change applies to
-// new tokens only; old ones keep the old role until they expire (JWT_TTL), and so do the tokens of a session that
-// was deleted.
+// new tokens only; old ones keep the old role until they expire (JWT_TTL). The tokens of a session that ended are
+// stopped by the revocation list (see Sessions), which the auth middleware checks after Verify.
 type Tokens struct {
 	key    []byte
 	ttl    time.Duration

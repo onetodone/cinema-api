@@ -1,10 +1,12 @@
 package middleware
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 	"slices"
 	"strings"
+	"uuid"
 
 	"github.com/onetodone/cinema-api/internal/domain"
 	"github.com/onetodone/cinema-api/internal/platform/logging"
@@ -18,10 +20,17 @@ type TokenVerifier interface {
 	Verify(token string) (domain.Principal, error)
 }
 
+// RevocationList tells whether a session has ended before it expired. It is implemented by
+// repository/redis.Revocations.
+type RevocationList interface {
+	Revoked(ctx context.Context, sessionID uuid.UUID) (bool, error)
+}
+
 var (
-	errAuthRequired = domain.Unauthenticated(domain.CodeUnauthenticated, "this endpoint requires a bearer token")
-	errNoToken      = domain.Unauthenticated(domain.CodeInvalidToken, "the bearer token is empty")
-	errForbidden    = domain.Forbidden(domain.CodeForbidden, "your role does not allow this action")
+	errAuthRequired   = domain.Unauthenticated(domain.CodeUnauthenticated, "this endpoint requires a bearer token")
+	errNoToken        = domain.Unauthenticated(domain.CodeInvalidToken, "the bearer token is empty")
+	errSessionRevoked = domain.Unauthenticated(domain.CodeInvalidToken, "the session of the access token has ended")
+	errForbidden      = domain.Forbidden(domain.CodeForbidden, "your role does not allow this action")
 )
 
 // Challenges added to the realm (RFC 6750 §3). A request without credentials gets the bare challenge.
@@ -33,11 +42,14 @@ const (
 // Authenticate requires a valid bearer token (RFC 6750):
 //   - no Authorization header, or another scheme: 401 UNAUTHENTICATED;
 //   - an empty, malformed, forged, or expired token: 401 INVALID_TOKEN or TOKEN_EXPIRED, with
-//     error="invalid_token" in the WWW-Authenticate challenge.
+//     error="invalid_token" in the WWW-Authenticate challenge;
+//   - a token whose session is on the revocation list: 401 INVALID_TOKEN, the same way. When the list cannot be
+//     read, the token passes (fail open): it expires within JWT_TTL, and its session can no longer refresh. A nil
+//     list checks nothing.
 //
 // On success the caller is stored in the request context (read it with principal.FromContext), and every
 // log record written with that context carries the caller's user id.
-func Authenticate(verifier TokenVerifier, logger *slog.Logger) Middleware {
+func Authenticate(verifier TokenVerifier, revoked RevocationList, logger *slog.Logger) Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			token, ok := bearerToken(r.Header.Get("Authorization"))
@@ -58,6 +70,16 @@ func Authenticate(verifier TokenVerifier, logger *slog.Logger) Middleware {
 				w.Header().Set("WWW-Authenticate", invalidTokenChallenge)
 				problem.Write(w, r, problem.FromError(err))
 				return
+			}
+			if revoked != nil {
+				// On error the list has recorded the failure, and the token passes.
+				if gone, err := revoked.Revoked(r.Context(), p.SessionID); err == nil && gone {
+					logger.DebugContext(r.Context(), "access token of an ended session rejected",
+						slog.String("session_id", p.SessionID.String()))
+					w.Header().Set("WWW-Authenticate", invalidTokenChallenge)
+					problem.Write(w, r, problem.FromError(errSessionRevoked))
+					return
+				}
 			}
 
 			ctx := principal.NewContext(r.Context(), p)

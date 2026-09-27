@@ -41,6 +41,8 @@ func TestHandlerServesEveryMetricFromZero(t *testing.T) {
 		`cinema_payments_reconciled_total{result="unsettled"} 0`,
 		`cinema_auth_refresh_total{result="reuse_detected"} 0`,
 		"cinema_sessions_swept_total 0",
+		`cinema_session_revocations_total{reason="evicted"} 0`,
+		`cinema_redis_fail_open_total{op="revocation_check"} 0`,
 		`cinema_rate_limit_rejections_total{limit="refresh"} 0`,
 		`cinema_http_request_duration_seconds_bucket{code="200",route="GET /v1/movies",le="0.005"} 1`,
 		`cinema_http_request_duration_seconds_bucket{code="200",route="GET /v1/movies",le="0.0025"} 0`,

@@ -22,12 +22,15 @@ type AuthService interface {
 	User(ctx context.Context, id uuid.UUID) (domain.User, error)
 }
 
-// SessionService runs logins, refreshes, and logouts. It is implemented by service/auth.Sessions.
+// SessionService runs logins, refreshes, and logouts, and lists and revokes sessions. It is implemented by
+// service/auth.Sessions.
 type SessionService interface {
 	Login(ctx context.Context, email, password string, c auth.Client) (auth.Grant, error)
 	Refresh(ctx context.Context, token string, c auth.Client) (auth.Grant, auth.RefreshResult, error)
-	Logout(ctx context.Context, token string) error
-	LogoutAll(ctx context.Context, userID uuid.UUID) error
+	Logout(ctx context.Context, token string) (ended bool, err error)
+	LogoutAll(ctx context.Context, userID uuid.UUID) (ended int, err error)
+	List(ctx context.Context, userID uuid.UUID) ([]domain.Session, error)
+	Revoke(ctx context.Context, userID, sessionID uuid.UUID) error
 }
 
 // AuthConfig configures the account handlers.
@@ -61,7 +64,7 @@ type Auth struct {
 	logger   *slog.Logger
 }
 
-// NewAuth returns the account handlers. Refreshes are counted in m.
+// NewAuth returns the account handlers. Refreshes and revoked sessions are counted in m.
 func NewAuth(accounts AuthService, sessions SessionService, cfg AuthConfig, m *metrics.Metrics, logger *slog.Logger) *Auth {
 	return &Auth{accounts: accounts, sessions: sessions, cfg: cfg, metrics: m, logger: logger}
 }
@@ -94,6 +97,7 @@ func (h *Auth) Login(w http.ResponseWriter, r *http.Request) {
 		writeError(h.logger, w, r, err)
 		return
 	}
+	h.countRevocations(metrics.RevocationEvicted, g.Evicted)
 	h.writeGrant(w, g)
 }
 
@@ -118,6 +122,9 @@ func (h *Auth) Refresh(w http.ResponseWriter, r *http.Request) {
 	if label, ok := refreshResults[result]; ok {
 		h.metrics.AuthRefreshes.WithLabelValues(label).Inc()
 	}
+	if result == auth.RefreshReuseDetected {
+		h.countRevocations(metrics.RevocationReuse, 1)
+	}
 
 	w.Header().Set("Cache-Control", "no-store")
 	if err != nil {
@@ -141,9 +148,13 @@ func (h *Auth) Logout(w http.ResponseWriter, r *http.Request) {
 
 	h.cfg.Cookie.clear(w)
 	if token := refreshToken(r); token != "" {
-		if err := h.sessions.Logout(r.Context(), token); err != nil {
+		ended, err := h.sessions.Logout(r.Context(), token)
+		if err != nil {
 			writeError(h.logger, w, r, err)
 			return
+		}
+		if ended {
+			h.countRevocations(metrics.RevocationLogout, 1)
 		}
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -157,11 +168,54 @@ func (h *Auth) LogoutAll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.sessions.LogoutAll(r.Context(), p.UserID); err != nil {
+	ended, err := h.sessions.LogoutAll(r.Context(), p.UserID)
+	if err != nil {
 		writeError(h.logger, w, r, err)
 		return
 	}
+	h.countRevocations(metrics.RevocationLogoutAll, ended)
 	h.cfg.Cookie.clear(w)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// ListSessions handles GET /v1/auth/sessions: the caller's sessions, most recently used first, with the session
+// of the caller's access token marked current. It must run behind the Authenticate middleware.
+func (h *Auth) ListSessions(w http.ResponseWriter, r *http.Request) {
+	p, ok := caller(h.logger, w, r)
+	if !ok {
+		return
+	}
+
+	sessions, err := h.sessions.List(r.Context(), p.UserID)
+	if err != nil {
+		writeError(h.logger, w, r, err)
+		return
+	}
+	render.JSON(w, http.StatusOK, dto.NewSessionList(sessions, p.SessionID))
+}
+
+// DeleteSession handles DELETE /v1/auth/sessions/{sessionID}. It ends a session of the caller, and stops its access
+// tokens at once. When that is the caller's own session, it also deletes the cookie, as a logout would. It must
+// run behind the Authenticate middleware.
+func (h *Auth) DeleteSession(w http.ResponseWriter, r *http.Request) {
+	p, ok := caller(h.logger, w, r)
+	if !ok {
+		return
+	}
+	var ps params
+	id := ps.pathUUID(r, "sessionID")
+	if !ps.ok(w, r) {
+		return
+	}
+
+	if err := h.sessions.Revoke(r.Context(), p.UserID, id); err != nil {
+		writeError(h.logger, w, r, err)
+		return
+	}
+	h.countRevocations(metrics.RevocationDeleted, 1)
+	if id == p.SessionID {
+		h.cfg.Cookie.clear(w)
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -178,6 +232,13 @@ func (h *Auth) Me(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	render.JSON(w, http.StatusOK, dto.NewUser(u))
+}
+
+// countRevocations counts n sessions that ended before they expired, for reason.
+func (h *Auth) countRevocations(reason string, n int) {
+	if n > 0 {
+		h.metrics.SessionRevocations.WithLabelValues(reason).Add(float64(n))
+	}
 }
 
 // writeGrant answers a login or refresh: the access token in the body, the refresh token in the cookie.

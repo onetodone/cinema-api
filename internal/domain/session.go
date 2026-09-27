@@ -40,6 +40,12 @@ type Session struct {
 	ExpiresAt time.Time
 }
 
+// SessionNotFound is the error for a session that does not exist, or that belongs to another user: to its caller,
+// the two look the same.
+func SessionNotFound(id uuid.UUID) error {
+	return NotFound(CodeSessionNotFound, "session %s not found", id)
+}
+
 // RefreshToken is the credential of a session, "<session id>.<secret>". The id says which session to look up;
 // only the SHA-256 of the secret is stored, so the token cannot be recovered from the database.
 type RefreshToken struct {

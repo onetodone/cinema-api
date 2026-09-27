@@ -40,6 +40,9 @@ type RouterDeps struct {
 	RefreshLimiter    middleware.RateLimiter // refreshes per session
 	// TrustedProxies are the networks whose X-Forwarded-For names the client address.
 	TrustedProxies []netip.Prefix
+	// Revocations lists the sessions that ended before they expired; their access tokens are refused. nil checks
+	// nothing: such tokens work until they expire.
+	Revocations middleware.RevocationList
 }
 
 // NewRouter registers all routes and wraps them in the shared middleware stack.
@@ -67,7 +70,7 @@ func newMux(d RouterDeps) (*http.ServeMux, []string) {
 	}
 
 	// Access levels.
-	authenticate := middleware.Authenticate(d.Tokens, d.Logger)
+	authenticate := middleware.Authenticate(d.Tokens, d.Revocations, d.Logger)
 	public := func(h http.HandlerFunc, mws ...middleware.Middleware) http.Handler {
 		return middleware.Chain(h, mws...)
 	}
@@ -103,6 +106,8 @@ func newMux(d RouterDeps) (*http.ServeMux, []string) {
 	handle("POST /v1/auth/refresh", public(d.Auth.Refresh, limitRefreshBySession))
 	handle("POST /v1/auth/logout", public(d.Auth.Logout))
 	handle("POST /v1/auth/logout-all", user(d.Auth.LogoutAll))
+	handle("GET /v1/auth/sessions", user(d.Auth.ListSessions))
+	handle("DELETE /v1/auth/sessions/{sessionID}", user(d.Auth.DeleteSession))
 	handle("GET /v1/me", user(d.Auth.Me))
 
 	handle("GET /v1/movies", public(d.Catalog.ListMovies))
