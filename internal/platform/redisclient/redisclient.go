@@ -3,9 +3,9 @@ package redisclient
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log/slog"
-	"crypto/tls"
 
 	"github.com/redis/go-redis/v9"
 
