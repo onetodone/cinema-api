@@ -23,6 +23,7 @@ type Movie struct {
 	DurationMin int
 	AgeRating   string // empty when unknown
 	PosterURL   string // empty when unknown
+	Genres      []Genre
 	CreatedAt   time.Time
 }
 
@@ -33,6 +34,7 @@ type NewMovie struct {
 	DurationMin int
 	AgeRating   string
 	PosterURL   string
+	Genres      []Genre // most characteristic first; may be empty
 }
 
 // Movie field limits.
@@ -65,6 +67,7 @@ func (m NewMovie) Validate() error {
 	if m.PosterURL != "" {
 		v.Check("poster_url", checkWebURL(m.PosterURL, MaxPosterURLLength))
 	}
+	checkGenres(&v, m.Genres)
 	return v.Err()
 }
 
@@ -86,6 +89,7 @@ type MovieSummary struct {
 	Title       string
 	DurationMin int
 	AgeRating   string
+	Genres      []Genre
 }
 
 // Hall is a screening room.
@@ -232,6 +236,7 @@ type Showtime struct {
 	Hall           Hall
 	StartsAt       time.Time
 	EndsAt         time.Time // includes the cleaning buffer
+	Language       LanguageVersion
 	BasePriceCents int64
 	Status         ShowtimeStatus
 	SeatsAvailable int
@@ -243,6 +248,7 @@ type NewShowtime struct {
 	MovieID        int64
 	HallID         int64
 	StartsAt       time.Time
+	Language       LanguageVersion
 	BasePriceCents int64
 }
 
@@ -273,6 +279,7 @@ func (s NewShowtime) Validate(now time.Time) error {
 	case s.StartsAt.After(now.Add(MaxScheduleAhead)):
 		v.Add("starts_at", "must be at most %d days ahead", int(MaxScheduleAhead/(24*time.Hour)))
 	}
+	s.Language.check(&v)
 	if s.BasePriceCents < 0 || s.BasePriceCents > MaxBasePriceCents {
 		v.Add("base_price_cents", "must be between 0 and %d", MaxBasePriceCents)
 	}

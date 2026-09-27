@@ -63,6 +63,14 @@ WHERE (SELECT count(*) FROM showtime_seats ss WHERE ss.showtime_id = s.id)
 	if mismatched != 0 {
 		t.Errorf("%d showtimes have an incomplete seat inventory", mismatched)
 	}
+
+	// Every movie has genres, and the schedule mixes original, subtitled, and dubbed showtimes.
+	if n := countRows(t, pool, `SELECT count(*) FROM movies WHERE cardinality(genres) = 0`); n != 0 {
+		t.Errorf("%d seeded movies have no genres", n)
+	}
+	if n := countRows(t, pool, `SELECT count(DISTINCT audio_language || '/' || coalesce(subtitle_language, '')) FROM showtimes`); n != 3 {
+		t.Errorf("%d language versions in the seeded schedule, want 3", n)
+	}
 }
 
 // TestCatalogAPI drives the real router, service, and repository over HTTP.

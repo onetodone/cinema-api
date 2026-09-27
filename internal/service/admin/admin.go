@@ -94,10 +94,13 @@ func (s *Service) CreateHall(ctx context.Context, h domain.NewHall) (domain.Hall
 // CreateShowtime schedules a movie in a hall and makes every seat of the hall available for it. The showtime
 // occupies the hall from its start until the movie and the cleaning buffer are over; a hall cannot host two
 // scheduled showtimes that overlap, which the database enforces with an exclusion constraint, so two admins who
-// schedule the same slot at once cannot both succeed.
+// schedule the same slot at once cannot both succeed. Surrounding space is trimmed from the language codes, and
+// they are lower-cased.
 //
 // Errors: a *domain.ValidationError; MOVIE_NOT_FOUND; HALL_NOT_FOUND; HALL_OVERLAP.
 func (s *Service) CreateShowtime(ctx context.Context, ns domain.NewShowtime) (domain.Showtime, error) {
+	ns.Language.Audio = strings.ToLower(strings.TrimSpace(ns.Language.Audio))
+	ns.Language.Subtitles = strings.ToLower(strings.TrimSpace(ns.Language.Subtitles))
 	if err := ns.Validate(s.now()); err != nil {
 		return domain.Showtime{}, err
 	}

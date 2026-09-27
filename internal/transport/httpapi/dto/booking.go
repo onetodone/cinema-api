@@ -25,6 +25,7 @@ type BookingShowtime struct {
 	Movie    MovieRef  `json:"movie"`
 	Hall     HallRef   `json:"hall"`
 	StartsAt time.Time `json:"starts_at"`
+	Language
 }
 
 // BookedSeat is one seat of a booking, at the price it was booked for.
@@ -77,6 +78,7 @@ func NewBooking(b domain.Booking, currency string) Booking {
 			Movie:    newMovieRef(b.Showtime.Movie),
 			Hall:     HallRef{ID: b.Showtime.Hall.ID, Name: b.Showtime.Hall.Name},
 			StartsAt: b.Showtime.StartsAt,
+			Language: newLanguage(b.Showtime.Language),
 		},
 		Seats:      seats,
 		TotalCents: b.TotalCents,

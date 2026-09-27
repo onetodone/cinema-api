@@ -4,6 +4,7 @@ package integration
 
 import (
 	"testing"
+	"time"
 
 	"github.com/onetodone/cinema-api/internal/platform/dbmigrate"
 )
@@ -71,5 +72,55 @@ WHERE n.nspname = 'public' AND t.typtype = 'e'`).Scan(&types); err != nil {
 	}
 	if got := tables(); got != wantTables {
 		t.Fatalf("after second up: %d tables, want %d", got, wantTables)
+	}
+}
+
+// TestGenresLanguagesMigrationBackfills applies 00003 to a database that already has a showtime: the showtime gets
+// English audio and no subtitles, the movie no genres, and new showtimes must state their audio.
+func TestGenresLanguagesMigrationBackfills(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	pool := newEmptyDB(t)
+
+	m, err := dbmigrate.New(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = m.Close() }()
+	if _, err := m.Up(ctx); err != nil {
+		t.Fatalf("up: %v", err)
+	}
+	if _, err := m.DownTo(ctx, 2); err != nil {
+		t.Fatalf("down to 2: %v", err)
+	}
+
+	exec(t, pool, `INSERT INTO movies (title, duration_min) VALUES ('Old', 90)`)
+	exec(t, pool, `INSERT INTO halls (name) VALUES ('Old hall')`)
+	oldShowtime := `
+INSERT INTO showtimes (movie_id, hall_id, starts_at, ends_at, base_price_cents)
+SELECT m.id, h.id, $1::timestamptz, $1::timestamptz + interval '2 hours', 900 FROM movies m, halls h`
+	exec(t, pool, oldShowtime, base)
+
+	if _, err := m.Up(ctx); err != nil {
+		t.Fatalf("up to 3: %v", err)
+	}
+	var (
+		audio     string
+		subtitles *string
+		genres    []string
+	)
+	err = pool.QueryRow(ctx, `
+SELECT s.audio_language, s.subtitle_language, m.genres::text[] FROM showtimes s JOIN movies m ON m.id = s.movie_id`).
+		Scan(&audio, &subtitles, &genres)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if audio != "eng" || subtitles != nil || genres == nil || len(genres) != 0 {
+		t.Errorf("backfilled showtime = %q, %v, genres %#v; want eng, no subtitles, no genres", audio, subtitles, genres)
+	}
+
+	_, err = pool.Exec(ctx, oldShowtime, base.Add(24*time.Hour))
+	if pgCode(err) != "23502" { // not_null_violation: the backfill default is gone
+		t.Errorf("a showtime without audio = %v, want a not-null violation", err)
 	}
 }

@@ -157,6 +157,7 @@ func TestPolledReadsWithETags(t *testing.T) {
 	scheduleTag := get(api, schedulePath, "").header.Get("ETag")
 	created := api.do(http.MethodPost, "/v1/admin/showtimes", adminToken, map[string]any{
 		"movie_id": f.short.ID, "hall_id": f.hall2.ID, "starts_at": start.Add(time.Hour).Format(time.RFC3339), "base_price_cents": 900,
+		"audio_language": "eng",
 	})
 	if created.status != http.StatusCreated {
 		t.Fatalf("create showtime = %d %v", created.status, created.body)

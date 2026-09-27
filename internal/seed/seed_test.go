@@ -165,6 +165,47 @@ func TestRunCreatesTheWholeCatalog(t *testing.T) {
 		if m.PosterURL != "" {
 			t.Errorf("movie %q got poster %q without a template", m.Title, m.PosterURL)
 		}
+		if len(m.Genres) == 0 {
+			t.Errorf("movie %q has no genres", m.Title)
+		}
+	}
+}
+
+func TestRunScreensEachMovieInAllItsVersions(t *testing.T) {
+	t.Parallel()
+
+	store := &memStore{}
+	first := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	if _, err := Run(t.Context(), store, Options{Days: 3, FirstDay: first, Location: time.UTC}); err != nil {
+		t.Fatal(err)
+	}
+
+	shown := map[int64]map[domain.LanguageVersion]bool{} // by movie id, which is its position + 1 in memStore
+	for _, s := range store.showtimes {
+		// The admin API's rules apply to demo showtimes too.
+		if err := s.Validate(first.Add(-time.Hour)); err != nil {
+			t.Fatalf("showtime %+v: %v", s, err)
+		}
+		if shown[s.MovieID] == nil {
+			shown[s.MovieID] = map[domain.LanguageVersion]bool{}
+		}
+		shown[s.MovieID][s.Language] = true
+	}
+	subtitled, dubbed := false, false
+	for i, m := range movies {
+		for _, v := range m.versions {
+			if !shown[int64(i+1)][v] {
+				t.Errorf("%q is never shown in %+v", m.Title, v)
+			}
+			subtitled = subtitled || v.Subtitles != ""
+			dubbed = dubbed || v.Audio != "eng"
+		}
+		if len(shown[int64(i+1)]) != len(m.versions) {
+			t.Errorf("%q is shown in %v, want only %v", m.Title, shown[int64(i+1)], m.versions)
+		}
+	}
+	if !subtitled || !dubbed {
+		t.Error("the demo has no subtitled or no dubbed showtimes")
 	}
 }
 

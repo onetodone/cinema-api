@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -101,11 +102,15 @@ func assertProblem(t *testing.T, rec *httptest.ResponseRecorder, status int, cod
 }
 
 var sampleShowtime = domain.Showtime{
-	ID:             11,
-	Movie:          domain.MovieSummary{ID: 1, Title: "Dune", DurationMin: 155, AgeRating: "PG-13"},
+	ID: 11,
+	Movie: domain.MovieSummary{
+		ID: 1, Title: "Dune", DurationMin: 155, AgeRating: "PG-13",
+		Genres: []domain.Genre{domain.GenreScienceFiction, domain.GenreAdventure},
+	},
 	Hall:           domain.Hall{ID: 2, Name: "Hall 2"},
 	StartsAt:       time.Date(2026, 10, 1, 19, 0, 0, 0, time.UTC),
 	EndsAt:         time.Date(2026, 10, 1, 21, 50, 0, 0, time.UTC),
+	Language:       domain.LanguageVersion{Audio: "eng", Subtitles: "tha"},
 	BasePriceCents: 1200,
 	Status:         domain.ShowtimeScheduled,
 	SeatsAvailable: 90,
@@ -181,7 +186,7 @@ func TestGetMovie(t *testing.T) {
 	t.Parallel()
 
 	svc := &stubCatalog{details: catalog.MovieDetails{
-		Movie:    domain.Movie{ID: 1, Title: "Dune", DurationMin: 155},
+		Movie:    domain.Movie{ID: 1, Title: "Dune", DurationMin: 155, Genres: []domain.Genre{domain.GenreDrama}},
 		Upcoming: []domain.Showtime{sampleShowtime},
 	}}
 	rec := serveCatalog(t, svc, "/v1/movies/1")
@@ -190,8 +195,8 @@ func TestGetMovie(t *testing.T) {
 	}
 
 	body := decode[map[string]any](t, rec)
-	if body["title"] != "Dune" {
-		t.Errorf("title = %v", body["title"])
+	if body["title"] != "Dune" || !reflect.DeepEqual(body["genres"], []any{"drama"}) {
+		t.Errorf("title, genres = %v, %v", body["title"], body["genres"])
 	}
 	upcoming, _ := body["upcoming_showtimes"].([]any)
 	if len(upcoming) != 1 {
@@ -249,10 +254,30 @@ func TestSchedule(t *testing.T) {
 		t.Fatalf("items = %v", body["items"])
 	}
 	item, _ := items[0].(map[string]any)
-	for k, v := range map[string]any{"seats_available": 90.0, "seats_total": 100.0, "base_price_cents": 1200.0} {
+	for k, v := range map[string]any{
+		"seats_available": 90.0, "seats_total": 100.0, "base_price_cents": 1200.0,
+		"audio_language": "eng", "subtitle_language": "tha",
+	} {
 		if item[k] != v {
 			t.Errorf("%s = %v, want %v", k, item[k], v)
 		}
+	}
+	if movie, _ := item["movie"].(map[string]any); !reflect.DeepEqual(movie["genres"], []any{"science_fiction", "adventure"}) {
+		t.Errorf("movie = %v, want its genres", item["movie"])
+	}
+}
+
+func TestShowtimeWithoutSubtitlesOrGenres(t *testing.T) {
+	t.Parallel()
+
+	st := sampleShowtime
+	st.Language.Subtitles, st.Movie.Genres = "", nil
+	body := decode[map[string]any](t, serveCatalog(t, &stubCatalog{showtime: st}, "/v1/showtimes/11"))
+	if _, ok := body["subtitle_language"]; ok || body["audio_language"] != "eng" {
+		t.Errorf("body = %v, want audio_language eng and no subtitle_language", body)
+	}
+	if movie, _ := body["movie"].(map[string]any); !reflect.DeepEqual(movie["genres"], []any{}) {
+		t.Errorf("movie = %v, want genres []", body["movie"])
 	}
 }
 
@@ -314,13 +339,18 @@ func TestSeatMap(t *testing.T) {
 	}
 
 	body := decode[struct {
-		ShowtimeID int64            `json:"showtime_id"`
-		Currency   string           `json:"currency"`
-		Summary    map[string]int   `json:"summary"`
-		Seats      []map[string]any `json:"seats"`
+		ShowtimeID       int64            `json:"showtime_id"`
+		AudioLanguage    string           `json:"audio_language"`
+		SubtitleLanguage string           `json:"subtitle_language"`
+		Currency         string           `json:"currency"`
+		Summary          map[string]int   `json:"summary"`
+		Seats            []map[string]any `json:"seats"`
 	}](t, rec)
 	if body.ShowtimeID != 11 || body.Currency != "USD" {
 		t.Errorf("showtime_id/currency = %d/%s", body.ShowtimeID, body.Currency)
+	}
+	if body.AudioLanguage != "eng" || body.SubtitleLanguage != "tha" {
+		t.Errorf("languages = %s/%s, want eng/tha", body.AudioLanguage, body.SubtitleLanguage)
 	}
 	if body.Summary["available"] != 1 || body.Summary["held"] != 1 || body.Summary["total"] != 2 {
 		t.Errorf("summary = %v", body.Summary)

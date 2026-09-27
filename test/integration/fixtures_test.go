@@ -49,13 +49,16 @@ func newFixture(t *testing.T) *fixture {
 func (f *fixture) showtime(t *testing.T, m domain.Movie, h domain.Hall, start time.Time) domain.Showtime {
 	t.Helper()
 	st, err := f.catalog.CreateShowtime(t.Context(), domain.NewShowtime{
-		MovieID: m.ID, HallID: h.ID, StartsAt: start, BasePriceCents: 1000,
+		MovieID: m.ID, HallID: h.ID, StartsAt: start, Language: english, BasePriceCents: 1000,
 	})
 	if err != nil {
 		t.Fatalf("create showtime: %v", err)
 	}
 	return st
 }
+
+// english is the language version of fixture showtimes.
+var english = domain.LanguageVersion{Audio: "eng"}
 
 // setSeatStatus marks one seat of a showtime as held or sold by a new booking, the way the booking flow will.
 func (f *fixture) setSeatStatus(t *testing.T, showtimeID, seatID int64, status domain.SeatStatus) {

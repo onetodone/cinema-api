@@ -10,12 +10,13 @@ import (
 
 // Movie is a movie in a list or on its own page.
 type Movie struct {
-	ID          int64  `json:"id"`
-	Title       string `json:"title"`
-	Description string `json:"description,omitempty"`
-	DurationMin int    `json:"duration_min"`
-	AgeRating   string `json:"age_rating,omitempty"`
-	PosterURL   string `json:"poster_url,omitempty"`
+	ID          int64    `json:"id"`
+	Title       string   `json:"title"`
+	Description string   `json:"description,omitempty"`
+	DurationMin int      `json:"duration_min"`
+	AgeRating   string   `json:"age_rating,omitempty"`
+	PosterURL   string   `json:"poster_url,omitempty"`
+	Genres      []string `json:"genres"`
 }
 
 // MovieList is one page of movies. NextCursor is omitted on the last page.
@@ -32,10 +33,11 @@ type MovieDetails struct {
 
 // MovieRef is the part of a movie shown with a showtime.
 type MovieRef struct {
-	ID          int64  `json:"id"`
-	Title       string `json:"title"`
-	DurationMin int    `json:"duration_min"`
-	AgeRating   string `json:"age_rating,omitempty"`
+	ID          int64    `json:"id"`
+	Title       string   `json:"title"`
+	DurationMin int      `json:"duration_min"`
+	AgeRating   string   `json:"age_rating,omitempty"`
+	Genres      []string `json:"genres"`
 }
 
 // HallRef identifies a hall.
@@ -46,16 +48,24 @@ type HallRef struct {
 
 // Showtime is one screening with its availability.
 type Showtime struct {
-	ID             int64     `json:"id"`
-	Movie          MovieRef  `json:"movie"`
-	Hall           HallRef   `json:"hall"`
-	StartsAt       time.Time `json:"starts_at"`
-	EndsAt         time.Time `json:"ends_at"`
-	Status         string    `json:"status"`
-	BasePriceCents int64     `json:"base_price_cents"`
-	Currency       string    `json:"currency"`
-	SeatsAvailable int       `json:"seats_available"`
-	SeatsTotal     int       `json:"seats_total"`
+	ID       int64     `json:"id"`
+	Movie    MovieRef  `json:"movie"`
+	Hall     HallRef   `json:"hall"`
+	StartsAt time.Time `json:"starts_at"`
+	EndsAt   time.Time `json:"ends_at"`
+	Language
+	Status         string `json:"status"`
+	BasePriceCents int64  `json:"base_price_cents"`
+	Currency       string `json:"currency"`
+	SeatsAvailable int    `json:"seats_available"`
+	SeatsTotal     int    `json:"seats_total"`
+}
+
+// Language is the language version of a showtime as ISO 639-3 codes, such as eng. SubtitleLanguage is omitted
+// when the showtime has no subtitles.
+type Language struct {
+	AudioLanguage    string `json:"audio_language"`
+	SubtitleLanguage string `json:"subtitle_language,omitempty"`
 }
 
 // Schedule lists the showtimes of one local calendar day.
@@ -84,13 +94,14 @@ type Seat struct {
 
 // SeatMap is the seat layout of a showtime.
 type SeatMap struct {
-	ShowtimeID int64       `json:"showtime_id"`
-	Movie      MovieRef    `json:"movie"`
-	Hall       HallRef     `json:"hall"`
-	StartsAt   time.Time   `json:"starts_at"`
-	Currency   string      `json:"currency"`
-	Summary    SeatSummary `json:"summary"`
-	Seats      []Seat      `json:"seats"`
+	ShowtimeID int64     `json:"showtime_id"`
+	Movie      MovieRef  `json:"movie"`
+	Hall       HallRef   `json:"hall"`
+	StartsAt   time.Time `json:"starts_at"`
+	Language
+	Currency string      `json:"currency"`
+	Summary  SeatSummary `json:"summary"`
+	Seats    []Seat      `json:"seats"`
 }
 
 // NewMovie maps a domain movie.
@@ -102,6 +113,7 @@ func NewMovie(m domain.Movie) Movie {
 		DurationMin: m.DurationMin,
 		AgeRating:   m.AgeRating,
 		PosterURL:   m.PosterURL,
+		Genres:      genreNames(m.Genres),
 	}
 }
 
@@ -130,6 +142,7 @@ func NewShowtime(s domain.Showtime, currency string) Showtime {
 		Hall:           HallRef{ID: s.Hall.ID, Name: s.Hall.Name},
 		StartsAt:       s.StartsAt,
 		EndsAt:         s.EndsAt,
+		Language:       newLanguage(s.Language),
 		Status:         string(s.Status),
 		BasePriceCents: s.BasePriceCents,
 		Currency:       currency,
@@ -170,6 +183,7 @@ func NewSeatMap(sm catalog.SeatMap, currency string) SeatMap {
 		Movie:      newMovieRef(sm.Showtime.Movie),
 		Hall:       HallRef{ID: sm.Showtime.Hall.ID, Name: sm.Showtime.Hall.Name},
 		StartsAt:   sm.Showtime.StartsAt,
+		Language:   newLanguage(sm.Showtime.Language),
 		Currency:   currency,
 		Summary: SeatSummary{
 			Available: sm.Summary.Available,
@@ -182,5 +196,20 @@ func NewSeatMap(sm catalog.SeatMap, currency string) SeatMap {
 }
 
 func newMovieRef(m domain.MovieSummary) MovieRef {
-	return MovieRef{ID: m.ID, Title: m.Title, DurationMin: m.DurationMin, AgeRating: m.AgeRating}
+	return MovieRef{
+		ID: m.ID, Title: m.Title, DurationMin: m.DurationMin, AgeRating: m.AgeRating, Genres: genreNames(m.Genres),
+	}
+}
+
+func newLanguage(lv domain.LanguageVersion) Language {
+	return Language{AudioLanguage: lv.Audio, SubtitleLanguage: lv.Subtitles}
+}
+
+// genreNames maps genres to their names. The result is never nil, so it encodes as [] rather than null.
+func genreNames(genres []domain.Genre) []string {
+	names := make([]string, len(genres))
+	for i, g := range genres {
+		names[i] = string(g)
+	}
+	return names
 }

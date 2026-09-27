@@ -16,6 +16,8 @@ info:
     - Times are RFC 3339. Showtime times carry the cinema's UTC offset; the timestamps of bookings, payments,
       and accounts are in UTC. Schedule days start at midnight in the cinema's time zone.
     - Money is in integer cents of the currency named next to it.
+    - Languages are lowercase ISO 639-3 codes, such as `eng` or `tha`. A showtime has one `audio_language` and at
+      most one `subtitle_language`; a client can show them upper-cased, as in "ENG | SUB: THA".
     - Lists use keyset pagination: pass `next_cursor` of one page as `cursor` to get the next. A page without
       `next_cursor` is the last one. Cursors are opaque.
     - Errors are `application/problem+json` (RFC 9457) with `type: about:blank`. Clients branch on `code`,
@@ -715,7 +717,7 @@ paths:
       tags: [Admin]
       operationId: createMovie
       summary: Add a movie
-      description: Surrounding space is trimmed from every text field.
+      description: Surrounding space is trimmed from every text field. `genres` is optional.
       security: [{ bearerAuth: [] }]
       requestBody:
         required: true
@@ -777,6 +779,11 @@ paths:
         times the base price. The showtime occupies the hall from its start until the movie and 15 minutes of
         cleaning are over. A hall cannot host two overlapping showtimes; the database enforces that with an
         exclusion constraint, so two admins who schedule the same slot at once cannot both succeed.
+
+        Each showtime is one language version: `audio_language` is required, `subtitle_language` is optional.
+        A movie shown dubbed and subtitled is two showtimes. Surrounding space is trimmed from the codes, and they
+        are lower-cased; a code must be the current ISO 639-3 code of a known language (`en` or the
+        bibliographic `fre` are refused).
       security: [{ bearerAuth: [] }]
       requestBody:
         required: true
@@ -1104,9 +1111,26 @@ components:
           description: Most recently used first.
           items: { $ref: '#/components/schemas/Session' }
 
+    Genre:
+      type: string
+      description: A stable slug for clients to translate and filter on.
+      enum: [action, adventure, animation, comedy, crime, documentary, drama, family, fantasy, history, horror,
+        music, mystery, romance, science_fiction, thriller, war, western]
+    Genres:
+      type: array
+      description: Most characteristic first; empty when the movie has none.
+      maxItems: 5
+      uniqueItems: true
+      items: { $ref: '#/components/schemas/Genre' }
+      example: [horror, comedy]
+    LanguageCode:
+      type: string
+      description: A lowercase ISO 639-3 language code.
+      pattern: '^[a-z]{3}$'
+      example: eng
     Movie:
       type: object
-      required: [id, title, duration_min]
+      required: [id, title, duration_min, genres]
       properties:
         id: { type: integer, format: int64 }
         title: { type: string, example: The Last Projectionist }
@@ -1114,6 +1138,7 @@ components:
         duration_min: { type: integer, example: 118 }
         age_rating: { type: string, example: PG-13 }
         poster_url: { type: string, format: uri }
+        genres: { $ref: '#/components/schemas/Genres' }
     MovieList:
       type: object
       required: [items]
@@ -1133,12 +1158,13 @@ components:
               items: { $ref: '#/components/schemas/Showtime' }
     MovieRef:
       type: object
-      required: [id, title, duration_min]
+      required: [id, title, duration_min, genres]
       properties:
         id: { type: integer, format: int64 }
         title: { type: string }
         duration_min: { type: integer }
         age_rating: { type: string }
+        genres: { $ref: '#/components/schemas/Genres' }
     HallRef:
       type: object
       required: [id, name]
@@ -1147,7 +1173,8 @@ components:
         name: { type: string, example: Hall 1 }
     Showtime:
       type: object
-      required: [id, movie, hall, starts_at, ends_at, status, base_price_cents, currency, seats_available, seats_total]
+      required: [id, movie, hall, starts_at, ends_at, audio_language, status, base_price_cents, currency, seats_available,
+        seats_total]
       properties:
         id: { type: integer, format: int64 }
         movie: { $ref: '#/components/schemas/MovieRef' }
@@ -1157,11 +1184,20 @@ components:
           type: string
           format: date-time
           description: When the hall is free again, cleaning included.
+        audio_language: { $ref: '#/components/schemas/AudioLanguage' }
+        subtitle_language: { $ref: '#/components/schemas/SubtitleLanguage' }
         status: { type: string, enum: [scheduled, canceled] }
         base_price_cents: { type: integer, example: 1300 }
         currency: { type: string, example: USD }
         seats_available: { type: integer }
         seats_total: { type: integer }
+    AudioLanguage:
+      allOf: [{ $ref: '#/components/schemas/LanguageCode' }]
+      description: The language of the soundtrack.
+    SubtitleLanguage:
+      allOf: [{ $ref: '#/components/schemas/LanguageCode' }]
+      description: The language of the subtitles. Absent when the showtime has none.
+      example: tha
     Schedule:
       type: object
       required: [date, items]
@@ -1188,12 +1224,14 @@ components:
         status: { $ref: '#/components/schemas/SeatStatus' }
     SeatMap:
       type: object
-      required: [showtime_id, movie, hall, starts_at, currency, summary, seats]
+      required: [showtime_id, movie, hall, starts_at, audio_language, currency, summary, seats]
       properties:
         showtime_id: { type: integer, format: int64 }
         movie: { $ref: '#/components/schemas/MovieRef' }
         hall: { $ref: '#/components/schemas/HallRef' }
         starts_at: { type: string, format: date-time }
+        audio_language: { $ref: '#/components/schemas/AudioLanguage' }
+        subtitle_language: { $ref: '#/components/schemas/SubtitleLanguage' }
         currency: { type: string }
         summary:
           type: object
@@ -1245,12 +1283,14 @@ components:
         status: { $ref: '#/components/schemas/BookingStatus' }
         showtime:
           type: object
-          required: [id, movie, hall, starts_at]
+          required: [id, movie, hall, starts_at, audio_language]
           properties:
             id: { type: integer, format: int64 }
             movie: { $ref: '#/components/schemas/MovieRef' }
             hall: { $ref: '#/components/schemas/HallRef' }
             starts_at: { type: string, format: date-time }
+            audio_language: { $ref: '#/components/schemas/AudioLanguage' }
+            subtitle_language: { $ref: '#/components/schemas/SubtitleLanguage' }
         seats:
           type: array
           description: By row and number.
@@ -1323,6 +1363,7 @@ components:
         duration_min: { type: integer, minimum: 1, maximum: 600 }
         age_rating: { type: string, maxLength: 16 }
         poster_url: { type: string, format: uri, maxLength: 2048, description: An absolute http or https URL. }
+        genres: { $ref: '#/components/schemas/Genres' }
     CreateHallRequest:
       type: object
       required: [name, rows]
@@ -1372,7 +1413,7 @@ components:
           items: { $ref: '#/components/schemas/HallSeat' }
     CreateShowtimeRequest:
       type: object
-      required: [movie_id, hall_id, starts_at, base_price_cents]
+      required: [movie_id, hall_id, starts_at, audio_language, base_price_cents]
       additionalProperties: false
       properties:
         movie_id: { type: integer, format: int64, minimum: 1 }
@@ -1382,6 +1423,11 @@ components:
           format: date-time
           description: In the future and at most 366 days ahead, with a UTC offset.
           example: '2026-10-01T19:30:00+02:00'
+        audio_language: { $ref: '#/components/schemas/AudioLanguage' }
+        subtitle_language:
+          allOf: [{ $ref: '#/components/schemas/LanguageCode' }]
+          description: The language of the subtitles. Omit it for a showtime without subtitles.
+          example: tha
         base_price_cents: { type: integer, minimum: 0, maximum: 1000000, example: 1300 }
 
     IdempotencyKey:

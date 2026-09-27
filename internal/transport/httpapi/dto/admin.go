@@ -8,21 +8,27 @@ import (
 
 // CreateMovieRequest is the body of POST /v1/admin/movies.
 type CreateMovieRequest struct {
-	Title       string `json:"title"`
-	Description string `json:"description"`
-	DurationMin int    `json:"duration_min"`
-	AgeRating   string `json:"age_rating"`
-	PosterURL   string `json:"poster_url"`
+	Title       string   `json:"title"`
+	Description string   `json:"description"`
+	DurationMin int      `json:"duration_min"`
+	AgeRating   string   `json:"age_rating"`
+	PosterURL   string   `json:"poster_url"`
+	Genres      []string `json:"genres"`
 }
 
 // NewMovie maps the request to the domain input.
 func (r CreateMovieRequest) NewMovie() domain.NewMovie {
+	genres := make([]domain.Genre, len(r.Genres))
+	for i, g := range r.Genres {
+		genres[i] = domain.Genre(g)
+	}
 	return domain.NewMovie{
 		Title:       r.Title,
 		Description: r.Description,
 		DurationMin: r.DurationMin,
 		AgeRating:   r.AgeRating,
 		PosterURL:   r.PosterURL,
+		Genres:      genres,
 	}
 }
 
@@ -74,12 +80,15 @@ func NewHall(h domain.HallLayout) Hall {
 }
 
 // CreateShowtimeRequest is the body of POST /v1/admin/showtimes. StartsAt is an RFC 3339 date-time with a time
-// zone offset, parsed by the handler so that a malformed value is reported as a field error.
+// zone offset, parsed by the handler so that a malformed value is reported as a field error. SubtitleLanguage is
+// empty for a showtime without subtitles.
 type CreateShowtimeRequest struct {
-	MovieID        int64  `json:"movie_id"`
-	HallID         int64  `json:"hall_id"`
-	StartsAt       string `json:"starts_at"`
-	BasePriceCents int64  `json:"base_price_cents"`
+	MovieID          int64  `json:"movie_id"`
+	HallID           int64  `json:"hall_id"`
+	StartsAt         string `json:"starts_at"`
+	AudioLanguage    string `json:"audio_language"`
+	SubtitleLanguage string `json:"subtitle_language"`
+	BasePriceCents   int64  `json:"base_price_cents"`
 }
 
 // NewShowtime maps the request to the domain input, with the start time the handler parsed.
@@ -88,6 +97,7 @@ func (r CreateShowtimeRequest) NewShowtime(startsAt time.Time) domain.NewShowtim
 		MovieID:        r.MovieID,
 		HallID:         r.HallID,
 		StartsAt:       startsAt,
+		Language:       domain.LanguageVersion{Audio: r.AudioLanguage, Subtitles: r.SubtitleLanguage},
 		BasePriceCents: r.BasePriceCents,
 	}
 }

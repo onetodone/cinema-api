@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -21,10 +22,13 @@ var sampleBooking = domain.Booking{
 	ID:     uuid.MustParse("01920000-0000-7000-8000-0000000000b1"),
 	UserID: sampleUser.ID,
 	Showtime: domain.ShowtimeRef{
-		ID:       11,
-		Movie:    domain.MovieSummary{ID: 1, Title: "Dune", DurationMin: 155, AgeRating: "PG-13"},
+		ID: 11,
+		Movie: domain.MovieSummary{
+			ID: 1, Title: "Dune", DurationMin: 155, AgeRating: "PG-13", Genres: []domain.Genre{domain.GenreScienceFiction},
+		},
 		Hall:     domain.Hall{ID: 2, Name: "Hall 2"},
 		StartsAt: time.Date(2030, 1, 10, 19, 0, 0, 0, time.FixedZone("GST", 4*3600)),
+		Language: domain.LanguageVersion{Audio: "tha"},
 		Status:   domain.ShowtimeScheduled,
 	},
 	Status: domain.BookingPending,
@@ -127,6 +131,12 @@ func TestCreateBooking(t *testing.T) {
 	showtime, _ := body["showtime"].(map[string]any)
 	if showtime["starts_at"] != "2030-01-10T19:00:00+04:00" || showtime["id"] != 11.0 {
 		t.Errorf("showtime = %v (the start keeps the cinema offset)", showtime)
+	}
+	if _, subtitled := showtime["subtitle_language"]; showtime["audio_language"] != "tha" || subtitled {
+		t.Errorf("showtime = %v, want audio_language tha and no subtitle_language", showtime)
+	}
+	if movie, _ := showtime["movie"].(map[string]any); !reflect.DeepEqual(movie["genres"], []any{"science_fiction"}) {
+		t.Errorf("movie = %v, want its genres", showtime["movie"])
 	}
 	seats, _ := body["seats"].([]any)
 	if len(seats) != 2 {

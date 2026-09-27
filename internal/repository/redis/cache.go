@@ -22,8 +22,8 @@ import (
 // other than their free seat counts, so those counts are up to the schedule TTL old. A TTL of 0 turns that cache
 // off: lookups miss without asking Redis.
 //
-// Keys are named <prefix>:seatmap:{<showtimeID>} and <prefix>:schedule:<yyyy-mm-dd>, the day in the cinema's
-// time zone.
+// Keys are named <prefix>:seatmap:<format>:{<showtimeID>} and <prefix>:schedule:<format>:<yyyy-mm-dd>, the day
+// in the cinema's time zone.
 type CatalogCache struct {
 	s           *Store
 	seatMapTTL  time.Duration
@@ -35,12 +35,17 @@ func (s *Store) CatalogCache(seatMapTTL, scheduleTTL time.Duration) *CatalogCach
 	return &CatalogCache{s: s, seatMapTTL: seatMapTTL, scheduleTTL: scheduleTTL}
 }
 
+// cacheFormat names the JSON layout of the cached values in their keys. Change it whenever the cached domain
+// types change: during a rolling deployment, old and new replicas then each read only the entries they wrote,
+// instead of serving values with fields missing. An entry the other version wrote is left to its TTL.
+const cacheFormat = "v2" // v2: genres and language versions (Sprint 11)
+
 func (c *CatalogCache) seatMapKey(showtimeID int64) string {
-	return c.s.key("seatmap", "{"+strconv.FormatInt(showtimeID, 10)+"}")
+	return c.s.key("seatmap", cacheFormat, "{"+strconv.FormatInt(showtimeID, 10)+"}")
 }
 
 func (c *CatalogCache) scheduleKey(day string) string {
-	return c.s.key("schedule", day)
+	return c.s.key("schedule", cacheFormat, day)
 }
 
 // SeatMap returns the cached seat map of a showtime.

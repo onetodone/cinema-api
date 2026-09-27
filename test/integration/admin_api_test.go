@@ -5,6 +5,8 @@ package integration
 import (
 	"fmt"
 	"net/http"
+	"reflect"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -83,6 +85,7 @@ func TestAdminAPI(t *testing.T) {
 
 	showtimeBody := map[string]any{
 		"movie_id": f.dune.ID, "hall_id": hallID, "starts_at": start.Format(time.RFC3339), "base_price_cents": 1000,
+		"audio_language": "eng",
 	}
 	created := api.do(http.MethodPost, "/v1/admin/showtimes", adminToken, showtimeBody)
 	if created.status != http.StatusCreated || created.body["seats_available"] != 5.0 || created.body["status"] != "scheduled" {
@@ -131,6 +134,10 @@ func TestAdminAPI(t *testing.T) {
 			status: http.StatusBadRequest, code: "VALIDATION_FAILED"},
 		{name: "no offset", edit: func(b map[string]any) { b["starts_at"] = start.Format("2006-01-02T15:04:05") },
 			status: http.StatusBadRequest, code: "VALIDATION_FAILED"},
+		{name: "no audio", edit: func(b map[string]any) { delete(b, "audio_language") },
+			status: http.StatusBadRequest, code: "VALIDATION_FAILED"},
+		{name: "two-letter subtitles", edit: func(b map[string]any) { b["subtitle_language"] = "th" },
+			status: http.StatusBadRequest, code: "VALIDATION_FAILED"},
 	} {
 		body := map[string]any{}
 		for k, v := range showtimeBody {
@@ -169,7 +176,7 @@ func TestAdminAPIConcurrentOverlappingShowtimes(t *testing.T) {
 		wg.Go(func() {
 			// Each starts a few minutes apart, and every one overlaps every other.
 			r := api.do(http.MethodPost, "/v1/admin/showtimes", adminToken, map[string]any{
-				"movie_id": f.short.ID, "hall_id": f.hall.ID, "base_price_cents": 900,
+				"movie_id": f.short.ID, "hall_id": f.hall.ID, "base_price_cents": 900, "audio_language": "eng",
 				"starts_at": start.Add(time.Duration(i) * time.Minute).Format(time.RFC3339),
 			})
 			statuses[i], codes[i] = r.status, r.code()
@@ -196,4 +203,123 @@ func TestAdminAPIConcurrentOverlappingShowtimes(t *testing.T) {
 		f.hall.ID); n != 5 {
 		t.Errorf("%d inventory rows, want the 5 seats of the one showtime: a failed create leaves nothing behind", n)
 	}
+}
+
+// TestAdminAPIGenresAndLanguages creates a movie with genres and showtimes in two language versions through the
+// API, and finds them on every read that shows a movie or a showtime, including a booking.
+func TestAdminAPIGenresAndLanguages(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	api := newAPIServer(t, f)
+	adminToken := api.signInAdmin(f)
+	customer := api.signUp("ann@example.com")
+
+	invalid := api.do(http.MethodPost, "/v1/admin/movies", adminToken, map[string]any{
+		"title": "Noir", "duration_min": 90, "genres": []string{"drama", "noir", "drama"},
+	})
+	if fields := errorFields(invalid); invalid.status != http.StatusBadRequest || !slices.Equal(fields, []string{"genres[1]", "genres[2]"}) {
+		t.Errorf("invalid genres = %d %v, want 400 on genres[1] and genres[2]", invalid.status, invalid.body)
+	}
+
+	movie := api.do(http.MethodPost, "/v1/admin/movies", adminToken, map[string]any{
+		"title": "Orbit of Glass", "duration_min": 142, "genres": []string{"science_fiction", "thriller"},
+	})
+	movieID, _ := movie.body["id"].(float64)
+	wantGenres := []any{"science_fiction", "thriller"}
+	if movie.status != http.StatusCreated || !reflect.DeepEqual(movie.body["genres"], wantGenres) {
+		t.Fatalf("create movie = %d %v", movie.status, movie.body)
+	}
+
+	// The service trims and lower-cases the codes.
+	start := time.Now().UTC().Add(48 * time.Hour).Truncate(time.Hour)
+	subtitled := api.do(http.MethodPost, "/v1/admin/showtimes", adminToken, map[string]any{
+		"movie_id": movieID, "hall_id": f.hall.ID, "starts_at": start.Format(time.RFC3339), "base_price_cents": 1000,
+		"audio_language": " ENG", "subtitle_language": "Tha ",
+	})
+	if subtitled.status != http.StatusCreated || subtitled.body["audio_language"] != "eng" || subtitled.body["subtitle_language"] != "tha" {
+		t.Fatalf("create subtitled showtime = %d %v", subtitled.status, subtitled.body)
+	}
+	dubbed := api.do(http.MethodPost, "/v1/admin/showtimes", adminToken, map[string]any{
+		"movie_id": movieID, "hall_id": f.hall2.ID, "starts_at": start.Format(time.RFC3339), "base_price_cents": 1000,
+		"audio_language": "tha",
+	})
+	if _, ok := dubbed.body["subtitle_language"]; dubbed.status != http.StatusCreated || ok {
+		t.Fatalf("create dubbed showtime = %d %v, want no subtitle_language", dubbed.status, dubbed.body)
+	}
+
+	// hasVersion checks a showtime (or a seat map or a booking's showtime) and the genres of its movie.
+	hasVersion := func(where string, st map[string]any, audio, subtitles string) {
+		t.Helper()
+		sub, ok := st["subtitle_language"]
+		if st["audio_language"] != audio || (subtitles == "") == ok || (ok && sub != subtitles) {
+			t.Errorf("%s: languages of %v, want %q and %q", where, st, audio, subtitles)
+		}
+		if m, _ := st["movie"].(map[string]any); !reflect.DeepEqual(m["genres"], wantGenres) {
+			t.Errorf("%s: movie %v, want genres %v", where, st["movie"], wantGenres)
+		}
+	}
+
+	list := api.do(http.MethodGet, "/v1/movies", "", nil)
+	items, _ := list.body["items"].([]any)
+	for _, it := range items {
+		m, _ := it.(map[string]any)
+		switch m["id"] {
+		case movieID:
+			if !reflect.DeepEqual(m["genres"], wantGenres) {
+				t.Errorf("movie list: %v, want genres %v", m, wantGenres)
+			}
+		case float64(f.dune.ID):
+			if !reflect.DeepEqual(m["genres"], []any{}) {
+				t.Errorf("movie list: %v, want genres [] for a movie without any", m)
+			}
+		}
+	}
+
+	page := api.do(http.MethodGet, fmt.Sprintf("/v1/movies/%d", int64(movieID)), "", nil)
+	upcoming, _ := page.body["upcoming_showtimes"].([]any)
+	if !reflect.DeepEqual(page.body["genres"], wantGenres) || len(upcoming) != 2 {
+		t.Fatalf("movie page = %d %v", page.status, page.body)
+	}
+	for _, u := range upcoming {
+		st, _ := u.(map[string]any)
+		if st["id"] == subtitled.body["id"] {
+			hasVersion("movie page", st, "eng", "tha")
+		} else {
+			hasVersion("movie page", st, "tha", "")
+		}
+	}
+
+	sched := api.do(http.MethodGet, fmt.Sprintf("/v1/showtimes?date=%s&movie_id=%d", start.Format(time.DateOnly), int64(movieID)), "", nil)
+	if items, _ := sched.body["items"].([]any); len(items) != 2 {
+		t.Errorf("schedule = %v, want both versions", sched.body)
+	}
+
+	location := subtitled.header.Get("Location")
+	hasVersion("showtime", api.do(http.MethodGet, location, "", nil).body, "eng", "tha")
+	seatMap := api.do(http.MethodGet, location+"/seats", "", nil)
+	hasVersion("seat map", seatMap.body, "eng", "tha")
+
+	seats, _ := seatMap.body["seats"].([]any)
+	seat, _ := seats[0].(map[string]any)
+	book := api.do(http.MethodPost, "/v1/bookings", customer, map[string]any{"showtime_id": subtitled.body["id"], "seat_ids": []any{seat["id"]}})
+	if book.status != http.StatusCreated {
+		t.Fatalf("booking = %d %v", book.status, book.body)
+	}
+	bookedShowtime, _ := book.body["showtime"].(map[string]any)
+	hasVersion("new booking", bookedShowtime, "eng", "tha")
+	read := api.do(http.MethodGet, book.header.Get("Location"), customer, nil)
+	readShowtime, _ := read.body["showtime"].(map[string]any)
+	hasVersion("read booking", readShowtime, "eng", "tha")
+}
+
+// errorFields returns the fields a 400 VALIDATION_FAILED names, in order.
+func errorFields(r apiResponse) []string {
+	errs, _ := r.body["errors"].([]any)
+	fields := make([]string, 0, len(errs))
+	for _, e := range errs {
+		fe, _ := e.(map[string]any)
+		field, _ := fe["field"].(string)
+		fields = append(fields, field)
+	}
+	return fields
 }

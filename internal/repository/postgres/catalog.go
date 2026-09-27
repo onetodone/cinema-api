@@ -21,14 +21,14 @@ func NewCatalog(pool *pgxpool.Pool) *Catalog {
 	return &Catalog{pool: pool}
 }
 
-const movieColumns = `id, title, description, duration_min, age_rating, poster_url, created_at`
+const movieColumns = `id, title, description, duration_min, age_rating, poster_url, genres::text[], created_at`
 
 func scanMovie(row pgx.Row) (domain.Movie, error) {
 	var (
 		m                    domain.Movie
 		ageRating, posterURL *string
 	)
-	err := row.Scan(&m.ID, &m.Title, &m.Description, &m.DurationMin, &ageRating, &posterURL, &m.CreatedAt)
+	err := row.Scan(&m.ID, &m.Title, &m.Description, &m.DurationMin, &ageRating, &posterURL, &m.Genres, &m.CreatedAt)
 	m.AgeRating, m.PosterURL = deref(ageRating), deref(posterURL)
 	return m, err
 }
@@ -61,8 +61,8 @@ func (c *Catalog) GetMovie(ctx context.Context, id int64) (domain.Movie, error) 
 
 // showtimeSelect joins a showtime with its movie, hall, and live seat counts.
 const showtimeSelect = `
-SELECT s.id, s.starts_at, s.ends_at, s.base_price_cents, s.status,
-       m.id, m.title, m.duration_min, m.age_rating,
+SELECT s.id, s.starts_at, s.ends_at, s.audio_language, s.subtitle_language, s.base_price_cents, s.status,
+       m.id, m.title, m.duration_min, m.age_rating, m.genres::text[],
        h.id, h.name,
        inv.available, inv.total
 FROM showtimes s
@@ -77,16 +77,16 @@ CROSS JOIN LATERAL (
 
 func scanShowtime(row pgx.Row) (domain.Showtime, error) {
 	var (
-		s         domain.Showtime
-		ageRating *string
+		s                    domain.Showtime
+		subtitles, ageRating *string
 	)
 	err := row.Scan(
-		&s.ID, &s.StartsAt, &s.EndsAt, &s.BasePriceCents, &s.Status,
-		&s.Movie.ID, &s.Movie.Title, &s.Movie.DurationMin, &ageRating,
+		&s.ID, &s.StartsAt, &s.EndsAt, &s.Language.Audio, &subtitles, &s.BasePriceCents, &s.Status,
+		&s.Movie.ID, &s.Movie.Title, &s.Movie.DurationMin, &ageRating, &s.Movie.Genres,
 		&s.Hall.ID, &s.Hall.Name,
 		&s.SeatsAvailable, &s.SeatsTotal,
 	)
-	s.Movie.AgeRating = deref(ageRating)
+	s.Language.Subtitles, s.Movie.AgeRating = deref(subtitles), deref(ageRating)
 	return s, err
 }
 

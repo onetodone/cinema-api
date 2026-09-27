@@ -32,8 +32,8 @@ func NewBookings(pool *pgxpool.Pool) *Bookings {
 // bookingSelect joins a booking with the showtime, movie, and hall shown next to it.
 const bookingSelect = `
 SELECT b.id, b.user_id, b.status, b.total_cents, b.expires_at, b.paid_at, b.created_at, b.updated_at,
-       s.id, s.starts_at, s.status,
-       m.id, m.title, m.duration_min, m.age_rating,
+       s.id, s.starts_at, s.audio_language, s.subtitle_language, s.status,
+       m.id, m.title, m.duration_min, m.age_rating, m.genres::text[],
        h.id, h.name
 FROM bookings b
 JOIN showtimes s ON s.id = b.showtime_id
@@ -42,20 +42,21 @@ JOIN halls     h ON h.id = s.hall_id`
 
 func scanBooking(row pgx.Row) (domain.Booking, error) {
 	var (
-		b         domain.Booking
-		paidAt    *time.Time
-		ageRating *string
+		b                    domain.Booking
+		paidAt               *time.Time
+		subtitles, ageRating *string
 	)
 	err := row.Scan(
 		&b.ID, &b.UserID, &b.Status, &b.TotalCents, &b.ExpiresAt, &paidAt, &b.CreatedAt, &b.UpdatedAt,
-		&b.Showtime.ID, &b.Showtime.StartsAt, &b.Showtime.Status,
+		&b.Showtime.ID, &b.Showtime.StartsAt, &b.Showtime.Language.Audio, &subtitles, &b.Showtime.Status,
 		&b.Showtime.Movie.ID, &b.Showtime.Movie.Title, &b.Showtime.Movie.DurationMin, &ageRating,
+		&b.Showtime.Movie.Genres,
 		&b.Showtime.Hall.ID, &b.Showtime.Hall.Name,
 	)
 	if paidAt != nil {
 		b.PaidAt = *paidAt
 	}
-	b.Showtime.Movie.AgeRating = deref(ageRating)
+	b.Showtime.Language.Subtitles, b.Showtime.Movie.AgeRating = deref(subtitles), deref(ageRating)
 	return b, err
 }
 
@@ -167,20 +168,20 @@ type showtimeStore struct {
 // GetForBooking reads the showtime without locking it: showtimes are not changed while they are on sale.
 func (s showtimeStore) GetForBooking(ctx context.Context, id int64) (domain.ShowtimeRef, bool, error) {
 	var (
-		st        domain.ShowtimeRef
-		ageRating *string
-		started   bool
+		st                   domain.ShowtimeRef
+		subtitles, ageRating *string
+		started              bool
 	)
 	err := s.q.QueryRow(ctx, `
-SELECT s.id, s.starts_at, s.status, s.starts_at <= now(),
-       m.id, m.title, m.duration_min, m.age_rating,
+SELECT s.id, s.starts_at, s.audio_language, s.subtitle_language, s.status, s.starts_at <= now(),
+       m.id, m.title, m.duration_min, m.age_rating, m.genres::text[],
        h.id, h.name
 FROM showtimes s
 JOIN movies m ON m.id = s.movie_id
 JOIN halls  h ON h.id = s.hall_id
 WHERE s.id = $1`, id).Scan(
-		&st.ID, &st.StartsAt, &st.Status, &started,
-		&st.Movie.ID, &st.Movie.Title, &st.Movie.DurationMin, &ageRating,
+		&st.ID, &st.StartsAt, &st.Language.Audio, &subtitles, &st.Status, &started,
+		&st.Movie.ID, &st.Movie.Title, &st.Movie.DurationMin, &ageRating, &st.Movie.Genres,
 		&st.Hall.ID, &st.Hall.Name,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -189,7 +190,7 @@ WHERE s.id = $1`, id).Scan(
 	if err != nil {
 		return domain.ShowtimeRef{}, false, fmt.Errorf("get showtime %d for booking: %w", id, err)
 	}
-	st.Movie.AgeRating = deref(ageRating)
+	st.Language.Subtitles, st.Movie.AgeRating = deref(subtitles), deref(ageRating)
 	return st, started, nil
 }
 

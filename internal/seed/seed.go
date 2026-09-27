@@ -47,36 +47,73 @@ const (
 	weekendSurcharge = 200
 )
 
-var movies = []domain.NewMovie{
+// demoMovie is a movie with the language versions it is screened in; its showtimes take them in turn.
+type demoMovie struct {
+	domain.NewMovie
+	versions []domain.LanguageVersion
+}
+
+// Language versions of the demo showtimes.
+var (
+	english         = domain.LanguageVersion{Audio: "eng"}
+	englishThaiSubs = domain.LanguageVersion{Audio: "eng", Subtitles: "tha"}
+	thaiDubbed      = domain.LanguageVersion{Audio: "tha"}
+)
+
+var movies = []demoMovie{
 	{
-		Title:       "The Last Projectionist",
-		Description: "A small-town projectionist fights to keep the last film cinema in the county alive.",
-		DurationMin: 118, AgeRating: "PG-13",
+		NewMovie: domain.NewMovie{
+			Title:       "The Last Projectionist",
+			Description: "A small-town projectionist fights to keep the last film cinema in the county alive.",
+			DurationMin: 118, AgeRating: "PG-13",
+			Genres: []domain.Genre{domain.GenreDrama},
+		},
+		versions: []domain.LanguageVersion{englishThaiSubs, english},
 	},
 	{
-		Title:       "Midnight Matinee",
-		Description: "A horror comedy about a late-night screening that refuses to end.",
-		DurationMin: 96, AgeRating: "R",
+		NewMovie: domain.NewMovie{
+			Title:       "Midnight Matinee",
+			Description: "A horror comedy about a late-night screening that refuses to end.",
+			DurationMin: 96, AgeRating: "R",
+			Genres: []domain.Genre{domain.GenreHorror, domain.GenreComedy},
+		},
+		versions: []domain.LanguageVersion{englishThaiSubs},
 	},
 	{
-		Title:       "Orbit of Glass",
-		Description: "The crew of a fragile research station must choose between rescue and discovery.",
-		DurationMin: 142, AgeRating: "PG-13",
+		NewMovie: domain.NewMovie{
+			Title:       "Orbit of Glass",
+			Description: "The crew of a fragile research station must choose between rescue and discovery.",
+			DurationMin: 142, AgeRating: "PG-13",
+			Genres: []domain.Genre{domain.GenreScienceFiction, domain.GenreThriller},
+		},
+		versions: []domain.LanguageVersion{englishThaiSubs, thaiDubbed, english},
 	},
 	{
-		Title:       "Paper Lanterns",
-		Description: "An animated journey of two siblings who follow a lantern across a sleeping city.",
-		DurationMin: 104, AgeRating: "PG",
+		NewMovie: domain.NewMovie{
+			Title:       "Paper Lanterns",
+			Description: "An animated journey of two siblings who follow a lantern across a sleeping city.",
+			DurationMin: 104, AgeRating: "PG",
+			Genres: []domain.Genre{domain.GenreAnimation, domain.GenreFamily, domain.GenreAdventure},
+		},
+		versions: []domain.LanguageVersion{thaiDubbed, englishThaiSubs},
 	},
 	{
-		Title:       "The Quiet Heist",
-		Description: "Four retired engineers plan a robbery that must not make a sound.",
-		DurationMin: 127, AgeRating: "R",
+		NewMovie: domain.NewMovie{
+			Title:       "The Quiet Heist",
+			Description: "Four retired engineers plan a robbery that must not make a sound.",
+			DurationMin: 127, AgeRating: "R",
+			Genres: []domain.Genre{domain.GenreCrime, domain.GenreComedy},
+		},
+		versions: []domain.LanguageVersion{englishThaiSubs, english},
 	},
 	{
-		Title:       "Salt and Thunder",
-		Description: "A sailing race around a storm-bound archipelago turns into a rescue mission.",
-		DurationMin: 133, AgeRating: "PG-13",
+		NewMovie: domain.NewMovie{
+			Title:       "Salt and Thunder",
+			Description: "A sailing race around a storm-bound archipelago turns into a rescue mission.",
+			DurationMin: 133, AgeRating: "PG-13",
+			Genres: []domain.Genre{domain.GenreAdventure, domain.GenreDrama},
+		},
+		versions: []domain.LanguageVersion{englishThaiSubs, thaiDubbed},
 	},
 }
 
@@ -121,7 +158,9 @@ func Run(ctx context.Context, store Store, opts Options) (Stats, error) {
 	var stats Stats
 
 	created := make([]domain.Movie, 0, len(movies))
-	for _, nm := range movies {
+	versions := make(map[int64][]domain.LanguageVersion, len(movies)) // by movie id
+	for _, dm := range movies {
+		nm := dm.NewMovie
 		if opts.PosterURLTemplate != "" {
 			nm.PosterURL = strings.ReplaceAll(opts.PosterURLTemplate, "{slug}", Slug(nm.Title))
 		}
@@ -134,6 +173,7 @@ func Run(ctx context.Context, store Store, opts Options) (Stats, error) {
 			return stats, fmt.Errorf("seed movies: %w", err)
 		}
 		created = append(created, m)
+		versions[m.ID] = dm.versions
 		stats.Movies++
 	}
 
@@ -151,16 +191,20 @@ func Run(ctx context.Context, store Store, opts Options) (Stats, error) {
 	}
 
 	first := time.Date(opts.FirstDay.Year(), opts.FirstDay.Month(), opts.FirstDay.Day(), 0, 0, 0, 0, opts.Location)
+	screenings := make(map[int64]int) // showtimes per movie so far, to take its versions in turn
 	for d := range opts.Days {
 		day := first.AddDate(0, 0, d)
 		for hallIdx, hallID := range hallIDs {
 			for _, slot := range PlanDay(day, hallIdx+d, created) {
+				movieVersions := versions[slot.Movie.ID]
 				_, err := store.CreateShowtime(ctx, domain.NewShowtime{
 					MovieID:        slot.Movie.ID,
 					HallID:         hallID,
 					StartsAt:       slot.StartsAt,
+					Language:       movieVersions[screenings[slot.Movie.ID]%len(movieVersions)],
 					BasePriceCents: slot.BasePriceCents,
 				})
+				screenings[slot.Movie.ID]++
 				if err != nil {
 					return stats, fmt.Errorf("seed showtimes: %w", err)
 				}

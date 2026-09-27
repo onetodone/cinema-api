@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"reflect"
 	"slices"
 	"testing"
 	"time"
@@ -27,7 +28,7 @@ func (s *stubAdmin) CreateMovie(_ context.Context, m domain.NewMovie) (domain.Mo
 	if s.err != nil {
 		return domain.Movie{}, s.err
 	}
-	return domain.Movie{ID: 42, Title: m.Title, DurationMin: m.DurationMin, AgeRating: m.AgeRating}, nil
+	return domain.Movie{ID: 42, Title: m.Title, DurationMin: m.DurationMin, AgeRating: m.AgeRating, Genres: m.Genres}, nil
 }
 
 func (s *stubAdmin) CreateHall(_ context.Context, h domain.NewHall) (domain.HallLayout, error) {
@@ -56,7 +57,7 @@ func (s *stubAdmin) CreateShowtime(_ context.Context, ns domain.NewShowtime) (do
 	return domain.Showtime{
 		ID: 77, Movie: domain.MovieSummary{ID: ns.MovieID, Title: "Dune", DurationMin: 155},
 		Hall: domain.Hall{ID: ns.HallID, Name: "Hall 4"}, StartsAt: ns.StartsAt.In(gst),
-		EndsAt: ns.StartsAt.Add(170 * time.Minute).In(gst), BasePriceCents: ns.BasePriceCents,
+		EndsAt: ns.StartsAt.Add(170 * time.Minute).In(gst), Language: ns.Language, BasePriceCents: ns.BasePriceCents,
 		Status: domain.ShowtimeScheduled, SeatsAvailable: 3, SeatsTotal: 3,
 	}, nil
 }
@@ -70,7 +71,8 @@ func TestCreateMovie(t *testing.T) {
 
 	svc := &stubAdmin{}
 	rec := postJSON(t, newAdminHandler(svc).CreateMovie, "/v1/admin/movies",
-		`{"title":"Dune","description":"Sand.","duration_min":155,"age_rating":"PG-13","poster_url":"https://x/y.jpg"}`)
+		`{"title":"Dune","description":"Sand.","duration_min":155,"age_rating":"PG-13","poster_url":"https://x/y.jpg",
+		  "genres":["science_fiction","adventure"]}`)
 
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
@@ -80,12 +82,26 @@ func TestCreateMovie(t *testing.T) {
 	}
 	want := domain.NewMovie{
 		Title: "Dune", Description: "Sand.", DurationMin: 155, AgeRating: "PG-13", PosterURL: "https://x/y.jpg",
+		Genres: []domain.Genre{domain.GenreScienceFiction, domain.GenreAdventure},
 	}
-	if svc.movie != want {
+	if !reflect.DeepEqual(svc.movie, want) {
 		t.Errorf("service got %+v, want %+v", svc.movie, want)
 	}
-	if body := decode[map[string]any](t, rec); body["id"] != 42.0 || body["title"] != "Dune" {
+	body := decode[map[string]any](t, rec)
+	if body["id"] != 42.0 || body["title"] != "Dune" || !reflect.DeepEqual(body["genres"], []any{"science_fiction", "adventure"}) {
 		t.Errorf("body = %v", body)
+	}
+}
+
+func TestCreateMovieWithoutGenresAnswersAnEmptyList(t *testing.T) {
+	t.Parallel()
+
+	rec := postJSON(t, newAdminHandler(&stubAdmin{}).CreateMovie, "/v1/admin/movies", `{"title":"Dune","duration_min":155}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	if body := decode[map[string]any](t, rec); !reflect.DeepEqual(body["genres"], []any{}) {
+		t.Errorf("genres = %#v, want []", body["genres"])
 	}
 }
 
@@ -163,7 +179,8 @@ func TestCreateShowtime(t *testing.T) {
 
 	svc := &stubAdmin{}
 	rec := postJSON(t, newAdminHandler(svc).CreateShowtime, "/v1/admin/showtimes",
-		`{"movie_id":1,"hall_id":4,"starts_at":"2030-01-10T19:30:00+04:00","base_price_cents":1100}`)
+		`{"movie_id":1,"hall_id":4,"starts_at":"2030-01-10T19:30:00+04:00","audio_language":"eng",
+		  "subtitle_language":"tha","base_price_cents":1100}`)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
 	}
@@ -172,7 +189,7 @@ func TestCreateShowtime(t *testing.T) {
 	}
 	start := time.Date(2030, 1, 10, 15, 30, 0, 0, time.UTC)
 	if svc.showtime.MovieID != 1 || svc.showtime.HallID != 4 || !svc.showtime.StartsAt.Equal(start) ||
-		svc.showtime.BasePriceCents != 1100 {
+		svc.showtime.BasePriceCents != 1100 || svc.showtime.Language != (domain.LanguageVersion{Audio: "eng", Subtitles: "tha"}) {
 		t.Errorf("service got %+v", svc.showtime)
 	}
 
@@ -180,10 +197,29 @@ func TestCreateShowtime(t *testing.T) {
 	for k, v := range map[string]any{
 		"id": 77.0, "starts_at": "2030-01-10T19:30:00+04:00", "ends_at": "2030-01-10T22:20:00+04:00",
 		"status": "scheduled", "base_price_cents": 1100.0, "currency": "EUR", "seats_available": 3.0, "seats_total": 3.0,
+		"audio_language": "eng", "subtitle_language": "tha",
 	} {
 		if body[k] != v {
 			t.Errorf("%s = %v, want %v", k, body[k], v)
 		}
+	}
+}
+
+func TestCreateShowtimeWithoutSubtitlesOmitsThem(t *testing.T) {
+	t.Parallel()
+
+	svc := &stubAdmin{}
+	rec := postJSON(t, newAdminHandler(svc).CreateShowtime, "/v1/admin/showtimes",
+		`{"movie_id":1,"hall_id":4,"starts_at":"2030-01-10T19:30:00Z","audio_language":"tha","base_price_cents":1100}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+	}
+	if svc.showtime.Language != (domain.LanguageVersion{Audio: "tha"}) {
+		t.Errorf("service got %+v", svc.showtime.Language)
+	}
+	body := decode[map[string]any](t, rec)
+	if _, ok := body["subtitle_language"]; ok || body["audio_language"] != "tha" {
+		t.Errorf("body = %v, want audio_language tha and no subtitle_language", body)
 	}
 }
 

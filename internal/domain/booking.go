@@ -54,6 +54,7 @@ type ShowtimeRef struct {
 	Movie    MovieSummary
 	Hall     Hall
 	StartsAt time.Time
+	Language LanguageVersion
 	Status   ShowtimeStatus
 }
 

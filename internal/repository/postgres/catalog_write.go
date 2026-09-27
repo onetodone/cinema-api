@@ -14,10 +14,11 @@ import (
 // CreateMovie inserts a movie and returns it with its generated id.
 func (c *Catalog) CreateMovie(ctx context.Context, nm domain.NewMovie) (domain.Movie, error) {
 	m, err := scanMovie(c.pool.QueryRow(ctx, `
-INSERT INTO movies (title, description, duration_min, age_rating, poster_url)
-VALUES ($1, $2, $3, $4, $5)
+INSERT INTO movies (title, description, duration_min, age_rating, poster_url, genres)
+VALUES ($1, $2, $3, $4, $5, $6::text[]::movie_genre[])
 RETURNING `+movieColumns,
-		nm.Title, nm.Description, nm.DurationMin, nullable(nm.AgeRating), nullable(nm.PosterURL)))
+		nm.Title, nm.Description, nm.DurationMin, nullable(nm.AgeRating), nullable(nm.PosterURL),
+		genreNames(nm.Genres)))
 	if err != nil {
 		return domain.Movie{}, fmt.Errorf("create movie %q: %w", nm.Title, err)
 	}
@@ -76,12 +77,13 @@ func (c *Catalog) CreateShowtime(ctx context.Context, ns domain.NewShowtime) (do
 	err := pgx.BeginFunc(ctx, c.pool, func(tx pgx.Tx) error {
 		var id int64
 		err := tx.QueryRow(ctx, `
-INSERT INTO showtimes (movie_id, hall_id, starts_at, ends_at, base_price_cents)
-SELECT m.id, $2, $3::timestamptz, $3::timestamptz + make_interval(mins => m.duration_min + $5), $4
+INSERT INTO showtimes (movie_id, hall_id, starts_at, ends_at, base_price_cents, audio_language, subtitle_language)
+SELECT m.id, $2, $3::timestamptz, $3::timestamptz + make_interval(mins => m.duration_min + $5), $4, $6, $7
 FROM movies m
 WHERE m.id = $1
 RETURNING id`,
 			ns.MovieID, ns.HallID, ns.StartsAt, ns.BasePriceCents, int(domain.CleaningBuffer.Minutes()),
+			ns.Language.Audio, nullable(ns.Language.Subtitles),
 		).Scan(&id)
 		switch {
 		case errors.Is(err, pgx.ErrNoRows):
@@ -112,4 +114,13 @@ WHERE hs.hall_id = $4`,
 		return domain.Showtime{}, fmt.Errorf("create showtime: %w", err)
 	}
 	return created, nil
+}
+
+// genreNames returns the genres as text for a movie_genre[] column. It is never nil, because nil encodes as NULL.
+func genreNames(genres []domain.Genre) []string {
+	names := make([]string, len(genres))
+	for i, g := range genres {
+		names[i] = string(g)
+	}
+	return names
 }

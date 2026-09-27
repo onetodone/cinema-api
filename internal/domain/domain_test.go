@@ -125,7 +125,10 @@ func TestViolations(t *testing.T) {
 func TestNewMovieValidate(t *testing.T) {
 	t.Parallel()
 
-	valid := NewMovie{Title: "Dune", DurationMin: 155, AgeRating: "PG-13", PosterURL: "https://img.example/dune.jpg"}
+	valid := NewMovie{
+		Title: "Dune", DurationMin: 155, AgeRating: "PG-13", PosterURL: "https://img.example/dune.jpg",
+		Genres: []Genre{GenreScienceFiction, GenreAdventure, GenreDrama, GenreWar, GenreAction},
+	}
 	if err := valid.Validate(); err != nil {
 		t.Fatalf("valid movie: %v", err)
 	}
@@ -151,9 +154,16 @@ func TestNewMovieValidate(t *testing.T) {
 		{name: "long poster", edit: func(m *NewMovie) {
 			m.PosterURL = "https://img.example/" + strings.Repeat("a", MaxPosterURLLength)
 		}, fields: []string{"poster_url"}},
+		{name: "unknown genre", edit: func(m *NewMovie) { m.Genres = []Genre{GenreDrama, "sci-fi"} }, fields: []string{"genres[1]"}},
+		{name: "genre in upper case", edit: func(m *NewMovie) { m.Genres = []Genre{"Drama"} }, fields: []string{"genres[0]"}},
+		{name: "empty genre", edit: func(m *NewMovie) { m.Genres = []Genre{""} }, fields: []string{"genres[0]"}},
+		{name: "repeated genre", edit: func(m *NewMovie) {
+			m.Genres = []Genre{GenreDrama, GenreWar, GenreDrama}
+		}, fields: []string{"genres[2]"}},
+		{name: "too many genres", edit: func(m *NewMovie) { m.Genres = append(m.Genres, GenreHistory) }, fields: []string{"genres"}},
 		{name: "everything wrong", edit: func(m *NewMovie) {
-			*m = NewMovie{PosterURL: "ftp://x/y"}
-		}, fields: []string{"title", "duration_min", "poster_url"}},
+			*m = NewMovie{PosterURL: "ftp://x/y", Genres: []Genre{"noir"}}
+		}, fields: []string{"title", "duration_min", "poster_url", "genres[0]"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -246,14 +256,17 @@ func TestNewShowtimeValidate(t *testing.T) {
 	t.Parallel()
 
 	now := time.Date(2030, 3, 1, 12, 0, 0, 0, time.UTC)
-	valid := NewShowtime{MovieID: 1, HallID: 2, StartsAt: now.Add(time.Minute), BasePriceCents: 900}
+	valid := NewShowtime{
+		MovieID: 1, HallID: 2, StartsAt: now.Add(time.Minute), BasePriceCents: 900,
+		Language: LanguageVersion{Audio: "eng", Subtitles: "tha"},
+	}
 	if err := valid.Validate(now); err != nil {
 		t.Fatalf("valid showtime: %v", err)
 	}
 	free := valid
-	free.BasePriceCents, free.StartsAt = 0, now.Add(MaxScheduleAhead)
+	free.BasePriceCents, free.StartsAt, free.Language.Subtitles = 0, now.Add(MaxScheduleAhead), ""
 	if err := free.Validate(now); err != nil {
-		t.Errorf("a free showtime a year ahead: %v", err)
+		t.Errorf("a free showtime a year ahead without subtitles: %v", err)
 	}
 
 	tests := []struct {
@@ -268,8 +281,12 @@ func TestNewShowtimeValidate(t *testing.T) {
 		{name: "too far ahead", edit: func(s *NewShowtime) { s.StartsAt = now.Add(MaxScheduleAhead + time.Second) }, fields: []string{"starts_at"}},
 		{name: "negative price", edit: func(s *NewShowtime) { s.BasePriceCents = -1 }, fields: []string{"base_price_cents"}},
 		{name: "huge price", edit: func(s *NewShowtime) { s.BasePriceCents = MaxBasePriceCents + 1 }, fields: []string{"base_price_cents"}},
+		{name: "no audio", edit: func(s *NewShowtime) { s.Language.Audio = "" }, fields: []string{"audio_language"}},
+		{name: "bad subtitles", edit: func(s *NewShowtime) { s.Language.Subtitles = "th" }, fields: []string{"subtitle_language"}},
+		{name: "both languages bad", edit: func(s *NewShowtime) { s.Language = LanguageVersion{Audio: "xyz", Subtitles: "EN"} },
+			fields: []string{"audio_language", "subtitle_language"}},
 		{name: "everything wrong", edit: func(s *NewShowtime) { *s = NewShowtime{BasePriceCents: -5} },
-			fields: []string{"movie_id", "hall_id", "starts_at", "base_price_cents"}},
+			fields: []string{"movie_id", "hall_id", "starts_at", "audio_language", "base_price_cents"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

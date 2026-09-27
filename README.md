@@ -46,8 +46,9 @@ docker run -d --name local-redis -p 6379:6379 redis:8.8-alpine
 cp .env.example .env            # its JWT_SECRET is a local placeholder; anywhere shared: openssl rand -base64 48
 sed -i 's/^PAYMENT_LOCAL_ENABLED=.*/PAYMENT_LOCAL_ENABLED=true/; s/^AUTH_COOKIE_SECURE=.*/AUTH_COOKIE_SECURE=false/' .env
 
-# 3. Database: create it, apply the migrations, and seed demo data (6 movies, 3 halls, a week of showtimes,
-#    and the admin account from ADMIN_EMAIL / ADMIN_PASSWORD). For poster images, first set
+# 3. Database: create it, apply the migrations, and seed demo data (6 movies with genres, 3 halls, a week of
+#    showtimes in English, English with Thai subtitles, or Thai, and the admin account from ADMIN_EMAIL /
+#    ADMIN_PASSWORD). For poster images, first set
 #    SEED_POSTER_URL_TEMPLATE=https://picsum.photos/seed/{slug}/400/600 in .env.
 make db-create migrate-up seed
 
@@ -71,7 +72,10 @@ curl -s -X POST $API/v1/auth/register -H 'Content-Type: application/json' \
 TOKEN=$(curl -s -c jar -X POST $API/v1/auth/login -H 'Content-Type: application/json' \
   -d '{"email":"ann@example.com","password":"correct horse"}' | jq -r .access_token)
 
-# Tomorrow's schedule, and the seat map of its first showtime
+# Tomorrow's schedule: every showtime is one language version (audio, optional subtitles) of a movie
+curl -s "$API/v1/showtimes?date=$(date -u -d tomorrow +%F)" |
+  jq -c '.items[:3][] | {title: .movie.title, genres: .movie.genres, audio_language, subtitle_language}'
+# ... and the seat map of its first showtime
 ST=$(curl -s "$API/v1/showtimes?date=$(date -u -d tomorrow +%F)" | jq '.items[0].id')
 curl -s $API/v1/showtimes/$ST/seats | jq '{summary, first: .seats[0]}'
 # Poll it like a client: sent back in If-None-Match, its ETag gets 304 while no seat changes
@@ -318,6 +322,10 @@ sequenceDiagram
 | **Rate limits** | Fixed one-minute windows (`INCR` + `PEXPIRE … NX` in one script) | Requests pass |
 | **Revoked sessions** | `<prefix>:revoked-sid:<session>` for every session that ended early, until its last access token has expired; one `EXISTS` per authenticated request | Ended sessions still cannot refresh; their access tokens work until they expire (≤ 15 min) |
 
+Cached values are JSON of the domain types, and their keys carry a format version (`seatmap:v2:{<showtime>}`,
+`schedule:v2:<day>`). When the types change, the version changes too, so during a rolling deployment old and new
+replicas never serve each other's entries; an invalidation by one leaves the other's entry to its TTL.
+
 The gate is what keeps a premiere rush from filling the connection pool with transactions that queue on one
 row lock: in the 200-goroutine test, the gate turns 199 losers away before they take a connection, and the race
 takes 76 ms instead of 199 ms. The `{showtime}` hash tag keeps all claims of a showtime in one Redis Cluster
@@ -451,6 +459,14 @@ Validation errors list every bad field at once in `errors`. Answers worth retryi
 it. The unique index that refuses the second hold aborts its transaction, so the booking is read right after; if it
 ended in that moment, `booking_id` is left out.
 
+**Genres and languages.** Movies carry `genres`, a list of up to five fixed slugs (`horror`, `science_fiction`,
+…), most characteristic first, which clients translate. Every showtime is one language version: `audio_language`
+and, when it has subtitles, `subtitle_language`, both lowercase ISO 639-3 codes that a client shows as
+"ENG | SUB: THA". A movie shown dubbed and subtitled is two showtimes. The admin API trims and lower-cases the codes
+and accepts only the current code of a known language (`golang.org/x/text/language`), so `en`, `ENGL`, `xyz`, and
+the bibliographic `fre` (use `fra`) are refused and every language has one spelling. Schedules, seat maps, and
+bookings carry the genres and the version, so a ticket says what will be heard.
+
 **Polling.** The schedule and seat maps carry a weak `ETag` (the SHA-256 of the body) and `Cache-Control: no-cache`.
 A client that sends the tag back in `If-None-Match` gets `304 Not Modified` without a body while nothing has changed;
 browsers do that by themselves. The tag is computed from the content alone, nothing is stored for it, and every
@@ -554,7 +570,8 @@ make load-test          # k6: 500 users race for one seat against a running API
   compare-and-set, a login without the user lock, no grace window, no revocation check, a revocation before the
   ownership check, a revocation lifetime without the second leeway, no lookup of the blocking booking, never
   answering 304, an ETag that depends on more than the content, an ignored status filter, one poster for every
-  movie): each made a test fail.
+  movie, language codes that are not lower-cased, bibliographic codes accepted, a migration that keeps its
+  backfill default, subtitles missing from bookings): each made a test fail.
 - **Load test.** Start the API without the per-address auth limit, since setup logs 500 accounts in from one
   address, and with a cheaper password hash:
 
@@ -620,5 +637,8 @@ the services declare, so services never import pgx, go-redis, or Prometheus, and
 - **Registration reveals whether an address exists** (`409 EMAIL_TAKEN`); the per-address limit slows enumeration.
 - **A failed compensation refund needs manual work.** It is logged at error level with every id; a refund outbox
   would be the production answer.
+- **One language version per showtime, and no filters for it yet.** A showtime has one audio language and at most
+  one subtitle language; a screening with two subtitle tracks would need a list. Clients filter the schedule by
+  genre or language themselves; a query parameter can follow when the catalog grows.
 - **One currency, one time zone, no showtime cancellation** by admins (out of scope). If cancellation is added,
   booking must lock the showtime row too.

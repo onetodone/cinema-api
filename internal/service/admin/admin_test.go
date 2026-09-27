@@ -3,6 +3,7 @@ package admin
 import (
 	"context"
 	"errors"
+	"reflect"
 	"slices"
 	"testing"
 	"time"
@@ -77,6 +78,7 @@ func TestCreateMovieTrimsAndStores(t *testing.T) {
 		DurationMin: 155,
 		AgeRating:   " PG-13 ",
 		PosterURL:   " https://img.example/dune.jpg ",
+		Genres:      []domain.Genre{domain.GenreScienceFiction, domain.GenreAdventure},
 	})
 	if err != nil {
 		t.Fatalf("CreateMovie: %v", err)
@@ -87,8 +89,9 @@ func TestCreateMovieTrimsAndStores(t *testing.T) {
 	want := domain.NewMovie{
 		Title: "Dune", Description: "Sand.", DurationMin: 155, AgeRating: "PG-13",
 		PosterURL: "https://img.example/dune.jpg",
+		Genres:    []domain.Genre{domain.GenreScienceFiction, domain.GenreAdventure},
 	}
-	if *repo.movie != want {
+	if !reflect.DeepEqual(*repo.movie, want) {
 		t.Errorf("stored %+v, want %+v", *repo.movie, want)
 	}
 }
@@ -180,20 +183,30 @@ func TestCreateShowtimeStoresAndInvalidatesTheScheduleDay(t *testing.T) {
 
 	// 2030-03-01 20:00 UTC is already March 2 in Tokyo: the cinema's day decides which schedule changes.
 	start := time.Date(2030, 3, 1, 20, 0, 0, 0, time.UTC)
-	st, err := svc.CreateShowtime(t.Context(), domain.NewShowtime{MovieID: 1, HallID: 2, StartsAt: start, BasePriceCents: 900})
+	st, err := svc.CreateShowtime(t.Context(), domain.NewShowtime{
+		MovieID: 1, HallID: 2, StartsAt: start, BasePriceCents: 900,
+		Language: domain.LanguageVersion{Audio: " ENG ", Subtitles: "Tha\n"},
+	})
 	if err != nil {
 		t.Fatalf("CreateShowtime: %v", err)
 	}
 	if st.ID != 11 || st.StartsAt.Location() != tokyo || st.EndsAt.Location() != tokyo || !st.StartsAt.Equal(start) {
 		t.Errorf("showtime = %+v, want its times in the cinema's zone", st)
 	}
-	if want := (domain.NewShowtime{MovieID: 1, HallID: 2, StartsAt: start, BasePriceCents: 900}); *repo.showtime != want {
+	want := domain.NewShowtime{
+		MovieID: 1, HallID: 2, StartsAt: start, BasePriceCents: 900,
+		Language: domain.LanguageVersion{Audio: "eng", Subtitles: "tha"},
+	}
+	if *repo.showtime != want {
 		t.Errorf("stored %+v, want %+v", *repo.showtime, want)
 	}
 	if !slices.Equal(cache.days, []string{"2030-03-02"}) {
 		t.Errorf("invalidated days = %v, want [2030-03-02]", cache.days)
 	}
 }
+
+// english is the language version of showtimes whose version does not matter to a test.
+var english = domain.LanguageVersion{Audio: "eng"}
 
 func TestCreateShowtimeInvalidatesEvenWhenTheClientHasGone(t *testing.T) {
 	t.Parallel()
@@ -203,7 +216,7 @@ func TestCreateShowtimeInvalidatesEvenWhenTheClientHasGone(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel() // the repository call is a fake, so only the invalidation sees the canceled context
 
-	_, err := svc.CreateShowtime(ctx, domain.NewShowtime{MovieID: 1, HallID: 2, StartsAt: now.Add(time.Hour)})
+	_, err := svc.CreateShowtime(ctx, domain.NewShowtime{MovieID: 1, HallID: 2, StartsAt: now.Add(time.Hour), Language: english})
 	if err != nil || len(cache.days) != 1 {
 		t.Errorf("CreateShowtime = %v, invalidated %v; want the invalidation to ignore the cancellation", err, cache.days)
 	}
@@ -213,7 +226,7 @@ func TestCreateShowtimeIgnoresAFailingCache(t *testing.T) {
 	t.Parallel()
 
 	svc := newService(&recordingRepo{}, WithScheduleCache(&recordingCache{err: errors.New("redis is down")}))
-	if _, err := svc.CreateShowtime(t.Context(), domain.NewShowtime{MovieID: 1, HallID: 2, StartsAt: now.Add(time.Hour)}); err != nil {
+	if _, err := svc.CreateShowtime(t.Context(), domain.NewShowtime{MovieID: 1, HallID: 2, StartsAt: now.Add(time.Hour), Language: english}); err != nil {
 		t.Errorf("CreateShowtime = %v, want success: the cached schedule expires by itself", err)
 	}
 }
@@ -226,8 +239,8 @@ func TestCreateShowtimeRejectsInvalidInputBeforeStoring(t *testing.T) {
 		domain.NewShowtime{StartsAt: now, BasePriceCents: -1})
 
 	var ve *domain.ValidationError
-	if !errors.As(err, &ve) || len(ve.Fields) != 4 {
-		t.Fatalf("error = %v, want movie_id, hall_id, starts_at, and base_price_cents", err)
+	if !errors.As(err, &ve) || len(ve.Fields) != 5 {
+		t.Fatalf("error = %v, want movie_id, hall_id, starts_at, audio_language, and base_price_cents", err)
 	}
 	if repo.calls != 0 || len(cache.days) != 0 {
 		t.Error("an invalid showtime reached the repository or the cache")
@@ -240,7 +253,7 @@ func TestCreateShowtimeLeavesTheCacheAloneOnFailure(t *testing.T) {
 	repo := &recordingRepo{err: domain.Conflict(domain.CodeHallOverlap, "overlap")}
 	cache := &recordingCache{}
 	_, err := newService(repo, WithScheduleCache(cache)).CreateShowtime(t.Context(),
-		domain.NewShowtime{MovieID: 1, HallID: 2, StartsAt: now.Add(time.Hour)})
+		domain.NewShowtime{MovieID: 1, HallID: 2, StartsAt: now.Add(time.Hour), Language: english})
 	if !errors.Is(err, domain.ErrConflict) {
 		t.Errorf("error = %v, want the repository's conflict", err)
 	}
