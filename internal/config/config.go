@@ -260,6 +260,7 @@ type RedisConfig struct {
 	Addr         string        `env:"REDIS_ADDR"          envDefault:"localhost:6379"`
 	Password     string        `env:"REDIS_PASSWORD"`
 	DB           int           `env:"REDIS_DB"            envDefault:"0"`
+	TLSEnabled   bool          `env:"REDIS_TLS_ENABLED"   envDefault:"false"`
 	DialTimeout  time.Duration `env:"REDIS_DIAL_TIMEOUT"  envDefault:"1s"`
 	ReadTimeout  time.Duration `env:"REDIS_READ_TIMEOUT"  envDefault:"500ms"`
 	WriteTimeout time.Duration `env:"REDIS_WRITE_TIMEOUT" envDefault:"500ms"`

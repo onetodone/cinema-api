@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"crypto/tls"
 
 	"github.com/redis/go-redis/v9"
 
@@ -14,7 +15,7 @@ import (
 // New returns a Redis client for cfg. It does not connect eagerly: Redis is an optional accelerator,
 // so callers decide how to react when it is unreachable (the API keeps serving in fail-open mode).
 func New(cfg config.RedisConfig, clientName string) *redis.Client {
-	return redis.NewClient(&redis.Options{
+	opts := &redis.Options{
 		Addr:          cfg.Addr,
 		Password:      cfg.Password,
 		DB:            cfg.DB,
@@ -24,7 +25,15 @@ func New(cfg config.RedisConfig, clientName string) *redis.Client {
 		WriteTimeout:  cfg.WriteTimeout,
 		MaxRetries:    cfg.MaxRetries,
 		ClientName:    clientName,
-	})
+	}
+
+	if cfg.TLSEnabled {
+		opts.TLSConfig = &tls.Config{
+			MinVersion: tls.VersionTLS12,
+		}
+	}
+
+	return redis.NewClient(opts)
 }
 
 // UseLogger sends the internal log lines of go-redis to logger at debug level. Without it, go-redis writes an
