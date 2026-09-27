@@ -1,0 +1,67 @@
+name: Deploy
+
+# Deploys main to the VPS once CI has passed for that exact commit.
+# A CI run cancelled by a newer push concludes as "cancelled", so only the newest commit gets deployed.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One deploy at a time, and a running deploy is never cancelled halfway through.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to the VPS
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Build exactly the commit that CI tested, not whatever main points to now.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Build static binaries
+        env:
+          GOOS: linux
+          GOARCH: amd64 # arm64 for an ARM VPS
+        run: make build
+
+      - name: Configure SSH
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          # A named host keeps the rsync and ssh commands short; BatchMode fails fast instead of prompting.
+          cat > ~/.ssh/config <<EOF
+          Host vps
+            HostName $DEPLOY_HOST
+            User swk
+            IdentityFile ~/.ssh/id_ed25519
+            BatchMode yes
+          EOF
+
+      - name: Upload binaries
+        # --delay-updates renames all files at the end, so no service ever starts a half-written binary.
+        run: rsync -az --delay-updates bin/ vps:/opt/go-cinema-api/bin/
+
+      - name: Migrate, restart, and wait until ready
+        run: ssh vps 'bash -s' < deploy/remote.sh
